@@ -92,7 +92,8 @@ async function doctor(home: string): Promise<string[]> {
   await check("config", () => {
     const c = loadConfig(home);
     if (!c.project) throw new Error(`set "project" in ${p.config}`);
-    return `project ${c.project}, template ${c.template}, size ${c.size}, totalCap ${c.totalCap}, perRepoCap ${c.perRepoCap}`;
+    const ladder = c.sizes.map((x) => `${x.size} x${x.max}`).join(", ");
+    return `project ${c.project}, template ${c.template}, sizes ${ladder}, perRepoCap ${c.perRepoCap}, budget ${c.dailySmallMachineHours} small-machine-hours a day`;
   });
   await check("secrets", () => {
     if (!existsSync(p.secrets)) throw new Error(`${p.secrets} does not exist`);
@@ -109,7 +110,7 @@ async function doctor(home: string): Promise<string[]> {
   await check("local t3", () => realLocalT3().version());
   await check("daemon", async () => {
     const s = await call(p.socket, "GET", "/status");
-    return `${s.machineHoursToday} of ${s.dailyMachineHours} machine-hours used today`;
+    return `${s.budget.usedToday} of ${s.budget.dailyLimit} small-machine-hours used today`;
   });
   return lines;
 }

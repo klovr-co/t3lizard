@@ -75,7 +75,7 @@ The `phase` union is the machine's state machine. No parallel booleans.
 ```ts
 type Action =
   | { kind: "grant"; ticketId: string; machineId: MachineId }      // idle machine of the ticket's repo
-  | { kind: "create"; repo: RepoKey }                              // queued ticket, no idle machine, repo count < perRepoCap, total < totalCap, budget left
+  | { kind: "create"; repo: RepoKey; size: Size }                // queued ticket, no idle machine, repo count < perRepoCap, a ladder size with room (largest first), budget left
   | { kind: "extend"; machineId: MachineId; deadline: number }   // leased or resetting machine near its Lizard deadline
   | { kind: "expireLease"; leaseId: string }                      // past expiresAt and the machine shows no busy thread (checked by the daemon before applying)
   | { kind: "close"; machineId: MachineId; reason: "idle" | "recycle" | "deadline" | "failed" | "orphan" | "manual" }
@@ -85,16 +85,17 @@ type Action =
 ```
 
 Rules:
-- Grant oldest queued ticket per repo first. One lease per machine.
+- Grant oldest queued ticket per repo first, and give it the largest idle machine of its repo (then the one with the most time left). One lease per machine. An idle smaller machine is granted at once rather than waiting for a new larger one to come up.
+- Size ladder (`config.sizes`, largest first by price): a `create` takes the largest size whose count of machines (every phase) is below its `max`. Machines of any size serve any repo; `perRepoCap` counts a repo's machines of all sizes. The queue reason names the ladder when it is full: `every machine size is in use (small 1/1, mini 2/2)`.
 - Count `creating | installing | linking` machines as capacity already coming, so a tick never over-creates.
 - Count every machine in state toward the caps, `closing` and `failed` included: Lizard still runs them, and the trial refuses a second Small until the first is gone.
-- Cross-repo: when a repo's queue is blocked only by `totalCap`, close an idle machine of a repo with no queue (reason `idle`) instead of waiting out `idleCloseMinutes`. A machine already `closing` counts as a slot on its way, so one tick never closes two for one ticket. Without this, on the trial (1 machine) a second repo waits up to 10 minutes behind an idle machine nobody wants.
+- Cross-repo: when a repo's queue is blocked only by the ladder being full, close an idle machine of a repo with no queue (reason `idle`) instead of waiting out `idleCloseMinutes`. A machine already `closing` counts as a slot on its way, so one tick never closes two for one ticket. Without this, on a full ladder a second repo waits up to 10 minutes behind an idle machine nobody wants.
 - Never grant a machine within 5 minutes of its deadline.
 - Close an idle machine when idle >= `idleCloseMinutes` AND the repo has no queued ticket.
 - Recycle: close an idle machine older than `recycleMinutes`.
 - Deadline: close any machine within 5 minutes of its Lizard deadline that is not leased; a leased (or resetting) one gets an `extend` action instead: the new deadline is `min(createdAt + maxLifetimeMinutes, deadline + lifetimeMinutes)`, applied with `setTimeout`. The trial caps lifetime at 1 hour from creation, so there `maxLifetimeMinutes = lifetimeMinutes` and nothing extends.
-- Budget: no `create` when today's machine-hours >= `dailyMachineHours`. Queued tickets then wait for existing machines. `status` shows the reason.
-- Accounts: a leased machine's limited thread gets `continueThread` on the next account after its own that is not limited, wrapping round to its own last. With none free, the machine waits for the account that frees first, plus 10 minutes (`ACCOUNT_WAIT_MARGIN_MS`): an `extendLease` when the lease ends sooner, an `extend` when the machine's deadline is sooner, and no `expireLease` meanwhile. It never waits past `createdAt + maxLifetimeMinutes` or past `dailyMachineHours` (counting the wait); then nothing is kept and `status` shows why.
+- Budget: in small-machine-hours, weighted by Lizard's per-hour price (`SIZE_WEIGHT`: nano 0.25, mini 0.5, small 1, medium 2, large 4, big 8). No `create` when today's weighted hours >= `dailySmallMachineHours`. Queued tickets then wait for existing machines. `status` shows the reason.
+- Accounts: a leased machine's limited thread gets `continueThread` on the next account after its own that is not limited, wrapping round to its own last. With none free, the machine waits for the account that frees first, plus 10 minutes (`ACCOUNT_WAIT_MARGIN_MS`): an `extendLease` when the lease ends sooner, an `extend` when the machine's deadline is sooner, and no `expireLease` meanwhile. It never waits past `createdAt + maxLifetimeMinutes` or past `dailySmallMachineHours` (counting the wait at the machine's weight); then nothing is kept and `status` shows why.
 
 ## Lizard adapter
 
@@ -177,8 +178,8 @@ Release: the client calls `release(leaseId)`. A crashed client: the lease expire
 - `POST /wait { ticketId, maxSeconds <= 300 }` -> same shape; long-poll, returns early on grant
 - `POST /release { leaseId } | { ticketId }`: ends a lease, or cancels a queued ticket (an agent that stops waiting), `POST /renew { leaseId }`
 - `/wait` on a ticket whose lease ended answers `status: "released"`; a cancelled or expired ticket answers its status and `error`.
-- `GET /status` -> pools per repo (machines with phase, age, limited threads and how long they wait for an account; queue; leases), today's machine-hours vs budget, why creates are blocked, last Lizard error, and `accounts: [{ id, free, limitedUntil? }]`
-- A granted lease carries `providerInstanceId`, the Claude account to delegate to.
+- `GET /status` -> pools per repo (machines with phase, age, limited threads and how long they wait for an account; queue; leases), `budget: { unit, usedToday, dailyLimit }` in small-machine-hours, `sizes: [{ size, max, inUse }]`, machine `size`, why creates are blocked, last Lizard error, and `accounts: [{ id, free, limitedUntil? }]`
+- A granted lease carries `providerInstanceId`, the Claude account to delegate to, and `size`, so the agent knows when it got a smaller machine.
 - `POST /close { machineId }`
 - `POST /setup/add { repo, line, reason, by? }`, `POST /setup/show { repo }`, `POST /setup/remove { repo, step, by? }`: the repo's machine setup script (see "Per-repo machine setup").
 
@@ -197,7 +198,7 @@ Release: the client calls `release(leaseId)`. A crashed client: the lease expire
   - Hourly cap: at most `createsPerRepoPerHour` (default 3) creates per repo in any rolling hour, short-lived ones included. One tick never plans past it.
   - Both show as the queued ticket's `reason` and in `status`.
   - A Lizard create error is not a create (no machine was made); it pauses creates as before.
-- Usage: each create adds `createChargeMinutes` (default 10) to the UTC day's bucket at once, so a loop of short-lived machines still runs into `dailyMachineHours`. Each tick (and each close) then adds every machine's time since `usageAccruedAt`, skipping its first `createChargeMinutes`. Machines bill while the daemon is down, so that time counts too.
+- Usage, in weighted seconds (`SIZE_WEIGHT` of the machine's size): each create adds `createChargeMinutes` (default 10) to the UTC day's bucket at once, so a loop of short-lived machines still runs into `dailySmallMachineHours`. Each tick (and each close) then adds every machine's time since `usageAccruedAt`, skipping its first `createChargeMinutes`. Machines bill while the daemon is down, so that time counts too.
 - Ended tickets are pruned after an hour, granted ones a day after their lease ends.
 
 ## Config `~/.t3lizard/config.json`
@@ -206,25 +207,25 @@ Release: the client calls `release(leaseId)`. A crashed client: the lease expire
 {
   "project": "<lizard project id>",
   "template": "claude",
-  "size": "small",
+  "sizes": [{ "size": "small", "max": 1 }, { "size": "mini", "max": 2 }],
   "perRepoCap": 4,
-  "totalCap": 1,
   "idleCloseMinutes": 10,
   "recycleMinutes": 240,
   "lifetimeMinutes": 60,
   "maxLifetimeMinutes": 60,
   "leaseMinutes": 90,
   "ticketMaxWaitMinutes": 60,
-  "dailyMachineHours": 20,
+  "dailySmallMachineHours": 20,
   "createsPerRepoPerHour": 3,
   "createChargeMinutes": 10,
   "proxyPortRange": [47300, 47399],
   "forwardEnv": ["GH_TOKEN"],
-  "accountRetryMinutes": 30
+  "accountRetryMinutes": 30,
+  "setupTimeoutMinutes": 20
 }
 ```
 
-Trial defaults shown (trial: 1 small machine at a time, 1 hour lifetime). `totalCap` defaults to 1 because the trial refuses a second Small (403 `TRIAL_SIZE_RUNNING`); raise it after the first payment. Two more keys: `sandboxUser` (default `"user"`) and `tickSeconds` (default 15). `T3LIZARD_HOME` overrides `~/.t3lizard`. Secrets live in `~/.t3lizard/secrets.env` (mode 600): `LIZARD_API_KEY`, the forwarded env, and the Claude accounts `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN_2`, ... Never log secret values.
+Trial defaults shown. The Lizard trial runs 1 small, 2 mini and 2 nano at once, each for at most 1 hour (a further one of a size fails with 403 `TRIAL_SIZE_RUNNING`). The default ladder uses the small and both minis; nano (0.5 vCPU, 1 GB) is too small for builds and is left out. After the first payment, add `medium` or raise the counts, and raise `maxLifetimeMinutes`. Older configs still load: `size` + `totalCap` become `sizes: [{ size, max: totalCap }]`, and `dailyMachineHours` is the older name of `dailySmallMachineHours` (giving both forms is an error). Two more keys: `sandboxUser` (default `"user"`) and `tickSeconds` (default 15). `T3LIZARD_HOME` overrides `~/.t3lizard`. Secrets live in `~/.t3lizard/secrets.env` (mode 600): `LIZARD_API_KEY`, the forwarded env, and the Claude accounts `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN_2`, ... Never log secret values.
 
 ## Files
 

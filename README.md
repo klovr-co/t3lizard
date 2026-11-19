@@ -7,7 +7,7 @@ One daemon owns every machine, lease and queue.
 The CLI and the MCP server are thin clients. Each call is one request to the daemon.
 
 Each repo has its own pool.
-A pool holds at most `perRepoCap` machines (default 4), and all pools together hold at most `totalCap`.
+A pool holds at most `perRepoCap` machines (default 4). All pools together use a size ladder: by default 1 small and 2 mini machines.
 When every machine is busy, requests wait in a FIFO queue.
 A machine that stays idle for `idleCloseMinutes` closes, but only when nothing is queued.
 
@@ -57,29 +57,31 @@ The config file is `~/.t3lizard/config.json`. Every key is optional except `proj
 {
   "project": "<lizard project id>",
   "template": "claude",
-  "size": "small",
+  "sizes": [{ "size": "small", "max": 1 }, { "size": "mini", "max": 2 }],
   "perRepoCap": 4,
-  "totalCap": 1,
   "idleCloseMinutes": 10,
   "recycleMinutes": 240,
   "lifetimeMinutes": 60,
   "maxLifetimeMinutes": 60,
   "leaseMinutes": 90,
   "ticketMaxWaitMinutes": 60,
-  "dailyMachineHours": 20,
+  "dailySmallMachineHours": 20,
   "createsPerRepoPerHour": 3,
   "createChargeMinutes": 10,
   "proxyPortRange": [47300, 47399],
   "forwardEnv": ["GH_TOKEN"],
   "sandboxUser": "user",
   "tickSeconds": 15,
-  "accountRetryMinutes": 30
+  "accountRetryMinutes": 30,
+  "setupTimeoutMinutes": 20
 }
 ```
 
 - `template` must be a glibc image. The default, `claude`, is Debian 12. Lizard's `base` template is Alpine (musl), and T3 Code does not run there. Bring-up checks this first and fails with a clear message.
-- `dailyMachineHours` is a hard budget. The daemon creates no machine once today's machine-hours (UTC) reach it.
-- Each create counts at least `createChargeMinutes` against that budget, even when the machine lives for seconds.
+- `sizes` is the size ladder: at most `max` machines of each size at once. A ticket that needs a new machine gets the largest size with room. The oldest ticket gets the largest idle machine. The lease and `status` show the size.
+- `dailySmallMachineHours` is a hard budget, in small-machine-hours. An hour of a small machine counts 1, a mini 0.5, a nano 0.25 (Lizard's per-hour prices). The daemon creates no machine once today's total (UTC) reaches it.
+- Each create counts at least `createChargeMinutes` (times its weight) against that budget, even when the machine lives for seconds.
+- Older configs still load. `size` and `totalCap` become `sizes: [{ "size": ..., "max": totalCap }]`. `dailyMachineHours` is the older name of `dailySmallMachineHours`.
 - `createsPerRepoPerHour` caps creates per repo in any rolling hour.
 - When a machine never becomes ready (bring-up fails, or it vanishes), creates back off for 2, then 5, then 15 minutes. One machine that becomes ready resets this. The reason shows on the queued ticket and in `status`.
 - `lifetimeMinutes` is the Lizard timeout set at create. Near the deadline, a leased machine is extended up to `maxLifetimeMinutes`. An idle one closes.
@@ -192,11 +194,11 @@ Each command prints JSON from the daemon.
 
 ## Trial limits
 
-The Lizard trial runs one Small machine at a time, for at most one hour.
-A second Small fails with 403 `TRIAL_SIZE_RUNNING`.
-So the defaults are `totalCap: 1`, `lifetimeMinutes: 60` and `maxLifetimeMinutes: 60`.
-Other repos queue behind the one machine.
-After the first payment, raise `totalCap` and `maxLifetimeMinutes`.
+The Lizard trial runs 1 small, 2 mini and 2 nano machines at once, each for at most one hour.
+One more of a size fails with 403 `TRIAL_SIZE_RUNNING`.
+So the default ladder is 1 small and 2 mini, with `lifetimeMinutes: 60` and `maxLifetimeMinutes: 60`.
+Nano (0.5 vCPU, 1 GB) is left out: it is too small for builds.
+After the first payment, add `medium` or raise the counts, and raise `maxLifetimeMinutes`.
 
 ## Tests
 

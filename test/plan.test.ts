@@ -9,16 +9,15 @@ const NOW = Date.parse("2026-11-19T12:00:00Z");
 const config: Config = {
   project: "p",
   template: "claude",
-  size: "small",
+  sizes: [{ size: "small", max: 4 }],
   perRepoCap: 4,
-  totalCap: 4,
   idleCloseMinutes: 10,
   recycleMinutes: 240,
   lifetimeMinutes: 60,
   maxLifetimeMinutes: 180,
   leaseMinutes: 90,
   ticketMaxWaitMinutes: 60,
-  dailyMachineHours: 20,
+  dailySmallMachineHours: 20,
   createsPerRepoPerHour: 3,
   createChargeMinutes: 10,
   proxyPortRange: [47300, 47399],
@@ -57,9 +56,9 @@ test("grants the oldest queued ticket of the repo to an idle machine", () => {
 
 test("never grants a machine of another repo", () => {
   const s = state([machine("m1", "b", idle(1))], [queued("t1", "a")], {});
-  const actions = plan(s, NOW, { ...config, totalCap: 2 });
+  const actions = plan(s, NOW, { ...config, sizes: [{ size: "small", max: 2 }] });
   assert.equal(actions.some((a) => a.kind === "grant"), false);
-  assert.deepEqual(actions.filter((a) => a.kind === "create"), [{ kind: "create", repo: "a" }]);
+  assert.deepEqual(actions.filter((a) => a.kind === "create"), [{ kind: "create", repo: "a", size: "small" }]);
 });
 
 test("creates one machine per unmet ticket, up to the per-repo cap", () => {
@@ -73,7 +72,7 @@ test("counts machines still coming up as capacity already on the way", () => {
     [machine("m1", "a", { kind: "creating" }), machine("m2", "a", { kind: "installing" }), machine("m3", "a", { kind: "linking" })],
     [queued("t1", "a"), queued("t2", "a"), queued("t3", "a"), queued("t4", "a")],
   );
-  assert.deepEqual(plan(s, NOW, config).filter((a) => a.kind === "create"), [{ kind: "create", repo: "a" }]);
+  assert.deepEqual(plan(s, NOW, config).filter((a) => a.kind === "create"), [{ kind: "create", repo: "a", size: "small" }]);
   const again = state(Object.values(s.machines), s.tickets.slice(0, 3));
   assert.deepEqual(plan(again, NOW, config), []);
 });
@@ -81,7 +80,7 @@ test("counts machines still coming up as capacity already on the way", () => {
 test("does not create past the total cap across repos", () => {
   const leased = (id: string) => machine(id, "b", { kind: "leased", leaseId: `l-${id}` });
   const s = state([leased("b1"), leased("b2"), leased("b3")], [queued("t1", "a"), queued("t2", "a")]);
-  assert.deepEqual(plan(s, NOW, config).filter((a) => a.kind === "create"), [{ kind: "create", repo: "a" }]);
+  assert.deepEqual(plan(s, NOW, config).filter((a) => a.kind === "create"), [{ kind: "create", repo: "a", size: "small" }]);
 });
 
 test("creates nothing once today's machine-hours reach the daily budget", () => {
@@ -119,12 +118,12 @@ test("keeps an idle machine while its repo still waits for more machines", () =>
 });
 
 test("closes an idle machine of a quiet repo when another repo is blocked by the total cap", () => {
-  const trial = { ...config, totalCap: 1 };
+  const trial = { ...config, sizes: [{ size: "small" as const, max: 1 }] };
   const s = state([machine("b1", "b", idle(1))], [queued("t1", "a")]);
   assert.deepEqual(plan(s, NOW, trial), [{ kind: "close", machineId: "b1", reason: "idle" }]);
   const freeing = state([machine("b1", "b", { kind: "closing" }), machine("b2", "b", idle(1))], [queued("t1", "a")]);
-  assert.deepEqual(plan(freeing, NOW, { ...config, totalCap: 2 }), []);
-  assert.deepEqual(plan(state([], [queued("t1", "a")]), NOW, trial), [{ kind: "create", repo: "a" }]);
+  assert.deepEqual(plan(freeing, NOW, { ...config, sizes: [{ size: "small", max: 2 }] }), []);
+  assert.deepEqual(plan(state([], [queued("t1", "a")]), NOW, trial), [{ kind: "create", repo: "a", size: "small" }]);
 });
 
 test("recycles an idle machine older than recycleMinutes, queue or not", () => {
@@ -133,7 +132,7 @@ test("recycles an idle machine older than recycleMinutes, queue or not", () => {
   const actions = plan(state([old], [queued("t1", "a")]), NOW, config);
   assert.deepEqual(actions, [
     { kind: "close", machineId: "m1", reason: "recycle" },
-    { kind: "create", repo: "a" },
+    { kind: "create", repo: "a", size: "small" },
   ]);
 });
 
@@ -198,7 +197,7 @@ test("a machine dropped right after create backs creates off for 2 minutes, with
   const reason = queueInfo(s, "t1", NOW, config).reason ?? "";
   assert.match(reason, /creates back off until 2026-11-19T12:02:00\.000Z: 1 machine\(s\) in a row never became ready; last: sb-1 vanished/);
   assert.deepEqual(createsAt(s, NOW + 2 * MIN - SEC), []);
-  assert.deepEqual(createsAt(s, NOW + 2 * MIN), [{ kind: "create", repo: "a" }]);
+  assert.deepEqual(createsAt(s, NOW + 2 * MIN), [{ kind: "create", repo: "a", size: "small" }]);
 });
 
 test("repeated bring-up failures back creates off 2, 5, then 15 minutes, across repos", () => {
@@ -208,14 +207,14 @@ test("repeated bring-up failures back creates off 2, 5, then 15 minutes, across 
     const records = Array.from({ length: n }, (_, i) => lost(`sb-${i}`, NOW - (n - 1 - i) * 30 * SEC, "bring-up of sb failed: preflight failed (exit 1): no glibc", i % 2 ? "b" : "a"));
     const s = state([], [queued("t1", "c")], { creates: records });
     assert.deepEqual(createsAt(s, NOW + expected[n - 1] * MIN - SEC), [], `after ${n} failure(s)`);
-    assert.deepEqual(createsAt(s, NOW + expected[n - 1] * MIN), [{ kind: "create", repo: "c" }], `after ${n} failure(s)`);
+    assert.deepEqual(createsAt(s, NOW + expected[n - 1] * MIN), [{ kind: "create", repo: "c", size: "small" }], `after ${n} failure(s)`);
   }
 });
 
 test("one machine that becomes ready resets the backoff", () => {
   const ready: CreateRecord = { machineId: "sb-3", repo: "a", at: NOW - 3 * MIN, outcome: "ready", settledAt: NOW - SEC };
   const s = state([], [queued("t1", "a")], { creates: [lost("sb-1", NOW - 20 * SEC, "x", "b"), lost("sb-2", NOW - 10 * SEC, "x", "b"), ready] });
-  assert.deepEqual(creates(s), [{ kind: "create", repo: "a" }]);
+  assert.deepEqual(creates(s), [{ kind: "create", repo: "a", size: "small" }]);
   const pending: CreateRecord = { machineId: "sb-4", repo: "a", at: NOW - 30 * SEC, outcome: "pending" };
   const stillLost = state([], [queued("t1", "a")], { creates: [lost("sb-1", NOW - 10 * SEC, "x"), pending] });
   assert.deepEqual(creates(stillLost), [], "a create still coming up does not reset it");
@@ -224,13 +223,13 @@ test("one machine that becomes ready resets the backoff", () => {
 test("caps creates per repo per rolling hour, short-lived machines included", () => {
   const made = (id: string, minutesAgo: number, repo = "a"): CreateRecord => ({ machineId: id, repo, at: NOW - minutesAgo * MIN, outcome: "ready", settledAt: NOW - minutesAgo * MIN + MIN });
   const s = state([], [queued("t1", "a"), queued("t2", "b")], { creates: [made("sb-1", 50), made("sb-2", 40), made("sb-3", 30)] });
-  assert.deepEqual(creates(s), [{ kind: "create", repo: "b" }], "other repos are not blocked");
+  assert.deepEqual(creates(s), [{ kind: "create", repo: "b", size: "small" }], "other repos are not blocked");
   assert.match(queueInfo(s, "t1", NOW, config).reason ?? "", /3 machines created for this repo in the last hour \(cap 3\); next create after 2026-11-19T12:10:00\.000Z/);
   assert.equal(queueInfo(s, "t2", NOW, config).reason, undefined);
-  assert.deepEqual(createsAt(s, NOW + 10 * MIN).filter((a) => a.kind === "create" && a.repo === "a"), [{ kind: "create", repo: "a" }]);
+  assert.deepEqual(createsAt(s, NOW + 10 * MIN).filter((a) => a.kind === "create" && a.repo === "a"), [{ kind: "create", repo: "a", size: "small" }]);
 
   const twoMade = state([], [queued("t1", "a"), queued("t2", "a"), queued("t3", "a")], { creates: [made("sb-1", 50), made("sb-2", 40)] });
-  assert.deepEqual(creates(twoMade), [{ kind: "create", repo: "a" }], "one tick never creates past the hourly cap");
+  assert.deepEqual(creates(twoMade), [{ kind: "create", repo: "a", size: "small" }], "one tick never creates past the hourly cap");
 });
 
 const A1 = "claudeAgent_acct1";
@@ -298,4 +297,77 @@ test("a machine does not wait past maxLifetimeMinutes or the daily budget", () =
   const w2 = accountWait(spent, m, NOW, config);
   assert.ok(w2 && "blocked" in w2 && w2.blocked.includes("daily budget"));
   assert.equal(plan(spent, NOW, config).some((a) => a.kind === "extendLease"), false);
+});
+
+// ---- size ladder ----
+
+const trialLadder: Config = { ...config, sizes: [{ size: "small", max: 1 }, { size: "mini", max: 2 }] };
+const sized = (id: string, repo: string, size: Machine["size"], phase: MachinePhase) => machine(id, repo, phase, { size });
+const leased = (id: string) => ({ kind: "leased", leaseId: `l-${id}` }) as MachinePhase;
+
+test("the ladder: each new machine is the largest size with room", () => {
+  const one = state([], [queued("t1", "a")]);
+  assert.deepEqual(plan(one, NOW, trialLadder), [{ kind: "create", repo: "a", size: "small" }]);
+  const four = state([], [queued("t1", "a", 4), queued("t2", "a", 3), queued("t3", "a", 2), queued("t4", "a", 1)]);
+  assert.deepEqual(
+    plan(four, NOW, trialLadder).filter((a) => a.kind === "create"),
+    [
+      { kind: "create", repo: "a", size: "small" },
+      { kind: "create", repo: "a", size: "mini" },
+      { kind: "create", repo: "a", size: "mini" },
+    ],
+    "small first, then the two minis; the fourth ticket waits",
+  );
+  const smallBusy = state([sized("s1", "b", "small", leased("s1"))], [queued("t1", "a")]);
+  assert.deepEqual(plan(smallBusy, NOW, trialLadder), [{ kind: "create", repo: "a", size: "mini" }], "small taken: a mini now, not a wait");
+  const smallComing = state([sized("s1", "a", "small", { kind: "installing" })], [queued("t1", "a"), queued("t2", "a")]);
+  assert.deepEqual(plan(smallComing, NOW, trialLadder), [{ kind: "create", repo: "a", size: "mini" }], "a machine coming up counts for its size and for the queue");
+});
+
+test("a mixed pool: the oldest ticket gets the largest idle machine, and sizes serve any repo", () => {
+  const s = state(
+    [sized("m1", "a", "mini", idle(1)), sized("s1", "a", "small", idle(1)), sized("m2", "a", "mini", idle(1))],
+    [queued("t-old", "a", 5), queued("t-new", "a", 1)],
+  );
+  assert.deepEqual(plan(s, NOW, trialLadder).filter((x) => x.kind === "grant"), [
+    { kind: "grant", ticketId: "t-old", machineId: "s1" },
+    { kind: "grant", ticketId: "t-new", machineId: "m1" },
+  ]);
+  // An idle mini is granted at once rather than waiting for a new small to come up.
+  const miniIdle = state([sized("m1", "a", "mini", idle(1))], [queued("t1", "a")]);
+  assert.deepEqual(plan(miniIdle, NOW, trialLadder).filter((x) => x.kind !== "close"), [{ kind: "grant", ticketId: "t1", machineId: "m1" }]);
+  // A small for repo b, minis for repo a: both repos run at the same time.
+  const two = state([sized("s1", "b", "small", leased("s1"))], [queued("ta", "a"), queued("tb", "b")]);
+  assert.deepEqual(plan(two, NOW, trialLadder).filter((x) => x.kind === "create"), [
+    { kind: "create", repo: "a", size: "mini" },
+    { kind: "create", repo: "b", size: "mini" },
+  ]);
+});
+
+test("a queue spread across sizes waits with the full ladder as the reason, and perRepoCap still holds", () => {
+  const machines = [sized("s1", "a", "small", leased("s1")), sized("m1", "a", "mini", leased("m1")), sized("m2", "b", "mini", leased("m2"))];
+  const s = state(machines, [queued("t1", "a", 3), queued("t2", "b", 2), queued("t3", "a", 1)]);
+  assert.deepEqual(plan(s, NOW, trialLadder), []);
+  assert.equal(queueInfo(s, "t1", NOW, trialLadder).reason, "every machine size is in use (small 1/1, mini 2/2)");
+  assert.equal(queueInfo(s, "t3", NOW, trialLadder).position, 2);
+  // The released small goes to the oldest ticket of its repo.
+  const freed = state([sized("s1", "a", "small", idle(0)), machines[1], machines[2]], s.tickets);
+  assert.deepEqual(plan(freed, NOW, trialLadder), [{ kind: "grant", ticketId: "t1", machineId: "s1" }]);
+  // perRepoCap 1: repo a has its machine; a free mini goes to repo b only.
+  const capped = state([sized("s1", "a", "small", leased("s1"))], [queued("ta", "a", 2), queued("tb", "b", 1)]);
+  assert.deepEqual(plan(capped, NOW, { ...trialLadder, perRepoCap: 1 }), [{ kind: "create", repo: "b", size: "mini" }]);
+});
+
+test("the budget counts small-machine-hours, so a mini's wait costs half", () => {
+  const s = state([], [queued("t1", "a")], { usage: { "2026-11-19": 20 * 3600 } });
+  assert.match(queueInfo(s, "t1", NOW, trialLadder).reason ?? "", /daily budget used: 20\.00 of 20 small-machine-hours/);
+
+  // Every account limited for 30 more minutes: waiting 40 minutes costs 0.67 on a small, 0.33 on a mini.
+  const withAccounts = { ...trialLadder, accounts: ["acct1"] };
+  const limited = { limitedThreads: [{ threadId: "th", runId: "r", account: "acct1" }] };
+  const extra = { usage: { "2026-11-19": 19.5 * 3600 }, accounts: { acct1: { limitedUntil: NOW + 30 * MIN } } };
+  const small = state([machine("s1", "a", leased("s1"), { size: "small", ...limited })], [], extra);
+  const mini = state([machine("m1", "a", leased("m1"), { size: "mini", ...limited })], [], extra);
+  assert.match(JSON.stringify(accountWait(small, small.machines.s1, NOW, withAccounts)), /would pass the daily budget of 20 small-machine-hours/);
+  assert.deepEqual(accountWait(mini, mini.machines.m1, NOW, withAccounts), { until: NOW + 40 * MIN });
 });

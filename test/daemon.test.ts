@@ -22,7 +22,7 @@ async function harness(t: { after(fn: () => unknown): void }, overrides: Partial
   const lizard = shared?.lizard ?? new FakeLizard(() => clock.now);
   const t3 = shared?.t3 ?? new FakeT3();
   const logs: string[] = [];
-  const config: Config = { ...DEFAULT_CONFIG, project: "p", perRepoCap: 2, totalCap: 2, proxyPortRange: [47380, 47399], ...overrides };
+  const config: Config = { ...DEFAULT_CONFIG, project: "p", perRepoCap: 2, sizes: [{ size: "small", max: 2 }], proxyPortRange: [47380, 47399], ...overrides };
   const daemon = new Daemon({
     lizard,
     t3,
@@ -260,13 +260,13 @@ test("usage is counted per machine-second and the state file keeps no other secr
   await h.daemon.settled();
   await h.advance(0);
   await h.advance(30);
-  assert.equal((await h.api("/status")).machineHoursToday, 0.5);
+  assert.equal((await h.api("/status")).budget.usedToday, 0.5);
   assert.equal(readFileSync(paths(h.home).state, "utf8").includes("gh-secret"), false);
 });
 
 test("machines that vanish right after create cannot loop: backoff, hourly cap and budget charge", async (t) => {
   // The live test made 7 sandboxes in 90 s. Here every sandbox is gone by its first step.
-  const h = await harness(t, { ticketMaxWaitMinutes: 180, totalCap: 1 });
+  const h = await harness(t, { ticketMaxWaitMinutes: 180, sizes: [{ size: "small", max: 1 }] });
   h.lizard.on.preflight = (m) => {
     for (const [id, x] of h.lizard.machines) if (x === m) h.lizard.machines.delete(id);
     return { stdout: "", stderr: "sandbox not found", exitCode: 1 };
@@ -295,7 +295,7 @@ test("machines that vanish right after create cannot loop: backoff, hourly cap a
   assert.equal(timeline[58], 3, "no fourth create inside the hour");
   assert.equal(timeline[59], 4, "the fourth create comes once the first leaves the hour");
   const status = await h.api("/status");
-  assert.ok(status.machineHoursToday >= 4 * 10 / 60 - 0.01, `each create charged 10 minutes, got ${status.machineHoursToday}`);
+  assert.ok(status.budget.usedToday >= 4 * 10 / 60 - 0.01, `each create charged 10 minutes, got ${status.budget.usedToday}`);
   assert.ok(h.logs.some((l) => /never became ready: bring-up of sb-1 failed.*creates back off 2 min \(1 in a row\)/.test(l)));
 });
 
@@ -417,4 +417,24 @@ test("setup add, show and remove through the API", async (t) => {
   assert.equal(shown.history[0].by, "thread-7");
   assert.equal((await h.api("/setup/remove", { repo: REPO, step: 1 })).removed.reason, "jq missing (thread-7)");
   assert.equal((await h.api("/setup/show", { repo: REPO })).steps.length, 0);
+});
+
+test("a mini lease shows its size, status shows the ladder, and usage is weighted by size", async (t) => {
+  const h = await harness(t, { sizes: [{ size: "small", max: 1 }, { size: "mini", max: 2 }], idleCloseMinutes: 120 });
+  const t0 = await h.api("/acquire", { repo: REPO, ref: "main", holder: "a" });
+  await h.daemon.settled();
+  const t1 = await h.api("/acquire", { repo: REPO, ref: "main", holder: "b" });
+  await h.daemon.settled();
+  const a = await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 1 });
+  const b = await h.api("/wait", { ticketId: t1.ticketId, maxSeconds: 1 });
+  assert.equal(a.lease.size, "small");
+  assert.equal(b.lease.size, "mini");
+  assert.deepEqual([...h.lizard.machines.values()].map((m) => m.size), ["small", "mini"]);
+  await h.advance(0);
+  await h.advance(30);
+  const status = await h.api("/status");
+  assert.deepEqual(status.sizes, [{ size: "small", max: 1, inUse: 1 }, { size: "mini", max: 2, inUse: 1 }]);
+  assert.deepEqual(status.pools["github.com/Acme/app"].machines.map((m: { size: string }) => m.size).sort(), ["mini", "small"]);
+  assert.match(status.budget.unit, /^small-machine-hours/);
+  assert.equal(status.budget.usedToday, 0.75, "30 min of small (0.5) + 30 min of mini (0.25)");
 });

@@ -6,14 +6,14 @@ import type { Account, Remote } from "./bringup.ts";
 import { paths } from "./config.ts";
 import { LizardLimitError, LizardPaymentError } from "./lizard.ts";
 import type { Lizard } from "./lizard.ts";
-import { accountLimited, accountWait, BRINGING_UP, createBackoff, createBlock, nextFreeAccount, plan, queueInfo, repoCreateBlock, utcDay } from "./plan.ts";
+import { accountLimited, accountWait, BRINGING_UP, BUDGET_UNIT, createBackoff, createBlock, nextFreeAccount, plan, queueInfo, repoCreateBlock, sizesInUse, usedSmallHours, utcDay } from "./plan.ts";
 import { startProxy } from "./proxy.ts";
 import { addStep, readHistory, readSetup, removeStep } from "./setup.ts";
 import type { RepoSetup } from "./setup.ts";
 import type { Proxy } from "./proxy.ts";
 import type { LocalT3 } from "./t3local.ts";
-import { emptyState } from "./types.ts";
-import type { AccountId, Action, CloseReason, Config, CreateRecord, Lease, Machine, MachineId, MachinePhase, RepoKey, State, Ticket } from "./types.ts";
+import { emptyState, SIZE_WEIGHT } from "./types.ts";
+import type { AccountId, Action, CloseReason, Config, CreateRecord, Lease, Machine, MachineId, MachinePhase, RepoKey, Size, State, Ticket } from "./types.ts";
 
 const MINUTE = 60_000;
 const PENDING = "pending:";
@@ -49,6 +49,8 @@ export class ApiError extends Error {
 export type LeaseView = {
   leaseId: string;
   machineId: MachineId;
+  /** The machine's size. A busy ladder can hand out a smaller one than usual (mini: 1 vCPU, 2 GB). */
+  size: Size;
   environmentId: string;
   projectId: string;
   workspacePath: string;
@@ -214,6 +216,7 @@ export class Daemon {
     for (const m of Object.values(this.state.machines)) {
       pool(m.repo).machines.push({
         id: m.id,
+        size: m.size,
         phase: m.phase.kind,
         ...(m.phase.kind === "failed" ? { error: m.phase.error } : {}),
         ageMinutes: minutes(now - m.createdAt),
@@ -238,9 +241,15 @@ export class Daemon {
     }
     return {
       pools,
-      machineHoursToday: Number(((this.state.usage[utcDay(now)] ?? 0) / 3600).toFixed(2)),
-      dailyMachineHours: config.dailyMachineHours,
-      totalCap: config.totalCap,
+      budget: {
+        unit: `${BUDGET_UNIT}: 1 h of small = 1, mini = 0.5, nano = 0.25 (Lizard per-hour prices)`,
+        usedToday: Number(usedSmallHours(this.state, now).toFixed(2)),
+        dailyLimit: config.dailySmallMachineHours,
+      },
+      sizes: (() => {
+        const used = sizesInUse(Object.values(this.state.machines));
+        return config.sizes.map((s) => ({ size: s.size, max: s.max, inUse: used.get(s.size) ?? 0 }));
+      })(),
       perRepoCap: config.perRepoCap,
       createsBlocked: createBlock(this.state, now, config),
       lastLizardError: this.state.lastLizardError,
@@ -265,6 +274,7 @@ export class Daemon {
         lease: {
           leaseId: lease.id,
           machineId: m.id,
+          size: m.size,
           environmentId: m.environmentId,
           projectId: m.projectId,
           workspacePath: m.workspacePath,
@@ -288,7 +298,7 @@ export class Daemon {
         this.launch(`grant:${a.machineId}`, () => this.grant(a.ticketId, a.machineId));
         return;
       case "create":
-        this.create(a.repo);
+        this.create(a.repo, a.size);
         return;
       case "extend":
         this.launch(`extend:${a.machineId}`, () => this.extend(a.machineId, a.deadline));
@@ -315,18 +325,18 @@ export class Daemon {
     }
   }
 
-  private create(repo: RepoKey): void {
+  private create(repo: RepoKey, size: Size): void {
     const { config } = this.deps;
     const now = this.deps.now();
     const lifetimeMs = config.lifetimeMinutes * MINUTE;
     const pendingId = `${PENDING}${randomUUID()}`;
-    this.state.machines[pendingId] = { id: pendingId, repo, size: config.size, createdAt: now, deadline: now + lifetimeMs, phase: { kind: "creating" } };
+    this.state.machines[pendingId] = { id: pendingId, repo, size, createdAt: now, deadline: now + lifetimeMs, phase: { kind: "creating" } };
     const record: CreateRecord = { machineId: pendingId, repo, at: now, outcome: "pending" };
     (this.state.creates ??= []).push(record);
     this.createsInFlight++;
     this.launch(`create:${pendingId}`, async () => {
       try {
-        const { id, deadline } = await this.deps.lizard.create(repo, config.size, lifetimeMs);
+        const { id, deadline } = await this.deps.lizard.create(repo, size, lifetimeMs);
         const pending = this.state.machines[pendingId];
         delete this.state.machines[pendingId];
         this.state.machines[id] = { ...pending, id, deadline, phase: { kind: "installing" } };
@@ -334,8 +344,8 @@ export class Daemon {
         // Every machine counts at least createChargeMinutes, so a create loop of short-lived
         // machines still runs into the daily budget. accrueUsage skips that first stretch.
         const day = utcDay(pending.createdAt);
-        this.state.usage[day] = (this.state.usage[day] ?? 0) + config.createChargeMinutes * 60;
-        this.deps.log(`machine ${id} created for ${repo}`);
+        this.state.usage[day] = (this.state.usage[day] ?? 0) + config.createChargeMinutes * 60 * SIZE_WEIGHT[size];
+        this.deps.log(`machine ${id} (${size}) created for ${repo}`);
         this.save();
         this.launch(`bringup:${id}`, () => this.bringUp(id));
       } catch (e) {
@@ -468,7 +478,7 @@ export class Daemon {
     this.state.leases[lease.id] = lease;
     this.replaceTicket({ ...current, status: "granted", leaseId: lease.id });
     this.setPhase(m, { kind: "leased", leaseId: lease.id });
-    this.deps.log(`lease ${lease.id}: machine ${machineId} to ${current.holder} at ${current.ref}`);
+    this.deps.log(`lease ${lease.id}: machine ${machineId} (${m.size}) to ${current.holder} at ${current.ref}`);
   }
 
   private async extend(id: MachineId, deadline: number): Promise<void> {
@@ -841,7 +851,7 @@ export class Daemon {
     const charged = this.deps.config.createChargeMinutes * MINUTE;
     let ms = 0;
     for (const m of Object.values(this.state.machines)) {
-      if (!m.id.startsWith(PENDING)) ms += Math.max(0, now - Math.max(since, m.createdAt + charged));
+      if (!m.id.startsWith(PENDING)) ms += Math.max(0, now - Math.max(since, m.createdAt + charged)) * SIZE_WEIGHT[m.size];
     }
     const day = utcDay(now);
     this.state.usage[day] = (this.state.usage[day] ?? 0) + ms / 1000;

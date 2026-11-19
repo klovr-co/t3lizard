@@ -1,4 +1,5 @@
-import type { AccountId, Action, Config, CreateRecord, Machine, MachineId, RepoKey, State, Ticket } from "./types.ts";
+import { SIZE_WEIGHT } from "./types.ts";
+import type { AccountId, Action, Config, CreateRecord, Machine, MachineId, RepoKey, Size, SizeSlot, State, Ticket } from "./types.ts";
 
 const MINUTE = 60_000;
 export const DEADLINE_MARGIN_MS = 5 * MINUTE;
@@ -14,6 +15,30 @@ const iso = (t: number) => new Date(t).toISOString();
 
 export function utcDay(now: number): string {
   return new Date(now).toISOString().slice(0, 10);
+}
+
+/** The budget unit: an hour of a small machine. Other sizes count by price (SIZE_WEIGHT). */
+export const BUDGET_UNIT = "small-machine-hours";
+
+/** Today's spend in small-machine-hours. state.usage holds weighted seconds per UTC day. */
+export function usedSmallHours(state: State, now: number): number {
+  return (state.usage[utcDay(now)] ?? 0) / 3600;
+}
+
+/** Machines per size, every phase counted: Lizard counts a sandbox until it is killed. */
+export function sizesInUse(machines: Machine[]): Map<Size, number> {
+  const used = new Map<Size, number>();
+  for (const m of machines) used.set(m.size, (used.get(m.size) ?? 0) + 1);
+  return used;
+}
+
+/** The largest size on the ladder with room, given machines per size. */
+export function sizeWithRoom(ladder: SizeSlot[], used: Map<Size, number>): Size | undefined {
+  return ladder.find((s) => (used.get(s.size) ?? 0) < s.max)?.size;
+}
+
+export function ladderText(ladder: SizeSlot[], used: Map<Size, number>): string {
+  return ladder.map((s) => `${s.size} ${used.get(s.size) ?? 0}/${s.max}`).join(", ");
 }
 
 /**
@@ -50,9 +75,9 @@ export function createBlock(state: State, now: number, config: Config): string |
   if (backoff) {
     return `creates back off until ${iso(backoff.until)}: ${backoff.failures} machine(s) in a row never became ready; last: ${backoff.reason}`;
   }
-  const usedHours = (state.usage[utcDay(now)] ?? 0) / 3600;
-  if (usedHours >= config.dailyMachineHours) {
-    return `daily budget used: ${usedHours.toFixed(2)} of ${config.dailyMachineHours} machine-hours`;
+  const usedHours = usedSmallHours(state, now);
+  if (usedHours >= config.dailySmallMachineHours) {
+    return `daily budget used: ${usedHours.toFixed(2)} of ${config.dailySmallMachineHours} ${BUDGET_UNIT}`;
   }
   return undefined;
 }
@@ -83,8 +108,8 @@ export function accountWait(state: State, m: Machine, now: number, config: Confi
   const until = frees + ACCOUNT_WAIT_MARGIN_MS;
   const cap = m.createdAt + config.maxLifetimeMinutes * MINUTE;
   if (until > cap) return { blocked: `the next Claude account frees at ${iso(frees)}, after this machine's maximum lifetime (${iso(cap)})` };
-  const hours = ((state.usage[utcDay(now)] ?? 0) + (until - now) / 1000) / 3600;
-  if (hours > config.dailyMachineHours) return { blocked: `waiting until ${iso(until)} would pass the daily budget of ${config.dailyMachineHours} machine-hours` };
+  const hours = usedSmallHours(state, now) + ((until - now) / 3_600_000) * SIZE_WEIGHT[m.size];
+  if (hours > config.dailySmallMachineHours) return { blocked: `waiting until ${iso(until)} would pass the daily budget of ${config.dailySmallMachineHours} ${BUDGET_UNIT}` };
   return { until };
 }
 
@@ -161,7 +186,8 @@ export function plan(state: State, now: number, config: Config): Action[] {
     if (m.phase.kind !== "idle" || closingNow.has(m.id)) continue;
     idleByRepo.set(m.repo, [...(idleByRepo.get(m.repo) ?? []), m]);
   }
-  for (const list of idleByRepo.values()) list.sort((a, b) => b.deadline - a.deadline);
+  // The oldest ticket gets the largest idle machine; among equals, the one with the most time left.
+  for (const list of idleByRepo.values()) list.sort((a, b) => SIZE_WEIGHT[b.size] - SIZE_WEIGHT[a.size] || b.deadline - a.deadline);
 
   const unmet = new Map<RepoKey, number>();
   for (const t of waiting) {
@@ -171,10 +197,15 @@ export function plan(state: State, now: number, config: Config): Action[] {
   }
 
   const count = (pred: (m: Machine) => boolean) => machines.filter(pred).length;
-  let total = machines.length;
-  let slotsFreeing = count((m) => m.phase.kind === "closing") + closingNow.size;
+  const onLadder = new Set(config.sizes.map((s) => s.size));
+  const used = sizesInUse(machines);
+  let slotsFreeing = machines.filter((m) => (m.phase.kind === "closing" || closingNow.has(m.id)) && onLadder.has(m.size)).length;
   const block = createBlock(state, now, config);
-  const stealable = [...idleByRepo.values()].flat().filter((m) => !unmet.has(m.repo));
+  // Closing an idle machine of a quiet repo frees a slot of its size; larger ones first.
+  const stealable = [...idleByRepo.values()]
+    .flat()
+    .filter((m) => !unmet.has(m.repo) && onLadder.has(m.size))
+    .sort((a, b) => SIZE_WEIGHT[b.size] - SIZE_WEIGHT[a.size]);
   for (const [repo, n] of unmet) {
     let need = n - count((m) => m.repo === repo && BRINGING_UP.has(m.phase.kind));
     let inRepo = count((m) => m.repo === repo);
@@ -182,9 +213,10 @@ export function plan(state: State, now: number, config: Config): Action[] {
     // Each pass of the loop stands for one future create, so it also spends the hourly allowance.
     let allowance = config.createsPerRepoPerHour - (state.creates ?? []).filter((r) => r.repo === repo && now - r.at < HOUR).length;
     while (need > 0 && inRepo < config.perRepoCap && allowance-- > 0) {
-      if (total < config.totalCap) {
-        creates.push({ kind: "create", repo });
-        total++;
+      const size = sizeWithRoom(config.sizes, used);
+      if (size) {
+        creates.push({ kind: "create", repo, size });
+        used.set(size, (used.get(size) ?? 0) + 1);
         inRepo++;
       } else if (slotsFreeing > 0) {
         slotsFreeing--;
@@ -223,6 +255,7 @@ export function queueInfo(state: State, ticketId: string, now: number, config: C
   if (inRepo.length >= config.perRepoCap) return { position, reason: `all ${config.perRepoCap} machines for this repo are busy` };
   const repoBlock = repoCreateBlock(state, ticket.repo, now, config);
   if (repoBlock) return { position, reason: repoBlock };
-  if (machines.length >= config.totalCap) return { position, reason: `total cap reached (${config.totalCap} machines)` };
+  const used = sizesInUse(machines);
+  if (!sizeWithRoom(config.sizes, used)) return { position, reason: `every machine size is in use (${ladderText(config.sizes, used)})` };
   return { position };
 }

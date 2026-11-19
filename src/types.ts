@@ -2,6 +2,19 @@ export type RepoKey = string;
 export type MachineId = string;
 export type Size = "nano" | "mini" | "small" | "medium" | "large" | "big";
 
+/**
+ * Lizard's flat per-hour price of each size, relative to small (SDK docs on `size`: nano $0.00405/h,
+ * mini $0.0081/h, small $0.0162/h, medium $0.0324/h, large $0.0648/h, big $0.1296/h). The daily
+ * budget is in small-machine-hours: an hour of a mini counts 0.5, of a nano 0.25.
+ */
+export const SIZE_WEIGHT: Record<Size, number> = { nano: 0.25, mini: 0.5, small: 1, medium: 2, large: 4, big: 8 };
+
+/** At most `max` machines of `size` at once. */
+export interface SizeSlot {
+  size: Size;
+  max: number;
+}
+
 export type MachinePhase =
   | { kind: "creating" }
   | { kind: "installing" }
@@ -114,19 +127,20 @@ export interface Config {
   project: string;
   /** Lizard template. Must be a glibc image: the T3 binary does not run on musl (Alpine). */
   template: string;
-  size: Size;
+  /** The size ladder, largest first. A ticket that needs a new machine gets the largest size with room. */
+  sizes: SizeSlot[];
   perRepoCap: number;
-  totalCap: number;
   idleCloseMinutes: number;
   recycleMinutes: number;
   lifetimeMinutes: number;
   maxLifetimeMinutes: number;
   leaseMinutes: number;
   ticketMaxWaitMinutes: number;
-  dailyMachineHours: number;
+  /** Daily budget in small-machine-hours (SIZE_WEIGHT): no creates once today's weighted hours reach it. */
+  dailySmallMachineHours: number;
   /** At most this many creates per repo in any rolling hour. */
   createsPerRepoPerHour: number;
-  /** Each create counts at least this long against dailyMachineHours, however short the machine lived. */
+  /** Each create counts at least this long (times its size weight) against the budget, however short the machine lived. */
   createChargeMinutes: number;
   proxyPortRange: [number, number];
   forwardEnv: string[];
@@ -144,7 +158,7 @@ export type CloseReason = "idle" | "recycle" | "deadline" | "failed" | "orphan" 
 
 export type Action =
   | { kind: "grant"; ticketId: string; machineId: MachineId }
-  | { kind: "create"; repo: RepoKey }
+  | { kind: "create"; repo: RepoKey; size: Size }
   | { kind: "extend"; machineId: MachineId; deadline: number }
   | { kind: "expireLease"; leaseId: string }
   | { kind: "close"; machineId: MachineId; reason: CloseReason }
