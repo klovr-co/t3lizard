@@ -1,0 +1,369 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, statSync } from "node:fs";
+import net from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { call, serveApi } from "../src/api.ts";
+import { DEFAULT_CONFIG, paths } from "../src/config.ts";
+import { Daemon } from "../src/daemon.ts";
+import { LizardLimitError } from "../src/lizard.ts";
+import { normalizeOrigin } from "../src/repo.ts";
+import type { Config } from "../src/types.ts";
+import { FakeLizard, FakeT3, noSleep } from "./fakes.ts";
+
+const MIN = 60_000;
+const REPO = "git@github.com:Acme/app.git";
+
+async function harness(t: { after(fn: () => unknown): void }, overrides: Partial<Config> = {}, shared?: { home: string; lizard: FakeLizard; t3: FakeT3; clock: { now: number } }) {
+  const home = shared?.home ?? mkdtempSync(join(tmpdir(), "t3lizard-daemon-"));
+  const clock = shared?.clock ?? { now: Date.parse("2026-11-19T12:00:00Z") };
+  const lizard = shared?.lizard ?? new FakeLizard(() => clock.now);
+  const t3 = shared?.t3 ?? new FakeT3();
+  const logs: string[] = [];
+  const config: Config = { ...DEFAULT_CONFIG, project: "p", perRepoCap: 2, totalCap: 2, proxyPortRange: [47380, 47399], ...overrides };
+  const daemon = new Daemon({
+    lizard,
+    t3,
+    config,
+    machineEnv: { GH_TOKEN: "gh-secret" },
+    accountTokens: Object.fromEntries(config.accounts.map((a) => [a, `token-of-${a}`])),
+    home,
+    resolveRepo: async (r) => normalizeOrigin(r),
+    now: () => clock.now,
+    sleep: noSleep,
+    log: (l) => logs.push(l),
+  });
+  await daemon.start();
+  const socket = paths(home).socket;
+  const server = await serveApi(daemon, socket);
+  const api = (path: string, body?: unknown) => call(socket, body === undefined ? "GET" : "POST", path, body);
+  const stop = async () => {
+    await new Promise((r) => server.close(r));
+    await daemon.stop();
+  };
+  let stopped = false;
+  t.after(() => (stopped ? undefined : stop()));
+  return {
+    home, clock, lizard, t3, logs, daemon, api,
+    stop: async () => {
+      stopped = true;
+      await stop();
+    },
+    advance: async (minutes: number) => {
+      clock.now += minutes * MIN;
+      await daemon.tick();
+      await daemon.settled();
+    },
+  };
+}
+
+const portOpen = (port: number) =>
+  new Promise<boolean>((resolve) => {
+    const s = net.connect(port, "127.0.0.1");
+    s.once("connect", () => (s.destroy(), resolve(true)));
+    s.once("error", () => resolve(false));
+  });
+
+test("acquire, queue, grant on release, then idle close", async (t) => {
+  const h = await harness(t);
+
+  const a0 = await h.api("/acquire", { repo: REPO, ref: "main", holder: "thread-a" });
+  assert.equal(a0.status, "queued");
+  assert.equal(a0.reason, "a machine is starting");
+  await h.daemon.settled();
+  const a = await h.api("/wait", { ticketId: a0.ticketId, maxSeconds: 1 });
+  assert.equal(a.status, "granted");
+  assert.equal(a.lease.machineId, "sb-1");
+  assert.equal(a.lease.environmentId, "env-1");
+  assert.equal(a.lease.projectId, "11111111-2222-3333-4444-555555555555");
+  assert.equal(a.lease.workspacePath, "/home/user/app");
+  const proxyPort = Number(new URL(h.t3.links.get("env-1")!.url).port);
+  assert.ok(await portOpen(proxyPort), "proxy listens on the linked port");
+  assert.equal(h.lizard.machines.get("sb-1")!.repo, "github.com/Acme/app");
+  assert.equal(h.lizard.machines.get("sb-1")!.files.get("env")!.content, "GH_TOKEN='gh-secret'\n");
+  assert.ok(h.lizard.machines.get("sb-1")!.steps.includes("reset"), "checkout reset before the lease");
+
+  const b0 = await h.api("/acquire", { repo: REPO, ref: "feature", holder: "thread-b" });
+  await h.daemon.settled();
+  const b = await h.api("/wait", { ticketId: b0.ticketId, maxSeconds: 1 });
+  assert.equal(b.lease.machineId, "sb-2");
+
+  const c0 = await h.api("/acquire", { repo: REPO, ref: "main", holder: "thread-c" });
+  assert.deepEqual({ status: c0.status, position: c0.position, reason: c0.reason }, {
+    status: "queued",
+    position: 1,
+    reason: "all 2 machines for this repo are busy",
+  });
+  assert.equal(h.lizard.machines.size, 2, "no machine over the per-repo cap");
+
+  const waiting = h.api("/wait", { ticketId: c0.ticketId, maxSeconds: 10 });
+  assert.deepEqual(await h.api("/release", { leaseId: a.lease.leaseId }), { released: true });
+  const c = await waiting;
+  assert.equal(c.status, "granted");
+  assert.equal(c.lease.machineId, "sb-1", "the released machine goes to the next ticket");
+  assert.equal((await h.api("/wait", { ticketId: a0.ticketId, maxSeconds: 0 })).status, "released");
+
+  await h.api("/release", { leaseId: b.lease.leaseId });
+  await h.api("/release", { ticketId: c0.ticketId });
+  await h.daemon.settled();
+
+  await h.advance(9);
+  assert.equal(h.lizard.killed.length, 0);
+  await h.advance(1);
+  assert.deepEqual(h.lizard.killed.sort(), ["sb-1", "sb-2"]);
+  assert.deepEqual(h.t3.unlinked.sort(), ["env-1", "env-2"]);
+  assert.deepEqual((await h.api("/status")).pools, {});
+  assert.equal(await portOpen(proxyPort), false, "proxy closed with its machine");
+
+  const stateFile = paths(h.home).state;
+  assert.equal(statSync(stateFile).mode & 0o777, 0o600);
+  assert.ok(statSync(stateFile).size > 0);
+  assert.equal(statSync(paths(h.home).socket).mode & 0o777, 0o600);
+});
+
+test("a restarted daemon re-opens proxies, keeps leases, and drops machines Lizard lost", async (t) => {
+  const first = await harness(t);
+  const a0 = await first.api("/acquire", { repo: REPO, ref: "main", holder: "a" });
+  await first.daemon.settled();
+  const a = await first.api("/wait", { ticketId: a0.ticketId, maxSeconds: 1 });
+  const port = Number(new URL(first.t3.links.get("env-1")!.url).port);
+  await first.stop();
+  assert.equal(await portOpen(port), false);
+
+  const second = await harness(t, {}, first);
+  assert.ok(await portOpen(port), "proxy back on the same port, so the existing T3 link still works");
+  assert.equal((await second.api("/wait", { ticketId: a0.ticketId, maxSeconds: 0 })).lease.leaseId, a.lease.leaseId);
+
+  second.lizard.machines.delete("sb-1");
+  await second.advance(0);
+  assert.equal((await second.api("/wait", { ticketId: a0.ticketId, maxSeconds: 0 })).status, "released");
+  assert.deepEqual(second.t3.unlinked, ["env-1"]);
+  assert.equal(await portOpen(port), false);
+});
+
+test("kills sandboxes Lizard has that the daemon does not know", async (t) => {
+  const h = await harness(t);
+  await h.lizard.create("github.com/Acme/app", "small", 60 * MIN);
+  await h.advance(0);
+  assert.deepEqual(h.lizard.killed, ["sb-1"]);
+});
+
+test("bring-up exposes the front proxy and points its Host at the machine's fixed devbox port before linking", async (t) => {
+  const exposed: number[] = [];
+  const first = await harness(t);
+  const expose = first.lizard.exposePort.bind(first.lizard);
+  first.lizard.exposePort = async (id, port) => (exposed.push(port), expose(id, port));
+  await first.api("/acquire", { repo: REPO, ref: "main", holder: "a" });
+  await first.daemon.settled();
+  const m = first.lizard.machines.get("sb-1")!;
+  const link = first.t3.links.get("env-1")!;
+  const port = Number(new URL(link.url).port);
+  assert.deepEqual(exposed, [3774]);
+  assert.equal(m.files.get("front-host")!.content, `127.0.0.1:${port}\n`);
+  assert.ok(m.steps.indexOf("front-health") < m.steps.lastIndexOf("pair"), "front configured before pairing");
+
+  const frontSetups = m.steps.filter((s) => s === "front-health").length;
+  await first.stop();
+  // Something else holds the port while the daemon restarts: it must wait for the same port.
+  const squatter = net.createServer();
+  await new Promise<void>((r) => squatter.listen(port, "127.0.0.1", r));
+  const second = await harness(t, {}, first);
+  await second.advance(1);
+  assert.ok(second.logs.some((l) => l.includes(`proxy for sb-1`) && l.includes("did not reopen")));
+  await new Promise((r) => squatter.close(r));
+  await second.advance(1);
+  assert.ok(await portOpen(port), "reopened on the next tick");
+  assert.equal(second.daemon.state.machines["sb-1"].proxyPort, port, "the port is kept across restarts");
+  assert.equal(m.steps.filter((s) => s === "front-health").length, frontSetups, "no reconfigure needed");
+  assert.equal(m.files.get("front-host")!.content, `127.0.0.1:${port}\n`);
+});
+
+test("never kills a sandbox someone else started in the project", async (t) => {
+  const h = await harness(t);
+  h.lizard.addForeign("theirs", { owner: "ci" });
+  h.lizard.addForeign("unlabelled");
+  await h.advance(0);
+  await h.advance(1);
+  assert.deepEqual(h.lizard.killed, []);
+});
+
+test("a machine missing from a lagging listing is kept while Lizard says it is alive", async (t) => {
+  const h = await harness(t);
+  const t0 = await h.api("/acquire", { repo: REPO, ref: "main", holder: "a" });
+  await h.daemon.settled();
+  h.lizard.hiddenFromList.add("sb-1");
+  await h.advance(1);
+  assert.equal(h.lizard.killed.length, 0);
+  assert.equal((await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 0 })).status, "granted");
+  assert.ok(!h.logs.some((l) => l.includes("gone at Lizard")));
+});
+
+test("a Lizard limit pauses creates until retryAfter and shows in status", async (t) => {
+  const h = await harness(t);
+  h.lizard.nextCreateError = new LizardLimitError("Too many sandbox starts", "SANDBOX_RATE_LIMITED", 120);
+  const t0 = await h.api("/acquire", { repo: REPO, ref: "main", holder: "a" });
+  await h.daemon.settled();
+  const queued = await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 0 });
+  assert.match(queued.reason, /paused.*Too many sandbox starts/);
+  assert.equal((await h.api("/status")).lastLizardError.code, "SANDBOX_RATE_LIMITED");
+  await h.advance(1);
+  assert.equal(h.lizard.machines.size, 0, "no retry inside retryAfter");
+  await h.advance(1);
+  assert.equal((await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 0 })).status, "granted");
+});
+
+test("a ref that cannot be fetched cancels the ticket and keeps the machine", async (t) => {
+  const h = await harness(t);
+  h.lizard.on.reset = (_m, args) => (args[1] === "unpushed" ? { stdout: "", stderr: "fatal: couldn't find remote ref unpushed", exitCode: 10 } : undefined);
+  const t0 = await h.api("/acquire", { repo: REPO, ref: "unpushed", holder: "a" });
+  await h.daemon.settled();
+  const v = await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 0 });
+  assert.equal(v.status, "cancelled");
+  assert.match(v.error, /cannot fetch unpushed/);
+  const t1 = await h.api("/acquire", { repo: REPO, ref: "main", holder: "b" });
+  assert.equal(t1.status, "granted", "the same machine serves the next ticket at once");
+  assert.equal(t1.lease.machineId, "sb-1");
+});
+
+test("an expired lease is kept while the machine has a busy thread, then freed", async (t) => {
+  const h = await harness(t, { leaseMinutes: 30, idleCloseMinutes: 60 });
+  const t0 = await h.api("/acquire", { repo: REPO, ref: "main", holder: "a" });
+  await h.daemon.settled();
+  h.lizard.threads = [{ status: "running" }];
+  await h.advance(30);
+  assert.equal((await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 0 })).status, "granted");
+  h.lizard.threads = [{ status: "completed" }];
+  await h.advance(10);
+  assert.equal((await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 0 })).status, "released");
+  assert.equal((await h.api("/status")).pools["github.com/Acme/app"].machines[0].phase, "idle");
+});
+
+test("a failed bring-up closes the machine and pauses creates", async (t) => {
+  const h = await harness(t);
+  h.lizard.on["install-poll"] = () => ({ stdout: "failed\nnpm ERR! network\n", stderr: "", exitCode: 0 });
+  const t0 = await h.api("/acquire", { repo: REPO, ref: "main", holder: "a" });
+  await h.daemon.settled();
+  await h.advance(0);
+  assert.deepEqual(h.lizard.killed, ["sb-1"]);
+  const v = await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 0 });
+  assert.equal(v.status, "queued");
+  assert.match(v.reason, /bring-up of sb-1 failed/);
+  await h.advance(1);
+  assert.equal(h.lizard.machines.size, 0);
+});
+
+test("usage is counted per machine-second and the state file keeps no other secret than the access token", async (t) => {
+  const h = await harness(t, { idleCloseMinutes: 120 });
+  await h.api("/acquire", { repo: REPO, ref: "main", holder: "a" });
+  await h.daemon.settled();
+  await h.advance(0);
+  await h.advance(30);
+  assert.equal((await h.api("/status")).machineHoursToday, 0.5);
+  assert.equal(readFileSync(paths(h.home).state, "utf8").includes("gh-secret"), false);
+});
+
+test("machines that vanish right after create cannot loop: backoff, hourly cap and budget charge", async (t) => {
+  // The live test made 7 sandboxes in 90 s. Here every sandbox is gone by its first step.
+  const h = await harness(t, { ticketMaxWaitMinutes: 180, totalCap: 1 });
+  h.lizard.on.preflight = (m) => {
+    for (const [id, x] of h.lizard.machines) if (x === m) h.lizard.machines.delete(id);
+    return { stdout: "", stderr: "sandbox not found", exitCode: 1 };
+  };
+  let calls = 0;
+  const create = h.lizard.create.bind(h.lizard);
+  h.lizard.create = (...a) => (calls++, create(...a));
+  const created = () => calls;
+  const t0 = await h.api("/acquire", { repo: REPO, ref: "main", holder: "a" });
+  await h.daemon.settled();
+  await h.advance(0);
+  assert.equal(created(), 1);
+  const v = await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 0 });
+  assert.equal(v.status, "queued");
+  assert.match(v.reason, /creates back off until .*: 1 machine\(s\) in a row never became ready; last: bring-up of sb-1 failed/);
+
+  const timeline: number[] = [];
+  for (let minute = 1; minute <= 70; minute++) {
+    await h.advance(1);
+    timeline.push(created());
+  }
+  // Creates at minute 0, 2 (after 2 min), 7 (after 5 more), then the hourly cap of 3 holds until minute 60.
+  assert.equal(timeline[1], 2, "second create after the 2-minute backoff");
+  assert.equal(timeline[5], 2);
+  assert.equal(timeline[6], 3, "third create after the 5-minute backoff");
+  assert.equal(timeline[58], 3, "no fourth create inside the hour");
+  assert.equal(timeline[59], 4, "the fourth create comes once the first leaves the hour");
+  const status = await h.api("/status");
+  assert.ok(status.machineHoursToday >= 4 * 10 / 60 - 0.01, `each create charged 10 minutes, got ${status.machineHoursToday}`);
+  assert.ok(h.logs.some((l) => /never became ready: bring-up of sb-1 failed.*creates back off 2 min \(1 in a row\)/.test(l)));
+});
+
+test("a sandbox that vanishes during bring-up is dropped by reconcile and counts as a failed create", async (t) => {
+  const h = await harness(t);
+  let open!: () => void;
+  const gate = new Promise<void>((r) => (open = r));
+  const exec = h.lizard.exec.bind(h.lizard);
+  h.lizard.exec = async (id, cmd, timeoutMs) => {
+    if (cmd[2].includes("# t3lizard:install-poll")) await gate;
+    return exec(id, cmd, timeoutMs);
+  };
+  await h.api("/acquire", { repo: REPO, ref: "main", holder: "a" });
+  for (let i = 0; i < 20 && !h.lizard.machines.get("sb-1")?.steps.includes("install-start"); i++) await new Promise((r) => setImmediate(r));
+  h.lizard.machines.delete("sb-1");
+  await h.daemon.tick();
+  open();
+  await h.daemon.settled();
+  assert.ok(h.logs.some((l) => l.includes("machine sb-1 is gone at Lizard; dropping it")));
+  assert.ok(h.logs.some((l) => /sb-1 vanished at Lizard during bring-up \(installing\); creates back off 2 min/.test(l)));
+  await h.advance(1);
+  assert.equal(h.lizard.machines.size, 0, "no create inside the backoff");
+  await h.advance(1);
+  assert.equal(h.lizard.machines.size, 1, "one create after it");
+});
+
+test("a thread that hits a usage limit continues on the next account; with all limited the machine waits", async (t) => {
+  const A1 = "claudeAgent_acct1";
+  const A2 = "claudeAgent_acct2";
+  const h = await harness(t, { accounts: [A1, A2], accountRetryMinutes: 30, leaseMinutes: 20, lifetimeMinutes: 30, maxLifetimeMinutes: 240 });
+  const queued = await h.api("/acquire", { repo: REPO, ref: "main", holder: "thread-a" });
+  await h.daemon.settled();
+  const granted = await h.api("/wait", { ticketId: queued.ticketId, maxSeconds: 1 });
+  assert.equal(granted.lease.providerInstanceId, A1);
+  const m = h.lizard.machines.get("sb-1")!;
+  assert.doesNotMatch(m.files.get("env")!.content, /token-of/, "no account token in the machine-wide env");
+  assert.equal(m.files.get("accounts.json")!.content, JSON.stringify([{ id: A1, token: `token-of-${A1}` }, { id: A2, token: `token-of-${A2}` }]));
+
+  const limitedOn = (runId: string, account: string) =>
+    h.lizard.limited.set("sb-1", [{ threadId: "t1", runId, account, requestedAt: new Date(h.clock.now).toISOString(), notice: "Claude usage limit reached." }]);
+
+  // acct1 hits its limit: the thread moves to acct2 and new delegations go there too.
+  limitedOn("r1", A1);
+  await h.advance(1);
+  assert.deepEqual(h.lizard.continued, [["sb-1", "t1", "r1", A2]]);
+  const s1 = await h.api("/status");
+  assert.deepEqual(s1.accounts.map((a: { id: string; free: boolean }) => [a.id, a.free]), [[A1, false], [A2, true]]);
+  assert.equal((await h.api("/wait", { ticketId: queued.ticketId, maxSeconds: 1 })).lease.providerInstanceId, A2);
+
+  // A later scan that still shows r1 (it raced the continue) does not continue it again.
+  await h.advance(1);
+  assert.equal(h.lizard.continued.length, 1);
+
+  // acct2 hits its limit too: nothing is free, so the lease and machine are kept until acct1 frees, plus 10 minutes.
+  limitedOn("r2", A2);
+  await h.advance(1);
+  assert.equal(h.lizard.continued.length, 1);
+  const acct1Frees = h.clock.now - 2 * MIN + 30 * MIN;
+  const lease = h.daemon.state.leases[granted.lease.leaseId];
+  assert.equal(lease.expiresAt, acct1Frees + 10 * MIN);
+  assert.equal(h.lizard.machines.get("sb-1")!.deadline, acct1Frees + 10 * MIN);
+  const s2 = await h.api("/status");
+  assert.equal(s2.pools["github.com/Acme/app"].machines[0].waitingForAccountUntil, new Date(acct1Frees + 10 * MIN).toISOString());
+
+  // Once acct1 frees, the thread continues there.
+  await h.advance(28);
+  assert.deepEqual(h.lizard.continued.at(-1), ["sb-1", "t1", "r2", A1]);
+
+  // A released lease takes its limited threads with it; the next holder's scan ignores older runs.
+  await h.api("/release", { leaseId: granted.lease.leaseId });
+  assert.equal(h.daemon.state.machines["sb-1"].limitedThreads, undefined);
+});

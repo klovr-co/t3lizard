@@ -1,0 +1,284 @@
+import { readFileSync } from "node:fs";
+import type { ExecResult, Lizard } from "./lizard.ts";
+import type { LocalT3 } from "./t3local.ts";
+import type { AccountId, LimitedThread, MachineId, RepoKey } from "./types.ts";
+
+/** T3 Code on the machine. Bound to 127.0.0.1: only the front proxy reaches it. */
+export const T3_PORT = 3773;
+/** The machine front proxy. This is the port Lizard exposes. */
+export const FRONT_PORT = 3774;
+/** On the machine: what the front proxy sets as Host, i.e. the devbox proxy's 127.0.0.1:<port>. */
+export const FRONT_HOST_FILE = "front-host";
+export const FRONT_JS = readFileSync(new URL("./machine/front.mjs", import.meta.url), "utf8");
+export const ACCOUNTS_JS = readFileSync(new URL("./machine/accounts.mjs", import.meta.url), "utf8");
+/** T3 thread statuses that mean an agent is still working on the machine. */
+export const BUSY_STATUSES: ReadonlySet<string> = new Set(["waiting", "running", "starting", "queued", "preparing"]);
+
+const INSTALL_TIMEOUT_MS = 25 * 60_000;
+const HEALTH_TIMEOUT_MS = 3 * 60_000;
+
+/** Every machine-side step is a bash script whose first line names the step. */
+function script(step: string, body: string, ...args: string[]): string[] {
+  const prelude = [
+    `# t3lizard:${step}`,
+    "set -euo pipefail",
+    'D="$HOME/.t3lizard"',
+    'export PATH="$HOME/.local/bin:$D/node/bin:$PATH"',
+    'if [ -f "$D/env" ]; then set -a; . "$D/env"; set +a; fi',
+  ];
+  return ["bash", "-c", [...prelude, body].join("\n"), "t3lizard", ...args];
+}
+
+export const INSTALL_SH = `#!/usr/bin/env bash
+# t3lizard machine install. Safe to run again. $1 is the exact T3 Code version.
+set -euo pipefail
+V="$1"
+D="$HOME/.t3lizard"
+exec 9>"$D/install.lock"
+flock -n 9 || exit 0
+trap 'echo "install failed at line $LINENO" > "$D/install.failed"' ERR
+export PATH="$HOME/.local/bin:$D/node/bin:$PATH"
+if [ -f "$D/env" ]; then set -a; . "$D/env"; set +a; fi
+
+have="$(t3 --version 2>/dev/null || true)"; have="\${have#t3 v}"
+if [ "$have" != "$V" ]; then
+  echo "installing t3 $V"
+  curl -fsSL https://t3.codes/install.sh | T3CODE_VERSION="$V" T3CODE_INSTALL_BIN_DIR="$HOME/.local/bin" sh
+fi
+
+major="$(node -v 2>/dev/null | sed -n 's/^v\\([0-9]*\\).*/\\1/p' || true)"
+if [ "$major" = "" ] || [ "$major" -lt 22 ]; then
+  echo "installing node 24"
+  arch=x64
+  if [ "$(uname -m)" = aarch64 ]; then arch=arm64; fi
+  mkdir -p "$D/node"
+  curl -fsSL "https://nodejs.org/dist/v24.11.1/node-v24.11.1-linux-$arch.tar.gz" | tar -xz -C "$D/node" --strip-components=1
+fi
+
+npm_g() { npm install -g --prefix "$HOME/.local" --no-fund --no-audit "$@"; }
+command -v claude >/dev/null || npm_g @anthropic-ai/claude-code
+command -v codex >/dev/null || npm_g @openai/codex || echo "codex install failed, continuing"
+
+mkdir -p "$HOME/.t3/userdata"
+node -e '
+const fs = require("fs"); const f = process.argv[1];
+let s = {}; try { s = JSON.parse(fs.readFileSync(f, "utf8")); } catch {}
+s.linkedEnvironmentsEnabled = true;
+fs.writeFileSync(f + ".tmp", JSON.stringify(s, null, 2)); fs.renameSync(f + ".tmp", f);
+' "$HOME/.t3/userdata/settings.json"
+
+git config --global credential.helper '!f() { test "$1" = get && echo username=x-access-token && echo "password=$GH_TOKEN"; }; f'
+
+rm -f "$D/install.failed"
+echo "$V" > "$D/install.done"
+echo "install done"
+`;
+
+/**
+ * Keeps one long-running command alive: `supervise.sh <name> <cmd...>`. A second copy for the same
+ * name exits at once (flock), so starting it again is safe. Output goes to $D/<name>.log.
+ */
+export const SUPERVISE_SH = `#!/usr/bin/env bash
+D="$HOME/.t3lizard"
+name="$1"; shift
+exec 9>"$D/$name.lock"
+flock -n 9 || exit 0
+export PATH="$HOME/.local/bin:$D/node/bin:$PATH"
+if [ -f "$D/env" ]; then set -a; . "$D/env"; set +a; fi
+while true; do
+  "$@" >> "$D/$name.log" 2>&1 9>&- || true
+  echo "$name exited, restarting" >> "$D/$name.log"
+  sleep 2
+done
+`;
+
+const START_SUPERVISED = [
+  `setsid nohup bash "$D/supervise.sh" t3 t3 serve --host 127.0.0.1 --port ${T3_PORT} --base-dir "$HOME/.t3" --no-browser > /dev/null 2>&1 < /dev/null &`,
+  `setsid nohup bash "$D/supervise.sh" front node "$D/front.mjs" ${FRONT_PORT} ${T3_PORT} "$D/${FRONT_HOST_FILE}" > /dev/null 2>&1 < /dev/null &`,
+].join("\n");
+
+export interface Remote {
+  lizard: Lizard;
+  sleep(ms: number): Promise<void>;
+}
+
+async function run(r: Remote, id: MachineId, cmd: string[], timeoutMs?: number): Promise<ExecResult> {
+  const res = await r.lizard.exec(id, cmd, timeoutMs);
+  if (res.exitCode !== 0) {
+    const step = cmd[2].match(/# t3lizard:([\w-]+)/)?.[1] ?? "step";
+    throw new Error(`${step} failed (exit ${res.exitCode}): ${(res.stderr || res.stdout).trim().slice(-2000)}`);
+  }
+  return res;
+}
+
+function writeFile(r: Remote, id: MachineId, name: string, content: string, mode: string) {
+  const body = [
+    'mkdir -p "$D" && chmod 700 "$D"',
+    'printf %s "$2" | base64 -d > "$D/$1.tmp"',
+    'chmod "$3" "$D/$1.tmp"',
+    'mv "$D/$1.tmp" "$D/$1"',
+  ].join("\n");
+  return run(r, id, script("write", body, name, Buffer.from(content).toString("base64"), mode));
+}
+
+export function envFile(env: Record<string, string>): string {
+  return Object.entries(env)
+    .map(([k, v]) => `${k}='${v.replace(/'/g, `'\\''`)}'\n`)
+    .join("");
+}
+
+async function pollUntil(r: Remote, timeoutMs: number, everyMs: number, check: () => Promise<boolean>, what: string) {
+  for (let waited = 0; waited <= timeoutMs; waited += everyMs) {
+    if (await check()) return;
+    await r.sleep(everyMs);
+  }
+  throw new Error(`${what} did not finish in ${Math.round(timeoutMs / 60_000)} minutes`);
+}
+
+/**
+ * Fails fast, with a clear message, on an image the install cannot work on. The T3 binary needs
+ * glibc: on musl (Alpine, Lizard's `base` template) it fails as "t3: not found". The install
+ * script itself needs flock and setsid, and would otherwise hang until its poll times out.
+ */
+export const PREFLIGHT_SH = `if ! getconf GNU_LIBC_VERSION > /dev/null 2>&1; then
+  os="$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" || echo "unknown OS")"
+  echo "no glibc on this image ($os). T3 Code needs glibc: set \\"template\\" in config.json to a glibc template such as claude" >&2
+  exit 1
+fi
+missing=""
+for tool in curl git tar gzip flock setsid base64 sed grep awk; do
+  command -v "$tool" > /dev/null || missing="$missing $tool"
+done
+if [ -n "$missing" ]; then echo "missing tools on this image:$missing" >&2; exit 1; fi
+echo "$(getconf GNU_LIBC_VERSION) $(uname -m)"`;
+
+export interface Account {
+  id: AccountId;
+  token: string;
+}
+
+/**
+ * Steps 1-3: secrets, install, Claude accounts, `t3 serve` supervisor. Each step converges when re-run.
+ * Account tokens never go to the env file: each lives only in its own T3 provider instance.
+ */
+export async function install(r: Remote, id: MachineId, secrets: Record<string, string>, t3Version: string, accounts: Account[]): Promise<void> {
+  await run(r, id, script("preflight", PREFLIGHT_SH));
+  await writeFile(r, id, "env", envFile(secrets), "600");
+  await writeFile(r, id, "install.sh", INSTALL_SH, "700");
+  await writeFile(r, id, "supervise.sh", SUPERVISE_SH, "700");
+  await writeFile(r, id, "front.mjs", FRONT_JS, "600");
+  await writeFile(r, id, "accounts.mjs", ACCOUNTS_JS, "600");
+
+  await run(
+    r,
+    id,
+    script(
+      "install-start",
+      'rm -f "$D/install.failed"\nif ! grep -qxF "$1" "$D/install.done" 2>/dev/null; then setsid nohup bash "$D/install.sh" "$1" > "$D/install.log" 2>&1 < /dev/null & fi',
+      t3Version,
+    ),
+  );
+  const poll = script(
+    "install-poll",
+    'if grep -qxF "$1" "$D/install.done" 2>/dev/null; then echo done\nelif [ -f "$D/install.failed" ]; then echo failed; tail -n 30 "$D/install.log"\nelse echo running; fi',
+    t3Version,
+  );
+  await pollUntil(r, INSTALL_TIMEOUT_MS, 10_000, async () => {
+    const out = (await run(r, id, poll)).stdout;
+    if (out.startsWith("failed")) throw new Error(`install failed:\n${out.slice("failed".length).trim()}`);
+    return out.startsWith("done");
+  }, "install");
+
+  if (accounts.length) {
+    await writeFile(r, id, "accounts.json", JSON.stringify(accounts), "600");
+    await run(r, id, script("accounts", 'node "$D/accounts.mjs" configure "$D/accounts.json"'));
+  }
+  await run(r, id, script("serve-start", START_SUPERVISED));
+  const health = script("health", `curl -fsS -m 5 http://127.0.0.1:${T3_PORT}/.well-known/t3/environment > /dev/null`);
+  await pollUntil(r, HEALTH_TIMEOUT_MS, 3_000, async () => (await r.lizard.exec(id, health, 30_000)).exitCode === 0, "t3 serve start");
+}
+
+export function cloneUrl(repo: RepoKey): string {
+  return `https://${repo}.git`;
+}
+
+/** Step 4: clone the repo and register it with the machine's T3. Returns its path and T3 project id. */
+export async function setupProject(r: Remote, id: MachineId, repo: RepoKey): Promise<{ workspacePath: string; projectId: string }> {
+  const body = `dir="$HOME/$2"
+if [ ! -d "$dir/.git" ]; then git clone "$1" "$dir"; fi
+idf="$D/project-id"
+if [ ! -s "$idf" ]; then
+  out="$(t3 project add "$dir" --base-dir "$HOME/.t3" 2>&1)" || { echo "$out" >&2; exit 1; }
+  printf '%s\\n' "$out" | grep -oE 'Added project [0-9a-f-]{36}' | awk '{print $3}' > "$idf.tmp" || true
+  if [ ! -s "$idf.tmp" ]; then echo "no project id in: $out" >&2; exit 1; fi
+  mv "$idf.tmp" "$idf"
+fi
+echo "WORKSPACE=$dir"
+echo "PROJECT=$(cat "$idf")"`;
+  const name = repo.split("/").pop() ?? "repo";
+  const out = (await run(r, id, script("project", body, cloneUrl(repo), name), 600_000)).stdout;
+  const kv = Object.fromEntries(out.split("\n").flatMap((l) => (l.includes("=") ? [l.split(/=(.*)/s).slice(0, 2)] : [])));
+  if (!kv.WORKSPACE || !kv.PROJECT) throw new Error(`project setup printed no workspace or project id: ${out.trim()}`);
+  return { workspacePath: kv.WORKSPACE, projectId: kv.PROJECT };
+}
+
+/**
+ * Step 5b: tell the machine's front proxy which Host to give T3: the devbox proxy's exact
+ * 127.0.0.1:<port>, the URL the devbox links to. T3 builds its origin from Host, and MCP OAuth
+ * (resource) and DPoP (htu) only pass when that origin equals the URL the devbox client signs.
+ * Waits until T3 answers through the front proxy.
+ */
+export async function configureFront(r: Remote, id: MachineId, devboxPort: number): Promise<string> {
+  const host = `127.0.0.1:${devboxPort}`;
+  await writeFile(r, id, FRONT_HOST_FILE, `${host}\n`, "600");
+  const health = script("front-health", `curl -fsS -m 5 http://127.0.0.1:${FRONT_PORT}/.well-known/t3/environment > /dev/null`);
+  await pollUntil(r, HEALTH_TIMEOUT_MS, 3_000, async () => (await r.lizard.exec(id, health, 30_000)).exitCode === 0, "front proxy start");
+  return host;
+}
+
+/** Step 6: pair the machine's T3 with the local one through the proxy. Retries while the route warms up. */
+export async function pairAndLink(r: Remote, t3: LocalT3, id: MachineId, proxyPort: number, attempts = 5): Promise<string> {
+  let last: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const out = (await run(r, id, script("pair", 't3 auth pairing create --base-dir "$HOME/.t3" --json --ttl 10m --label "$1"', `t3lizard ${id}`))).stdout;
+      const code = JSON.parse(out.slice(out.indexOf("{"), out.lastIndexOf("}") + 1)).credential;
+      if (typeof code !== "string") throw new Error(`no pairing credential in: ${out.trim()}`);
+      return await t3.link(`http://127.0.0.1:${proxyPort}`, code);
+    } catch (e) {
+      last = e;
+      if (i < attempts - 1) await r.sleep(5_000);
+    }
+  }
+  throw last;
+}
+
+export type ResetResult = { ok: true } | { ok: false; badRef: string };
+
+/** Point the checkout at `ref` before a lease is handed out. Keeps ignored files (node_modules) warm. */
+export async function resetCheckout(r: Remote, id: MachineId, workspacePath: string, ref: string): Promise<ResetResult> {
+  const body = 'cd "$1"\ngit fetch origin "$2" || exit 10\ngit checkout --force --detach FETCH_HEAD\ngit clean -ffd';
+  const res = await r.lizard.exec(id, script("reset", body, workspacePath, ref), 600_000);
+  if (res.exitCode === 10) return { ok: false, badRef: `cannot fetch ${ref}: ${res.stderr.trim().slice(-500)}` };
+  if (res.exitCode !== 0) throw new Error(`reset failed (exit ${res.exitCode}): ${(res.stderr || res.stdout).trim().slice(-2000)}`);
+  return { ok: true };
+}
+
+/** How many of the machine's T3 threads are still working. */
+export async function busyThreads(r: Remote, id: MachineId, workspacePath: string): Promise<number> {
+  const out = (await run(r, id, script("threads", 't3 thread list --json --project "$1" --base-dir "$HOME/.t3"', workspacePath))).stdout;
+  const rows = JSON.parse(out.trim() || "[]") as { status?: unknown }[];
+  return rows.filter((t) => BUSY_STATUSES.has(String(t.status))).length;
+}
+
+/** Threads on the machine whose latest run failed on a usage limit, with the account it ran on. */
+export async function scanLimits(r: Remote, id: MachineId): Promise<(LimitedThread & { notice: string; requestedAt: string })[]> {
+  const out = (await run(r, id, script("scan", 'node "$D/accounts.mjs" scan'), 120_000)).stdout;
+  return JSON.parse(out.trim()).limited;
+}
+
+/** Moves a limited thread to `account` and sends "continue". Skips a thread that moved on from `runId`. */
+export async function continueOnAccount(r: Remote, id: MachineId, t: LimitedThread): Promise<{ skipped?: string }> {
+  const out = (await run(r, id, script("continue", 'node "$D/accounts.mjs" continue "$1" "$2" "$3"', t.threadId, t.runId, t.account), 120_000)).stdout;
+  return JSON.parse(out.trim());
+}

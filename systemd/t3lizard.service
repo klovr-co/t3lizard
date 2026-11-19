@@ -1,0 +1,27 @@
+# systemd user unit for the t3lizard daemon.
+# Install (not done by the build):
+#   cp systemd/t3lizard.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now t3lizard
+# Edit the paths below to match this machine first.
+[Unit]
+Description=t3lizard: pool of Lizard cloud machines running T3 Code
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Node 24 runs the .ts sources directly. Use an absolute node path; nvm is not on PATH under systemd.
+ExecStart=%h/.nvm/versions/node/v24.21.0/bin/node %h/t3lizard/bin/t3lizard daemon
+WorkingDirectory=%h/t3lizard
+Environment=PATH=%h/.nvm/versions/node/v24.21.0/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# The local T3 Code CLI. Set it to the output of `which t3`.
+Environment=T3LIZARD_T3_CLI=%h/.local/bin/t3
+Restart=always
+RestartSec=5
+# The daemon reopens proxies from state on start, so a restart keeps T3 links working.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+UMask=0077
+
+[Install]
+WantedBy=default.target

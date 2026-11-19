@@ -1,0 +1,803 @@
+import { randomUUID } from "node:crypto";
+import { EventEmitter } from "node:events";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { busyThreads, configureFront, continueOnAccount, FRONT_PORT, install, pairAndLink, resetCheckout, scanLimits, setupProject } from "./bringup.ts";
+import type { Account, Remote } from "./bringup.ts";
+import { paths } from "./config.ts";
+import { LizardLimitError, LizardPaymentError } from "./lizard.ts";
+import type { Lizard } from "./lizard.ts";
+import { accountLimited, accountWait, BRINGING_UP, createBackoff, createBlock, nextFreeAccount, plan, queueInfo, repoCreateBlock, utcDay } from "./plan.ts";
+import { startProxy } from "./proxy.ts";
+import type { Proxy } from "./proxy.ts";
+import type { LocalT3 } from "./t3local.ts";
+import { emptyState } from "./types.ts";
+import type { AccountId, Action, CloseReason, Config, CreateRecord, Lease, Machine, MachineId, MachinePhase, RepoKey, State, Ticket } from "./types.ts";
+
+const MINUTE = 60_000;
+const PENDING = "pending:";
+const BUSY_LEASE_GRACE_MS = 10 * MINUTE;
+/** How often a leased machine is checked for threads stopped on a usage limit. */
+const LIMIT_SCAN_EVERY_MS = MINUTE;
+/** Allowed difference between the machine's clock and the devbox's. */
+const CLOCK_SKEW_MS = MINUTE;
+
+export interface DaemonDeps {
+  lizard: Lizard;
+  t3: LocalT3;
+  config: Config;
+  /** Values written to the machine's env file (config.forwardEnv). Never a Claude account token. */
+  machineEnv: Record<string, string>;
+  /** Token of each account in config.accounts. Goes only into that account's T3 provider instance. */
+  accountTokens: Record<AccountId, string>;
+  home: string;
+  resolveRepo(input: string): Promise<RepoKey>;
+  now(): number;
+  sleep(ms: number): Promise<void>;
+  log(line: string): void;
+}
+
+export class ApiError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+export type LeaseView = {
+  leaseId: string;
+  machineId: MachineId;
+  environmentId: string;
+  projectId: string;
+  workspacePath: string;
+  expiresAt: string;
+  /** The Claude account to delegate to: the first one not limited, else the one that frees first. */
+  providerInstanceId?: AccountId;
+};
+
+export type TicketView =
+  | { ticketId: string; status: "granted"; lease: LeaseView }
+  | { ticketId: string; status: "queued"; position: number; reason?: string }
+  | { ticketId: string; status: "released" | "cancelled" | "expired"; error?: string };
+
+/** Thrown inside a machine operation when someone else (close, reconcile) moved the machine on. */
+class Superseded extends Error {}
+
+export class Daemon {
+  state: State = emptyState();
+  private deps: DaemonDeps;
+  private files: ReturnType<typeof paths>;
+  private proxies = new Map<MachineId, Proxy>();
+  private running = new Map<string, Promise<void>>();
+  private createsInFlight = 0;
+  private createsDone = 0;
+  /** Orphans already killed, so a listing that still shows them does not kill them again every tick. */
+  private orphansKilled = new Set<MachineId>();
+  private ticking = false;
+  private changes = new EventEmitter();
+  private t3Version?: string;
+  private lastLimitScan = new Map<MachineId, number>();
+  /** A continue that failed is retried after this time, not every tick. */
+  private continueRetryAt = new Map<string, number>();
+  private remote: Remote;
+
+  constructor(deps: DaemonDeps) {
+    this.deps = deps;
+    this.files = paths(deps.home);
+    this.remote = { lizard: deps.lizard, sleep: deps.sleep };
+    this.changes.setMaxListeners(0);
+  }
+
+  // ---- lifecycle ----
+
+  /** Load state, re-open proxies so existing T3 links keep working, and resume interrupted work. */
+  async start(): Promise<void> {
+    mkdirSync(this.deps.home, { recursive: true, mode: 0o700 });
+    if (existsSync(this.files.state)) this.state = JSON.parse(readFileSync(this.files.state, "utf8"));
+    const now = this.deps.now();
+    // A create cut short by a restart may still have made a sandbox: reconcile kills it as an orphan.
+    // Its record stays, settled as lost, so it still counts toward the hourly cap and the backoff.
+    for (const r of this.state.creates ?? []) {
+      if (r.outcome === "pending" && r.machineId.startsWith(PENDING)) Object.assign(r, { outcome: "lost", settledAt: now, reason: "daemon restarted during create" });
+    }
+    for (const m of Object.values(this.state.machines)) {
+      if (m.id.startsWith(PENDING)) {
+        delete this.state.machines[m.id];
+        continue;
+      }
+      if (m.phase.kind === "resetting") m.phase = { kind: "idle", since: now };
+      if (m.proxyPort && m.hostname && m.accessToken) {
+        await this.openProxy(m).catch((e) => this.deps.log(`proxy for ${m.id} did not reopen: ${e.message}`));
+      }
+      if (m.phase.kind === "installing" || m.phase.kind === "linking") this.launch(`bringup:${m.id}`, () => this.bringUp(m.id));
+      if (m.phase.kind === "closing") this.launch(`close:${m.id}`, () => this.finishClose(m.id));
+    }
+    this.save();
+  }
+
+  async stop(): Promise<void> {
+    await this.settled();
+    await Promise.all([...this.proxies.values()].map((p) => p.close()));
+    this.proxies.clear();
+  }
+
+  /** Resolves once no background operation is running. Tests use it to step a fake clock. */
+  async settled(): Promise<void> {
+    while (this.running.size) await Promise.allSettled([...this.running.values()]);
+  }
+
+  async tick(): Promise<void> {
+    if (this.ticking) return;
+    this.ticking = true;
+    try {
+      this.accrueUsage();
+      await this.reconcile();
+      this.reopenProxies();
+      this.step();
+      this.scanForLimits();
+    } finally {
+      this.ticking = false;
+    }
+  }
+
+  /** Run the scheduler once and start what it decides. No Lizard listing. */
+  step(): void {
+    const now = this.deps.now();
+    for (const action of plan(this.state, now, this.deps.config)) this.apply(action);
+    this.pruneTickets(now);
+    this.save();
+  }
+
+  // ---- API ----
+
+  async acquire(req: { repo: string; ref: string; holder: string }): Promise<TicketView> {
+    const repo = await this.deps.resolveRepo(req.repo).catch((e) => {
+      throw new ApiError(400, `cannot resolve repo ${req.repo}: ${(e as Error).message}`);
+    });
+    const ticket: Ticket = { id: randomUUID(), repo, ref: req.ref, holder: req.holder, enqueuedAt: this.deps.now(), status: "queued" };
+    this.state.tickets.push(ticket);
+    this.deps.log(`ticket ${ticket.id} queued for ${repo}@${req.ref} by ${req.holder}`);
+    this.step();
+    // An idle machine was granted: wait out the checkout reset so the caller gets the lease now.
+    return this.waitUntil(ticket.id, 120, (v) => v.status !== "queued" || !this.isResetting(ticket.id));
+  }
+
+  wait(req: { ticketId: string; maxSeconds: number }): Promise<TicketView> {
+    return this.waitUntil(req.ticketId, Math.min(req.maxSeconds, 300), (v) => v.status !== "queued");
+  }
+
+  /** Ends a lease, or cancels a ticket (releasing its lease if it has one). */
+  release(req: { leaseId?: string; ticketId?: string }): { released: boolean } {
+    let leaseId = req.leaseId;
+    if (req.ticketId) {
+      const t = this.ticket(req.ticketId);
+      if (t.status === "queued") {
+        this.endTicket(t, "cancelled", "cancelled by holder");
+        for (const m of Object.values(this.state.machines)) {
+          if (m.phase.kind === "resetting" && m.phase.ticketId === t.id) m.phase = { kind: "idle", since: this.deps.now() };
+        }
+        this.step();
+        return { released: true };
+      }
+      if (t.status === "granted") leaseId = t.leaseId;
+    }
+    if (!leaseId || !this.state.leases[leaseId]) return { released: false };
+    this.endLease(leaseId, "released");
+    this.step();
+    return { released: true };
+  }
+
+  renew(req: { leaseId: string }): { expiresAt: string } {
+    const lease = this.state.leases[req.leaseId];
+    if (!lease) throw new ApiError(404, `no lease ${req.leaseId}`);
+    lease.expiresAt = this.deps.now() + this.deps.config.leaseMinutes * MINUTE;
+    this.save();
+    return { expiresAt: new Date(lease.expiresAt).toISOString() };
+  }
+
+  close(req: { machineId: string }): { closing: boolean } {
+    const m = this.state.machines[req.machineId];
+    if (!m || m.id.startsWith(PENDING)) throw new ApiError(404, `no machine ${req.machineId}`);
+    this.apply({ kind: "close", machineId: m.id, reason: "manual" });
+    this.save();
+    return { closing: true };
+  }
+
+  status() {
+    const now = this.deps.now();
+    const { config } = this.deps;
+    const minutes = (ms: number) => Math.round(ms / MINUTE);
+    const pools: Record<RepoKey, { machines: unknown[]; queue: unknown[]; leases: unknown[]; createsLastHour?: number; createsBlocked?: string }> = {};
+    const pool = (repo: RepoKey) => (pools[repo] ??= { machines: [], queue: [], leases: [] });
+    for (const m of Object.values(this.state.machines)) {
+      pool(m.repo).machines.push({
+        id: m.id,
+        phase: m.phase.kind,
+        ...(m.phase.kind === "failed" ? { error: m.phase.error } : {}),
+        ageMinutes: minutes(now - m.createdAt),
+        deadlineInMinutes: minutes(m.deadline - now),
+        environmentId: m.environmentId,
+        ...(m.limitedThreads?.length ? { limitedThreads: m.limitedThreads } : {}),
+        ...this.waitView(m, now),
+      });
+    }
+    for (const t of this.state.tickets) {
+      if (t.status !== "queued") continue;
+      pool(t.repo).queue.push({ ticketId: t.id, holder: t.holder, ref: t.ref, waitedMinutes: minutes(now - t.enqueuedAt), ...queueInfo(this.state, t.id, now, config) });
+    }
+    for (const [repo, p] of Object.entries(pools)) {
+      const n = (this.state.creates ?? []).filter((r) => r.repo === repo && now - r.at < 60 * MINUTE).length;
+      if (n) p.createsLastHour = n;
+      const blocked = repoCreateBlock(this.state, repo, now, config);
+      if (blocked) p.createsBlocked = blocked;
+    }
+    for (const l of Object.values(this.state.leases)) {
+      pool(l.repo).leases.push({ leaseId: l.id, machineId: l.machineId, holder: l.holder, ref: l.ref, expiresInMinutes: minutes(l.expiresAt - now) });
+    }
+    return {
+      pools,
+      machineHoursToday: Number(((this.state.usage[utcDay(now)] ?? 0) / 3600).toFixed(2)),
+      dailyMachineHours: config.dailyMachineHours,
+      totalCap: config.totalCap,
+      perRepoCap: config.perRepoCap,
+      createsBlocked: createBlock(this.state, now, config),
+      lastLizardError: this.state.lastLizardError,
+      accounts: config.accounts.map((id) => {
+        const until = this.state.accounts?.[id]?.limitedUntil;
+        return { id, free: !accountLimited(this.state, id, now), ...(until && until > now ? { limitedUntil: new Date(until).toISOString() } : {}) };
+      }),
+    };
+  }
+
+  view(ticketId: string): TicketView {
+    const t = this.ticket(ticketId);
+    if (t.status === "queued") return { ticketId, status: "queued", ...queueInfo(this.state, ticketId, this.deps.now(), this.deps.config) };
+    if (t.status === "granted") {
+      const lease = this.state.leases[t.leaseId];
+      const account = this.accountFor();
+      const m = lease && this.state.machines[lease.machineId];
+      if (!lease || !m?.environmentId || !m.projectId || !m.workspacePath) return { ticketId, status: "released" };
+      return {
+        ticketId,
+        status: "granted",
+        lease: {
+          leaseId: lease.id,
+          machineId: m.id,
+          environmentId: m.environmentId,
+          projectId: m.projectId,
+          workspacePath: m.workspacePath,
+          expiresAt: new Date(lease.expiresAt).toISOString(),
+          ...(account ? { providerInstanceId: account } : {}),
+        },
+      };
+    }
+    return { ticketId, status: t.status, ...(t.error ? { error: t.error } : {}) };
+  }
+
+  // ---- scheduler actions ----
+
+  private apply(a: Action): void {
+    switch (a.kind) {
+      case "expireTicket":
+        this.endTicket(this.ticket(a.ticketId), "expired", `waited longer than ${this.deps.config.ticketMaxWaitMinutes} minutes`);
+        return;
+      case "grant":
+        this.state.machines[a.machineId].phase = { kind: "resetting", ticketId: a.ticketId };
+        this.launch(`grant:${a.machineId}`, () => this.grant(a.ticketId, a.machineId));
+        return;
+      case "create":
+        this.create(a.repo);
+        return;
+      case "extend":
+        this.launch(`extend:${a.machineId}`, () => this.extend(a.machineId, a.deadline));
+        return;
+      case "expireLease":
+        this.launch(`lease:${a.leaseId}`, () => this.expireLease(a.leaseId));
+        return;
+      case "close":
+        this.beginClose(a.machineId, a.reason);
+        return;
+      case "extendLease": {
+        const lease = this.state.leases[a.leaseId];
+        if (!lease || lease.expiresAt >= a.expiresAt) return;
+        lease.expiresAt = a.expiresAt;
+        this.deps.log(`lease ${a.leaseId} kept until ${new Date(a.expiresAt).toISOString()}: every Claude account is limited`);
+        return;
+      }
+      case "continueThread": {
+        const key = `continue:${a.machineId}:${a.threadId}`;
+        if ((this.continueRetryAt.get(key) ?? 0) > this.deps.now()) return;
+        this.launch(key, () => this.continueThread(a));
+        return;
+      }
+    }
+  }
+
+  private create(repo: RepoKey): void {
+    const { config } = this.deps;
+    const now = this.deps.now();
+    const lifetimeMs = config.lifetimeMinutes * MINUTE;
+    const pendingId = `${PENDING}${randomUUID()}`;
+    this.state.machines[pendingId] = { id: pendingId, repo, size: config.size, createdAt: now, deadline: now + lifetimeMs, phase: { kind: "creating" } };
+    const record: CreateRecord = { machineId: pendingId, repo, at: now, outcome: "pending" };
+    (this.state.creates ??= []).push(record);
+    this.createsInFlight++;
+    this.launch(`create:${pendingId}`, async () => {
+      try {
+        const { id, deadline } = await this.deps.lizard.create(repo, config.size, lifetimeMs);
+        const pending = this.state.machines[pendingId];
+        delete this.state.machines[pendingId];
+        this.state.machines[id] = { ...pending, id, deadline, phase: { kind: "installing" } };
+        record.machineId = id;
+        // Every machine counts at least createChargeMinutes, so a create loop of short-lived
+        // machines still runs into the daily budget. accrueUsage skips that first stretch.
+        const day = utcDay(pending.createdAt);
+        this.state.usage[day] = (this.state.usage[day] ?? 0) + config.createChargeMinutes * 60;
+        this.deps.log(`machine ${id} created for ${repo}`);
+        this.save();
+        this.launch(`bringup:${id}`, () => this.bringUp(id));
+      } catch (e) {
+        delete this.state.machines[pendingId];
+        // Lizard made no machine, so this is not a create for the breaker; recordLizardError pauses creates.
+        this.state.creates = this.state.creates?.filter((r) => r !== record);
+        this.recordLizardError(e as Error);
+        this.save();
+      } finally {
+        this.createsInFlight--;
+        this.createsDone++;
+      }
+    });
+  }
+
+  private recordLizardError(e: Error): void {
+    const now = this.deps.now();
+    const err = e as Error & { code?: string; url?: string };
+    let pauseMs = MINUTE;
+    if (e instanceof LizardLimitError) pauseMs = (e.retryAfterS ?? 60) * 1000;
+    if (e instanceof LizardPaymentError) pauseMs = 10 * MINUTE;
+    this.state.createsPausedUntil = now + pauseMs;
+    this.state.lastLizardError = { at: now, message: e.message, ...(err.code ? { code: err.code } : {}), ...(err.url ? { url: err.url } : {}) };
+    this.deps.log(`Lizard create failed, creates paused for ${Math.round(pauseMs / 1000)} s: ${e.message}`);
+  }
+
+  /** Bring-up steps 1-6. Idempotent, so a daemon restart simply runs it again. */
+  private async bringUp(id: MachineId): Promise<void> {
+    const at = (kind: MachinePhase["kind"]) => {
+      const m = this.state.machines[id];
+      if (m?.phase.kind !== kind) throw new Superseded();
+      return m;
+    };
+    let linkedNow: string | undefined;
+    try {
+      let m = this.state.machines[id];
+      if (m?.phase.kind === "installing") {
+        this.t3Version ??= await this.deps.t3.version();
+        await install(this.remote, id, this.deps.machineEnv, this.t3Version, this.accounts());
+        this.setPhase(at("installing"), { kind: "linking" });
+      }
+      m = at("linking");
+      if (!m.workspacePath || !m.projectId) {
+        const project = await setupProject(this.remote, id, m.repo);
+        m = at("linking");
+        Object.assign(m, project);
+        this.save();
+      }
+      if (!m.hostname || !m.accessToken) {
+        // Lizard exposes the front proxy, never T3 itself: see src/machine/front.mjs.
+        const { hostname, accessToken } = await this.deps.lizard.exposePort(id, FRONT_PORT);
+        m = at("linking");
+        Object.assign(m, { hostname, accessToken });
+        this.save();
+      }
+      if (!this.proxies.has(id)) {
+        await this.openProxy(m);
+        m = at("linking");
+      }
+      if (m.frontHost !== `127.0.0.1:${m.proxyPort}`) {
+        const host = await configureFront(this.remote, id, m.proxyPort!);
+        m = at("linking");
+        m.frontHost = host;
+        this.save();
+      }
+      if (!m.environmentId) {
+        linkedNow = await pairAndLink(this.remote, this.deps.t3, id, m.proxyPort!);
+        m = at("linking");
+        m.environmentId = linkedNow;
+      }
+      this.settleCreate(id, "ready");
+      this.setPhase(m, { kind: "idle", since: this.deps.now() });
+      this.deps.log(`machine ${id} ready: environment ${m.environmentId}, project ${m.projectId}`);
+      this.step();
+    } catch (e) {
+      if (e instanceof Superseded) {
+        await this.closeProxy(id);
+        if (linkedNow) await this.deps.t3.unlink(linkedNow).catch(() => {});
+        return;
+      }
+      const m = this.state.machines[id];
+      if (m && (m.phase.kind === "installing" || m.phase.kind === "linking")) {
+        this.deps.log(`machine ${id} bring-up failed: ${(e as Error).message}`);
+        if (linkedNow) m.environmentId = linkedNow;
+        // A bring-up that fails once will likely fail again: the breaker stops a new machine every tick.
+        this.settleCreate(id, "lost", `bring-up of ${id} failed: ${(e as Error).message}`);
+        this.setPhase(m, { kind: "failed", error: (e as Error).message });
+        this.step();
+      }
+    }
+  }
+
+  private async grant(ticketId: string, machineId: MachineId): Promise<void> {
+    const reserved = () => {
+      const m = this.state.machines[machineId];
+      return m?.phase.kind === "resetting" && m.phase.ticketId === ticketId ? m : undefined;
+    };
+    const t = this.ticket(ticketId);
+    let result: Awaited<ReturnType<typeof resetCheckout>>;
+    try {
+      result = await resetCheckout(this.remote, machineId, this.state.machines[machineId].workspacePath!, t.ref);
+    } catch (e) {
+      const m = reserved();
+      if (!m) return;
+      this.setPhase(m, { kind: "failed", error: `reset failed: ${(e as Error).message}` });
+      this.endTicket(this.ticket(ticketId), "cancelled", `machine failed while preparing ${t.ref}: ${(e as Error).message}`);
+      this.step();
+      return;
+    }
+    const m = reserved();
+    if (!m) return;
+    const now = this.deps.now();
+    const current = this.ticket(ticketId);
+    if (current.status !== "queued" || !result.ok) {
+      if (!result.ok && current.status === "queued") this.endTicket(current, "cancelled", result.badRef);
+      this.setPhase(m, { kind: "idle", since: now });
+      this.step();
+      return;
+    }
+    const lease: Lease = { id: randomUUID(), machineId, repo: m.repo, ref: current.ref, holder: current.holder, grantedAt: now, expiresAt: now + this.deps.config.leaseMinutes * MINUTE };
+    this.state.leases[lease.id] = lease;
+    this.replaceTicket({ ...current, status: "granted", leaseId: lease.id });
+    this.setPhase(m, { kind: "leased", leaseId: lease.id });
+    this.deps.log(`lease ${lease.id}: machine ${machineId} to ${current.holder} at ${current.ref}`);
+  }
+
+  private async extend(id: MachineId, deadline: number): Promise<void> {
+    try {
+      await this.deps.lizard.setTimeout(id, deadline - this.deps.now());
+      const m = this.state.machines[id];
+      if (m) m.deadline = deadline;
+      this.save();
+    } catch (e) {
+      this.deps.log(`extend ${id} failed: ${(e as Error).message}`);
+    }
+  }
+
+  private async expireLease(leaseId: string): Promise<void> {
+    const lease = this.state.leases[leaseId];
+    const m = lease && this.state.machines[lease.machineId];
+    if (!lease) return;
+    const busy = m?.workspacePath ? await busyThreads(this.remote, m.id, m.workspacePath).catch(() => 0) : 0;
+    if (!this.state.leases[leaseId]) return;
+    if (busy > 0) {
+      lease.expiresAt = this.deps.now() + BUSY_LEASE_GRACE_MS;
+      this.deps.log(`lease ${leaseId} past expiry but ${busy} thread(s) still busy; checking again in 10 minutes`);
+      this.save();
+      return;
+    }
+    this.endLease(leaseId, "expired");
+    this.step();
+  }
+
+  private beginClose(id: MachineId, reason: CloseReason): void {
+    const m = this.state.machines[id];
+    if (!m || m.phase.kind === "closing") return;
+    if (m.phase.kind === "leased") delete this.state.leases[m.phase.leaseId];
+    if (BRINGING_UP.has(m.phase.kind)) this.settleCreate(id, "lost", `${id} closed (${reason}) before it became ready`);
+    this.deps.log(`closing machine ${id} (${reason})`);
+    this.setPhase(m, { kind: "closing" });
+    this.launch(`close:${id}`, () => this.finishClose(id));
+  }
+
+  /** Stop the proxy, unlink locally, kill at Lizard, forget. Each part converges when re-run. */
+  private async finishClose(id: MachineId): Promise<void> {
+    await this.closeProxy(id);
+    const m = this.state.machines[id];
+    if (!m) return;
+    if (m.environmentId) {
+      try {
+        await this.deps.t3.unlink(m.environmentId);
+        m.environmentId = undefined;
+      } catch (e) {
+        this.deps.log(`unlink ${m.environmentId} failed: ${(e as Error).message}`);
+      }
+    }
+    try {
+      await this.deps.lizard.kill(id);
+    } catch (e) {
+      this.setPhase(m, { kind: "failed", error: `kill failed: ${(e as Error).message}` });
+      return;
+    }
+    this.accrueUsage();
+    delete this.state.machines[id];
+    this.deps.log(`machine ${id} closed`);
+    this.step();
+  }
+
+  // ---- Claude accounts ----
+
+  private accounts(): Account[] {
+    return this.deps.config.accounts.map((id) => ({ id, token: this.deps.accountTokens[id] }));
+  }
+
+  /** The account a new delegation should use: the first free one, else the one that frees first. */
+  private accountFor(): AccountId | undefined {
+    const { accounts } = this.deps.config;
+    const until = (a: AccountId) => this.state.accounts?.[a]?.limitedUntil ?? 0;
+    return nextFreeAccount(this.state, this.deps.now(), accounts) ?? [...accounts].sort((a, b) => until(a) - until(b))[0];
+  }
+
+  private waitView(m: Machine, now: number) {
+    const wait = accountWait(this.state, m, now, this.deps.config);
+    if (!wait) return {};
+    return "until" in wait ? { waitingForAccountUntil: new Date(wait.until).toISOString() } : { cannotWaitForAccount: wait.blocked };
+  }
+
+  /** Each leased machine, at most once a minute: find threads stopped on a usage limit. */
+  private scanForLimits(): void {
+    if (!this.deps.config.accounts.length) return;
+    const now = this.deps.now();
+    for (const m of Object.values(this.state.machines)) {
+      if (m.phase.kind !== "leased") {
+        this.lastLimitScan.delete(m.id);
+        continue;
+      }
+      if (now - (this.lastLimitScan.get(m.id) ?? 0) < LIMIT_SCAN_EVERY_MS) continue;
+      this.lastLimitScan.set(m.id, now);
+      const lease = this.state.leases[m.phase.leaseId];
+      if (lease) this.launch(`scan:${m.id}`, () => this.scanMachine(m.id, lease));
+    }
+  }
+
+  /**
+   * Records the threads that hit a usage limit, and marks each newly limited account as limited
+   * for accountRetryMinutes. plan() then continues them on the next free account.
+   */
+  private async scanMachine(id: MachineId, lease: Lease): Promise<void> {
+    let found: Awaited<ReturnType<typeof scanLimits>>;
+    try {
+      found = await scanLimits(this.remote, id);
+    } catch (e) {
+      this.deps.log(`limit scan of ${id} failed: ${(e as Error).message}`);
+      return;
+    }
+    const m = this.state.machines[id];
+    if (m?.phase.kind !== "leased" || m.phase.leaseId !== lease.id) return;
+    const { accounts, accountRetryMinutes } = this.deps.config;
+    const now = this.deps.now();
+    const known = new Set((m.limitedThreads ?? []).map((t) => t.runId));
+    const continued = new Set(m.continuedRuns ?? []);
+    // Threads of an earlier lease on this machine are not this holder's: leave them alone.
+    const ours = (t: (typeof found)[number]) => Date.parse(t.requestedAt) >= lease.grantedAt - CLOCK_SKEW_MS;
+    const limited = found.filter((t) => accounts.includes(t.account) && !continued.has(t.runId) && ours(t));
+    for (const t of limited) {
+      if (known.has(t.runId)) continue;
+      const account = ((this.state.accounts ??= {})[t.account] ??= {});
+      account.limitedUntil = Math.max(account.limitedUntil ?? 0, now + accountRetryMinutes * MINUTE);
+      this.deps.log(`thread ${t.threadId} on ${id} stopped on the usage limit of ${t.account} ("${t.notice}"); ${t.account} skipped until ${new Date(account.limitedUntil).toISOString()}`);
+    }
+    m.limitedThreads = limited.map(({ threadId, runId, account }) => ({ threadId, runId, account }));
+    if (!m.limitedThreads.length) delete m.limitedThreads;
+    this.step();
+  }
+
+  private async continueThread(a: Extract<Action, { kind: "continueThread" }>): Promise<void> {
+    const key = `continue:${a.machineId}:${a.threadId}`;
+    let out: { skipped?: string };
+    try {
+      out = await continueOnAccount(this.remote, a.machineId, a);
+    } catch (e) {
+      this.continueRetryAt.set(key, this.deps.now() + MINUTE);
+      this.deps.log(`continuing thread ${a.threadId} on ${a.machineId} with ${a.account} failed: ${(e as Error).message}`);
+      return;
+    }
+    this.continueRetryAt.delete(key);
+    const m = this.state.machines[a.machineId];
+    if (!m) return;
+    m.continuedRuns = [...(m.continuedRuns ?? []), a.runId].slice(-50);
+    m.limitedThreads = m.limitedThreads?.filter((t) => t.runId !== a.runId);
+    if (!m.limitedThreads?.length) delete m.limitedThreads;
+    this.deps.log(out.skipped ? `thread ${a.threadId} on ${a.machineId} not continued: ${out.skipped}` : `thread ${a.threadId} on ${a.machineId} continues on ${a.account}`);
+    this.save();
+  }
+
+  // ---- reconcile with Lizard ----
+
+  private async reconcile(): Promise<void> {
+    if (this.createsInFlight > 0) return;
+    const before = this.createsDone;
+    let live: Set<MachineId>;
+    try {
+      live = new Set(await this.deps.lizard.list());
+    } catch (e) {
+      this.deps.log(`Lizard list failed: ${(e as Error).message}`);
+      return;
+    }
+    if (this.createsInFlight > 0 || this.createsDone !== before) return;
+    for (const id of live) {
+      if (this.state.machines[id] || this.running.has(`orphan:${id}`) || this.orphansKilled.has(id)) continue;
+      this.deps.log(`killing orphan sandbox ${id}`);
+      this.launch(`orphan:${id}`, async () => {
+        try {
+          await this.deps.lizard.kill(id);
+          this.orphansKilled.add(id);
+        } catch (e) {
+          this.deps.log(`orphan kill ${id} failed: ${(e as Error).message}`);
+        }
+      });
+    }
+    for (const m of Object.values(this.state.machines)) {
+      if (live.has(m.id) || m.phase.kind === "closing" || m.id.startsWith(PENDING)) continue;
+      // A listing can lag or miss a sandbox. Drop a machine only when Lizard confirms it is gone.
+      let alive: boolean;
+      try {
+        alive = await this.deps.lizard.alive(m.id);
+      } catch (e) {
+        this.deps.log(`cannot tell whether ${m.id} is alive, keeping it: ${(e as Error).message}`);
+        continue;
+      }
+      const current = this.state.machines[m.id];
+      if (alive || !current || current.phase.kind === "closing") continue;
+      this.deps.log(`machine ${m.id} is gone at Lizard; dropping it`);
+      if (BRINGING_UP.has(current.phase.kind)) this.settleCreate(m.id, "lost", `${m.id} vanished at Lizard during bring-up (${current.phase.kind})`);
+      if (current.phase.kind === "leased") delete this.state.leases[current.phase.leaseId];
+      this.setPhase(current, { kind: "closing" });
+      this.launch(`close:${m.id}`, () => this.finishClose(m.id));
+    }
+  }
+
+  // ---- helpers ----
+
+  private launch(key: string, fn: () => Promise<void>): void {
+    if (this.running.has(key)) return;
+    const p = fn()
+      .catch((e) => this.deps.log(`${key}: ${(e as Error).stack ?? e}`))
+      .finally(() => {
+        this.running.delete(key);
+        this.save();
+      });
+    this.running.set(key, p);
+  }
+
+  private isResetting(ticketId: string): boolean {
+    return Object.values(this.state.machines).some((m) => m.phase.kind === "resetting" && m.phase.ticketId === ticketId);
+  }
+
+  private async waitUntil(ticketId: string, maxSeconds: number, done: (v: TicketView) => boolean): Promise<TicketView> {
+    const until = Date.now() + maxSeconds * 1000;
+    for (;;) {
+      const v = this.view(ticketId);
+      const left = until - Date.now();
+      if (done(v) || left <= 0) return v;
+      await new Promise<void>((resolve) => {
+        const finish = () => {
+          clearTimeout(timer);
+          this.changes.off("change", finish);
+          resolve();
+        };
+        const timer = setTimeout(finish, left);
+        this.changes.on("change", finish);
+      });
+    }
+  }
+
+  private ticket(id: string): Ticket {
+    const t = this.state.tickets.find((x) => x.id === id);
+    if (!t) throw new ApiError(404, `no ticket ${id}`);
+    return t;
+  }
+
+  private replaceTicket(t: Ticket): void {
+    this.state.tickets = this.state.tickets.map((x) => (x.id === t.id ? t : x));
+  }
+
+  private endTicket(t: Ticket, status: "cancelled" | "expired", error: string): void {
+    const { id, repo, ref, holder, enqueuedAt } = t;
+    this.replaceTicket({ id, repo, ref, holder, enqueuedAt, status, endedAt: this.deps.now(), error });
+    this.deps.log(`ticket ${id} ${status}: ${error}`);
+  }
+
+  private endLease(leaseId: string, how: "released" | "expired"): void {
+    const lease = this.state.leases[leaseId];
+    delete this.state.leases[leaseId];
+    const m = this.state.machines[lease.machineId];
+    if (m) {
+      delete m.limitedThreads;
+      delete m.continuedRuns;
+    }
+    if (m?.phase.kind === "leased" && m.phase.leaseId === leaseId) this.setPhase(m, { kind: "idle", since: this.deps.now() });
+    this.deps.log(`lease ${leaseId} ${how}`);
+  }
+
+  /** Marks a create as having become ready, or lost before that (which feeds the breaker). Once only. */
+  private settleCreate(id: MachineId, outcome: "ready" | "lost", reason?: string): void {
+    const r = this.state.creates?.find((x) => x.machineId === id && x.outcome === "pending");
+    if (!r) return;
+    const now = this.deps.now();
+    Object.assign(r, { outcome, settledAt: now }, reason ? { reason } : {});
+    if (outcome !== "lost") return;
+    const b = createBackoff(this.state, now);
+    const pause = b ? `creates back off ${Math.round((b.until - now) / MINUTE)} min (${b.failures} in a row)` : "no backoff";
+    this.deps.log(`machine ${id} for ${r.repo} never became ready: ${reason}; ${pause}`);
+  }
+
+  private setPhase(m: Machine, phase: MachinePhase): void {
+    m.phase = phase;
+    this.save();
+  }
+
+  private async openProxy(m: Machine): Promise<void> {
+    const [lo, hi] = this.deps.config.proxyPortRange;
+    const taken = new Set(Object.values(this.state.machines).filter((x) => x.id !== m.id).map((x) => x.proxyPort));
+    const candidates = m.proxyPort ? [m.proxyPort] : Array.from({ length: hi - lo + 1 }, (_, i) => lo + i).filter((p) => !taken.has(p));
+    for (const port of candidates) {
+      try {
+        const proxy = await startProxy({ port, upstream: new URL(`https://${m.hostname}`), accessToken: m.accessToken! });
+        this.proxies.set(m.id, proxy);
+        m.proxyPort = port;
+        this.save();
+        return;
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "EADDRINUSE") throw e;
+      }
+    }
+    throw new Error(`no free proxy port in ${lo}-${hi}`);
+  }
+
+  /**
+   * A linked machine whose proxy did not reopen at start (its port was busy) gets another try each
+   * tick, on the same port: the devbox T3 link and the machine's front Host both name that port.
+   */
+  private reopenProxies(): void {
+    for (const m of Object.values(this.state.machines)) {
+      if (this.proxies.has(m.id) || !m.environmentId || !m.proxyPort || !m.hostname || !m.accessToken) continue;
+      // Bring-up opens its own proxy; only machines past it are retried here.
+      if (!["idle", "resetting", "leased"].includes(m.phase.kind)) continue;
+      this.launch(`proxy:${m.id}`, () => this.openProxy(m).catch((e) => this.deps.log(`proxy for ${m.id} on port ${m.proxyPort} did not reopen: ${e.message}`)));
+    }
+  }
+
+  private async closeProxy(id: MachineId): Promise<void> {
+    const proxy = this.proxies.get(id);
+    this.proxies.delete(id);
+    await proxy?.close();
+  }
+
+  private accrueUsage(): void {
+    const now = this.deps.now();
+    const since = this.state.usageAccruedAt ?? now;
+    const charged = this.deps.config.createChargeMinutes * MINUTE;
+    let ms = 0;
+    for (const m of Object.values(this.state.machines)) {
+      if (!m.id.startsWith(PENDING)) ms += Math.max(0, now - Math.max(since, m.createdAt + charged));
+    }
+    const day = utcDay(now);
+    this.state.usage[day] = (this.state.usage[day] ?? 0) + ms / 1000;
+    this.state.usageAccruedAt = now;
+    for (const d of Object.keys(this.state.usage)) if (d < utcDay(now - 7 * 24 * 60 * MINUTE)) delete this.state.usage[d];
+  }
+
+  private pruneTickets(now: number): void {
+    if (this.state.creates) this.state.creates = this.state.creates.filter((r) => r.outcome === "pending" || now - r.at < 24 * 60 * MINUTE);
+    this.state.tickets = this.state.tickets.filter((t) => {
+      if (t.status === "queued") return true;
+      if (t.status === "granted") return !!this.state.leases[t.leaseId] || now - t.enqueuedAt < 24 * 60 * MINUTE;
+      return now - t.endedAt < 60 * MINUTE;
+    });
+  }
+
+  private save(): void {
+    const tmp = `${this.files.state}.tmp`;
+    writeFileSync(tmp, JSON.stringify(this.state, null, 2), { mode: 0o600 });
+    renameSync(tmp, this.files.state);
+    this.changes.emit("change");
+  }
+}
