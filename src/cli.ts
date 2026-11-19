@@ -21,6 +21,10 @@ const USAGE = `t3lizard: a pool of Lizard cloud machines running T3 Code, per re
   t3lizard status                          pools, queues, leases, budget
   t3lizard close <machineId>               close one machine now
   t3lizard doctor                          check config, secrets and the daemon
+  t3lizard setup add <repo> [--reason <why>] -- <shell line>
+                                           add a step to the repo's machine setup (runs on new machines)
+  t3lizard setup show <repo>               the repo's setup steps, script and history
+  t3lizard setup remove <repo> <step>      remove a step by its number (see setup show)
 `;
 
 /** Starts the API and the tick loop. Resolves when the daemon is told to stop. */
@@ -111,10 +115,13 @@ async function doctor(home: string): Promise<string[]> {
 }
 
 export async function main(argv: string[]): Promise<number> {
+  // Everything after the first "--" is a shell line for `setup add`, taken as is.
+  const dashes = argv.indexOf("--");
+  const shellLine = dashes >= 0 ? argv.slice(dashes + 1).join(" ") : undefined;
   const { positionals, values } = parseArgs({
-    args: argv,
+    args: dashes >= 0 ? argv.slice(0, dashes) : argv,
     allowPositionals: true,
-    options: { holder: { type: "string" }, max: { type: "string" }, help: { type: "boolean", short: "h" } },
+    options: { holder: { type: "string" }, max: { type: "string" }, reason: { type: "string" }, help: { type: "boolean", short: "h" } },
   });
   const [cmd, ...args] = positionals;
   const home = t3lizardHome();
@@ -153,6 +160,25 @@ export async function main(argv: string[]): Promise<number> {
       need(1);
       print(await call(socket, "POST", "/close", { machineId: args[0] }));
       return 0;
+    case "setup": {
+      const [sub, repo, step] = args;
+      const by = `cli:${userInfo().username}@${hostname()}`;
+      if (sub === "add" && repo && shellLine) {
+        print(await call(socket, "POST", "/setup/add", { repo, line: shellLine, reason: values.reason ?? "added from the CLI", by }));
+        return 0;
+      }
+      if (sub === "show" && repo) {
+        const out = await call(socket, "POST", "/setup/show", { repo });
+        if (!out.exists) console.log(`${out.repo}: no setup yet (${out.path})`);
+        else console.log(`${out.repo}: ${out.path}\n\n${out.steps.map((x: { n: number; date: string; reason: string; line: string }) => `${x.n}. ${x.date}: ${x.reason}\n   ${x.line}`).join("\n") || "(no numbered steps)"}\n\n--- script ---\n${out.script}`);
+        return 0;
+      }
+      if (sub === "remove" && repo && step) {
+        print(await call(socket, "POST", "/setup/remove", { repo, step: Number(step), by }));
+        return 0;
+      }
+      throw new Error(`usage:\n  t3lizard setup add <repo> [--reason <why>] -- <shell line>\n  t3lizard setup show <repo>\n  t3lizard setup remove <repo> <step>`);
+    }
     case "doctor": {
       const lines = await doctor(home);
       console.log(lines.join("\n"));

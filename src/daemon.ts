@@ -1,13 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { busyThreads, configureFront, continueOnAccount, FRONT_PORT, install, pairAndLink, resetCheckout, scanLimits, setupProject } from "./bringup.ts";
+import { busyThreads, configureFront, continueOnAccount, FRONT_PORT, install, pairAndLink, resetCheckout, runRepoSetup, scanLimits, setupProject } from "./bringup.ts";
 import type { Account, Remote } from "./bringup.ts";
 import { paths } from "./config.ts";
 import { LizardLimitError, LizardPaymentError } from "./lizard.ts";
 import type { Lizard } from "./lizard.ts";
 import { accountLimited, accountWait, BRINGING_UP, createBackoff, createBlock, nextFreeAccount, plan, queueInfo, repoCreateBlock, utcDay } from "./plan.ts";
 import { startProxy } from "./proxy.ts";
+import { addStep, readHistory, readSetup, removeStep } from "./setup.ts";
+import type { RepoSetup } from "./setup.ts";
 import type { Proxy } from "./proxy.ts";
 import type { LocalT3 } from "./t3local.ts";
 import { emptyState } from "./types.ts";
@@ -382,6 +384,15 @@ export class Daemon {
         Object.assign(m, project);
         this.save();
       }
+      const setup = this.repoSetup(m.repo);
+      if (setup?.script && m.setupHash !== setup.hash) {
+        this.deps.log(`machine ${id}: running the ${m.repo} setup (${setup.steps.length} step(s), ${setup.path})`);
+        await runRepoSetup(this.remote, id, m.workspacePath!, setup.script, this.deps.config.setupTimeoutMinutes * MINUTE, (log) => this.logSetupOutput(id, log));
+        m = at("linking");
+        m.setupHash = setup.hash;
+        this.deps.log(`machine ${id}: ${m.repo} setup done`);
+        this.save();
+      }
       if (!m.hostname || !m.accessToken) {
         // Lizard exposes the front proxy, never T3 itself: see src/machine/front.mjs.
         const { hostname, accessToken } = await this.deps.lizard.exposePort(id, FRONT_PORT);
@@ -520,6 +531,59 @@ export class Daemon {
     delete this.state.machines[id];
     this.deps.log(`machine ${id} closed`);
     this.step();
+  }
+
+  // ---- per-repo machine setup ----
+
+  private repoSetup(repo: RepoKey): RepoSetup | undefined {
+    try {
+      return readSetup(this.deps.home, repo);
+    } catch (e) {
+      this.deps.log(`no setup for ${repo}: ${(e as Error).message}`);
+      return undefined;
+    }
+  }
+
+  private logSetupOutput(id: MachineId, log: string): void {
+    for (const line of log.trimEnd().split("\n")) if (line) this.deps.log(`setup ${id}: ${line}`);
+  }
+
+  private async setupRepo(input: string): Promise<RepoKey> {
+    return this.deps.resolveRepo(input).catch((e) => {
+      throw new ApiError(400, `cannot resolve repo ${input}: ${(e as Error).message}`);
+    });
+  }
+
+  private setupView(setup: RepoSetup) {
+    return { repo: setup.repo, path: setup.path, steps: setup.steps.map(({ n, date, reason, line }) => ({ n, date, reason, line })) };
+  }
+
+  async setupAdd(req: { repo: string; line: string; reason: string; by?: string }) {
+    const repo = await this.setupRepo(req.repo);
+    try {
+      const out = addStep(this.deps.home, repo, { line: req.line, reason: req.reason, by: req.by, now: this.deps.now() });
+      this.deps.log(out.added ? `setup for ${repo}: step ${out.step.n} added${req.by ? ` by ${req.by}` : ""}: ${out.step.line}` : `setup for ${repo}: not added, ${out.note}`);
+      return { added: out.added, ...(out.note ? { note: out.note } : {}), step: out.step.n, appliesTo: "machines created from now on", ...this.setupView(readSetup(this.deps.home, repo)) };
+    } catch (e) {
+      throw new ApiError(400, (e as Error).message);
+    }
+  }
+
+  async setupShow(req: { repo: string }) {
+    const repo = await this.setupRepo(req.repo);
+    const setup = readSetup(this.deps.home, repo);
+    return { ...this.setupView(setup), exists: setup.exists, script: setup.script ?? "", history: readHistory(this.deps.home, repo) };
+  }
+
+  async setupRemove(req: { repo: string; step: number; by?: string }) {
+    const repo = await this.setupRepo(req.repo);
+    try {
+      const out = removeStep(this.deps.home, repo, { n: req.step, by: req.by, now: this.deps.now() });
+      this.deps.log(`setup for ${repo}: step ${out.removed.n} removed${req.by ? ` by ${req.by}` : ""}: ${out.removed.line}`);
+      return { removed: out.removed, ...this.setupView(readSetup(this.deps.home, repo)) };
+    } catch (e) {
+      throw new ApiError(400, (e as Error).message);
+    }
   }
 
   // ---- Claude accounts ----

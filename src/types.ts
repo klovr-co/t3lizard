@@ -46,6 +46,8 @@ export interface Machine {
   environmentId?: string;
   projectId?: string;
   workspacePath?: string;
+  /** sha256 of the repo setup script this machine ran to the end, so a resumed bring-up skips it. */
+  setupHash?: string;
   /** Threads that hit a usage limit and wait to continue on another account. From the last scan. */
   limitedThreads?: LimitedThread[];
   /** Runs already continued on another account, so a scan that raced the continue never repeats it. */
@@ -130,6 +132,8 @@ export interface Config {
   forwardEnv: string[];
   sandboxUser: string;
   tickSeconds: number;
+  /** The repo setup script (~/.t3lizard/repos/<owner>/<name>/setup.sh) is stopped after this long. */
+  setupTimeoutMinutes: number;
   /** How long an account that hit its usage limit is skipped before it is tried again. */
   accountRetryMinutes: number;
   /** Claude accounts in order. Not a config file key: one per CLAUDE_CODE_OAUTH_TOKEN[_N] secret. */

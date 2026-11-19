@@ -130,7 +130,33 @@ The MCP server gives agents these instructions:
    If the thread stops on a usage limit, keep the lease. t3lizard continues the same thread on another account.
 5. Call `pool_release` with the lease id as soon as the work is done.
 
+6. When a job fails because a tool or system package is missing, call `pool_setup_add` with one install line and a reason.
+   The next machine for that repo then has it. Then install it by hand on the current machine and carry on.
+
 Other tools: `pool_renew` extends a lease. `pool_status` shows pools, queues, leases, budget, and each Claude account with `limitedUntil`.
+
+## Per-repo machine setup
+
+Each repo can have a setup script on the devbox: `~/.t3lizard/repos/<owner>/<name>/setup.sh`.
+Bring-up runs it on every new machine for that repo, as user `user`, in the checkout, after the clone.
+The machine is handed out only after it succeeds.
+
+- Every step must be safe to run twice. Guard installs, for example `command -v bun >/dev/null || ...`.
+- It stops after `setupTimeoutMinutes` (default 20). Its output goes to the daemon log.
+- A failure fails the bring-up and quotes the script's last lines. The create backoff then applies.
+- Put new binaries in `~/.local/bin`. That folder is on PATH for T3 threads.
+
+Add, show and remove steps:
+
+```sh
+t3lizard setup add github.com/klovr-co/aldrent --reason "needs jq" -- 'command -v jq >/dev/null || sudo -n apt-get install -y jq'
+t3lizard setup show github.com/klovr-co/aldrent
+t3lizard setup remove github.com/klovr-co/aldrent 3
+```
+
+Each step gets a comment with the date and the reason. `history.jsonl` next to the script records every add and remove.
+A change applies to machines created after it.
+`examples/repos/klovr-co/aldrent/setup.sh` is the seeded aldrent script: bun from the official install script.
 
 ## When a Claude account hits its limit
 
@@ -157,6 +183,9 @@ t3lizard renew <leaseId>
 t3lizard status
 t3lizard close <machineId>
 t3lizard doctor
+t3lizard setup add <repo> [--reason <why>] -- <shell line>
+t3lizard setup show <repo>
+t3lizard setup remove <repo> <step>
 ```
 
 Each command prints JSON from the daemon.

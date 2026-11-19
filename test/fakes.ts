@@ -97,6 +97,8 @@ export class FakeLizard implements Lizard, SandboxDirectory {
         return ok(`Cloning...\nWORKSPACE=/home/user/${args[1]}\nPROJECT=11111111-2222-3333-4444-555555555555\n`);
       case "pair":
         return ok(`{"credential":"pair-${id}-${m.steps.length}"}\n`);
+      case "repo-setup-poll":
+        return ok("exit=0\n");
       case "threads":
         return ok(JSON.stringify(this.threads));
       case "scan":

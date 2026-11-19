@@ -117,6 +117,7 @@ One module, `src/lizard.ts`, wraps `@lizard-build/sdk` (`Sandbox.create`, `Sandb
 2b. Claude accounts: write `~/.t3lizard/accounts.json` (mode 600), then `node ~/.t3lizard/accounts.mjs configure` merges them into `~/.t3/userdata/settings.json` (mode 600) and deletes the file. Runs before `t3 serve` starts.
 3. `supervise.sh <name> <cmd...>` keeps a command running (flock per name so only one runs, restart after 2 s, output in `~/.t3lizard/<name>.log`), started with nohup. Two are started: `t3 serve --host 127.0.0.1 --port 3773 --base-dir ~/.t3 --no-browser`, and the front proxy `node ~/.t3lizard/front.mjs 3774 3773 ~/.t3lizard/front-host` (see "Machine front proxy").
 4. Clone the repo into `~/<repo-name>` from `https://<RepoKey>.git` (the git credential helper supplies `GH_TOKEN`), `t3 project add`, parse the project id and save it to `~/.t3lizard/project-id` on the machine. A re-run reads that file, since `t3 project add` has no list command to look the id up again.
+4b. Repo setup: if `~/.t3lizard/repos/<owner>/<name>/setup.sh` exists on the devbox, copy it to the machine and run it as the sandbox user, in the checkout (see "Per-repo machine setup"). Skipped when the machine already ran this exact script (`setupHash`).
 5. `exposePort(3774)` (the front proxy, never T3 itself) -> hostname + access token. Start a local proxy on `127.0.0.1:<port>` (port range from config, stored in state) that forwards HTTP and WebSocket upgrades to `https://<hostname>` and adds header `X-Lizard-Access-Token`. Keep the token only in daemon memory and state (state file mode 600).
 5b. Write `127.0.0.1:<proxyPort>` to `~/.t3lizard/front-host` on the machine (mode 600) and wait until T3 answers through the front proxy. Store it as `frontHost`.
 6. `t3 auth pairing create --json` on the machine, then locally `t3 environment link http://127.0.0.1:<port> --pairing-code <code> --access full-access`, retry a few times while the route warms up. Store `environmentId`.
@@ -151,6 +152,19 @@ The loop:
 
 The lease view's `providerInstanceId` is the first free account, else the one that frees first. Agents pass it in `delegate_task`'s target.
 
+## Per-repo machine setup
+
+Every repo needs different tools (aldrent needs bun; the `claude` image has none). Each repo has a setup script on the devbox, `~/.t3lizard/repos/<owner>/<name>/setup.sh` (the host part of the repo key is left out of the path), that agents grow over time.
+
+- Bring-up step 4b runs it on every new machine for the repo: after the clone, before the front proxy, the link and `idle`. As the sandbox user, in the checkout, with the machine env sourced and `~/.local/bin` on PATH.
+- An exec is capped at 10 minutes, so it runs in the background under `flock` and `timeout -k 10 <setupTimeoutMinutes>` (default 20), and the daemon polls its exit code. A second start while one runs (daemon restart) only waits for it. The script itself does not inherit the lock, so a service it starts cannot hold the lock.
+- Its output (last 64 KiB) goes to the daemon log, one line per log line (`setup <machine>: ...`), on success and on failure.
+- A non-zero exit or a timeout fails the bring-up with the last 25 lines, so the machine closes and the create backoff applies.
+- Every step must be safe to run twice. A step is a dated comment and one shell line: `# 2026-11-20: <reason> (<who>)`. Hand-written lines are kept and not numbered.
+- `POST /setup/add { repo, line, reason, by? }` (CLI `t3lizard setup add <repo> [--reason ..] -- <line>`, MCP `pool_setup_add`) appends a step. One line only; the same line is not added twice. `POST /setup/show { repo }` and `POST /setup/remove { repo, step, by? }`. Every add and remove is appended to `history.jsonl` next to the script, so a bad line can be found and removed.
+- A change applies to machines created after it. The agent that hit the missing tool also installs it by hand on its current machine (MCP instructions, rule 6).
+- `examples/repos/` in this repo holds the seeded aldrent script (unzip if missing, bun via the official script into `~/.bun`, symlinks into `~/.local/bin` so T3 threads find it).
+
 ## Lease hand-out (grant)
 
 Before a lease is returned, the daemon moves the machine to `resetting` and resets its checkout to the ticket's ref: `git fetch origin <ref> && git checkout --force --detach FETCH_HEAD && git clean -ffd` (keeps ignored files such as node_modules for a warm cache). The ref must already be pushed. A failed `git fetch` is the ticket's fault (ref not pushed): the ticket is `cancelled` with the error and the machine goes back to `idle`. Any other reset failure marks the ticket `cancelled` and the machine `failed`. On daemon start a `resetting` machine goes back to `idle` and its ticket, still `queued`, is granted again on the next tick.
@@ -166,6 +180,7 @@ Release: the client calls `release(leaseId)`. A crashed client: the lease expire
 - `GET /status` -> pools per repo (machines with phase, age, limited threads and how long they wait for an account; queue; leases), today's machine-hours vs budget, why creates are blocked, last Lizard error, and `accounts: [{ id, free, limitedUntil? }]`
 - A granted lease carries `providerInstanceId`, the Claude account to delegate to.
 - `POST /close { machineId }`
+- `POST /setup/add { repo, line, reason, by? }`, `POST /setup/show { repo }`, `POST /setup/remove { repo, step, by? }`: the repo's machine setup script (see "Per-repo machine setup").
 
 `repo` given as an origin URL or a path to a local checkout (daemon reads `git remote get-url origin`). The key keeps the owner and repo case as the origin has it.
 
@@ -215,6 +230,7 @@ Trial defaults shown (trial: 1 small machine at a time, 1 hour lifetime). `total
 
 - `~/.t3lizard/state.json`: written by the daemon only, atomic (write temp + rename), mode 600.
 - `~/.t3lizard/daemon.log`
+- `~/.t3lizard/repos/<owner>/<name>/setup.sh` and `history.jsonl`: each repo's machine setup, written through the API.
 - `systemd/t3lizard.service` user unit (not installed by the build).
 
 ## Stack

@@ -19,6 +19,9 @@ const routes: Record<string, (d: Daemon, body: unknown) => unknown> = {
     ),
   "POST /renew": (d, b) => d.renew(z.object({ leaseId: id }).parse(b)),
   "POST /close": (d, b) => d.close(z.object({ machineId: id }).parse(b)),
+  "POST /setup/add": (d, b) => d.setupAdd(z.object({ repo: id, line: id, reason: id, by: id.optional() }).parse(b)),
+  "POST /setup/show": (d, b) => d.setupShow(z.object({ repo: id }).parse(b)),
+  "POST /setup/remove": (d, b) => d.setupRemove(z.object({ repo: id, step: z.number().int().positive(), by: id.optional() }).parse(b)),
 };
 
 export async function serveApi(daemon: Daemon, socketPath: string): Promise<http.Server> {

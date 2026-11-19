@@ -146,7 +146,7 @@ export const PREFLIGHT_SH = `if ! getconf GNU_LIBC_VERSION > /dev/null 2>&1; the
   exit 1
 fi
 missing=""
-for tool in curl git tar gzip flock setsid base64 sed grep awk; do
+for tool in curl git tar gzip flock setsid timeout base64 sed grep awk; do
   command -v "$tool" > /dev/null || missing="$missing $tool"
 done
 if [ -n "$missing" ]; then echo "missing tools on this image:$missing" >&2; exit 1; fi
@@ -220,6 +220,51 @@ echo "PROJECT=$(cat "$idf")"`;
   const kv = Object.fromEntries(out.split("\n").flatMap((l) => (l.includes("=") ? [l.split(/=(.*)/s).slice(0, 2)] : [])));
   if (!kv.WORKSPACE || !kv.PROJECT) throw new Error(`project setup printed no workspace or project id: ${out.trim()}`);
   return { workspacePath: kv.WORKSPACE, projectId: kv.PROJECT };
+}
+
+/** How much of the setup output reaches the daemon log, and how much of it a failure quotes. */
+const SETUP_LOG_BYTES = 64 * 1024;
+const SETUP_FAIL_LINES = 25;
+
+/**
+ * Step 4b: the repo's own setup script (~/.t3lizard/repos/<owner>/<name>/setup.sh on the devbox),
+ * run in the checkout as the sandbox user. An exec is capped at 10 minutes, so it runs in the
+ * background under a lock and `timeout`, and this polls for its exit code. A second start while
+ * one runs (a daemon restart) only polls. Returns the output; a non-zero exit throws with its
+ * last lines, so the bring-up fails and the create backoff applies.
+ */
+export async function runRepoSetup(
+  r: Remote,
+  id: MachineId,
+  workspacePath: string,
+  setupScript: string,
+  timeoutMs: number,
+  onOutput: (log: string) => void = () => {},
+): Promise<void> {
+  await writeFile(r, id, "repo-setup.sh", setupScript, "700");
+  const seconds = String(Math.ceil(timeoutMs / 1000));
+  const start = `exec 9>"$D/repo-setup.lock"
+if ! flock -n 9; then echo "already running"; exit 0; fi
+rm -f "$D/repo-setup.exit" "$D/repo-setup.log"
+cd "$1"
+setsid nohup bash -c 'timeout -k 10 "$1" bash "$2/repo-setup.sh" > "$2/repo-setup.log" 2>&1 9>&-; echo $? > "$2/repo-setup.exit.tmp"; mv "$2/repo-setup.exit.tmp" "$2/repo-setup.exit"' repo-setup "$2" "$D" < /dev/null > /dev/null 2>&1 &`;
+  await run(r, id, script("repo-setup-start", start, workspacePath, seconds));
+  const poll = script("repo-setup-poll", 'if [ -f "$D/repo-setup.exit" ]; then echo "exit=$(cat "$D/repo-setup.exit")"; else echo running; fi');
+  let exit = -1;
+  // The machine-side timeout stops the script; the devbox waits a minute longer for its exit code.
+  await pollUntil(r, timeoutMs + 60_000, Math.min(5_000, Math.max(500, timeoutMs / 20)), async () => {
+    const m = (await run(r, id, poll)).stdout.match(/^exit=(\d+)/);
+    if (m) exit = Number(m[1]);
+    return !!m;
+  }, "repo setup");
+  const log = (await run(r, id, script("repo-setup-log", `tail -c ${SETUP_LOG_BYTES} "$D/repo-setup.log" 2>/dev/null || true`))).stdout;
+  onOutput(log);
+  if (exit !== 0) {
+    const limit = timeoutMs >= 60_000 ? `${Math.round(timeoutMs / 60_000)} minutes` : `${Math.round(timeoutMs / 1000)} s`;
+    const why = exit === 124 || exit === 137 ? `timed out after ${limit}` : `exit ${exit}`;
+    const tail = log.trimEnd().split("\n").slice(-SETUP_FAIL_LINES).join("\n");
+    throw new Error(`repo setup failed (${why}):\n${tail}`);
+  }
 }
 
 /**

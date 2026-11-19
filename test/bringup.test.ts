@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ACCOUNTS_JS, busyThreads, configureFront, FRONT_JS, install, pairAndLink, PREFLIGHT_SH, resetCheckout, setupProject } from "../src/bringup.ts";
+import { ACCOUNTS_JS, busyThreads, configureFront, FRONT_JS, install, pairAndLink, PREFLIGHT_SH, resetCheckout, runRepoSetup, setupProject } from "../src/bringup.ts";
 import { realLocalT3 } from "../src/t3local.ts";
 import { FakeLizard, FakeT3, noSleep } from "./fakes.ts";
 
@@ -179,4 +179,46 @@ test("the reset and thread scripts work in a real shell against a real git repo"
   assert.equal(spawnSync("test", ["-e", join(ws, "stray.txt")]).status, 1);
   assert.equal((await resetCheckout(r, "sb", ws, "no-such-branch")).ok, false);
   assert.equal(await busyThreads(r, "sb", ws), 1);
+});
+
+test("runRepoSetup runs the repo script in the checkout in a real shell: output, failure, timeout, no double run", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const { mkdirSync, readFileSync, existsSync } = await import("node:fs");
+  const home = mkdtempSync(join(tmpdir(), "t3lizard-reposetup-"));
+  const ws = join(home, "app");
+  mkdirSync(ws);
+  const lizard = new FakeLizard();
+  lizard.exec = async (_id, cmd) => {
+    const res = spawnSync(cmd[0], cmd.slice(1), { env: { HOME: home, PATH: process.env.PATH }, encoding: "utf8" });
+    return { stdout: res.stdout, stderr: res.stderr, exitCode: res.status ?? 1 };
+  };
+  const r = { lizard, sleep: (ms: number) => new Promise<void>((res) => setTimeout(res, Math.min(ms, 50))) };
+  const outputs: string[] = [];
+
+  const ok = "#!/usr/bin/env bash\nset -euo pipefail\necho \"in $(pwd)\"\necho ran >> ran.txt\necho done-ok\n";
+  await runRepoSetup(r, "sb", ws, ok, 30_000, (log) => outputs.push(log));
+  assert.equal(outputs[0], `in ${ws}\ndone-ok\n`, "runs in the checkout; output goes to the caller");
+  assert.equal(readFileSync(join(ws, "ran.txt"), "utf8"), "ran\n");
+  await runRepoSetup(r, "sb", ws, ok, 30_000);
+  assert.equal(readFileSync(join(ws, "ran.txt"), "utf8"), "ran\nran\n", "a second bring-up runs it again");
+
+  const bad = "#!/usr/bin/env bash\nset -euo pipefail\nfor i in $(seq 1 40); do echo line-$i; done\nno-such-tool-xyz install\n";
+  const err = await runRepoSetup(r, "sb", ws, bad, 30_000).catch((e) => e as Error);
+  assert.match(err.message, /^repo setup failed \(exit 127\):\n/);
+  assert.match(err.message, /no-such-tool-xyz: command not found$/);
+  assert.doesNotMatch(err.message, /line-10\n/, "only the last lines are quoted");
+  assert.match(err.message, /line-40/);
+
+  const slow = "#!/usr/bin/env bash\necho starting\nsleep 30\n";
+  const late = await runRepoSetup(r, "sb", ws, slow, 1_000).catch((e) => e as Error);
+  assert.match(late.message, /^repo setup failed \(timed out after 1 s\):\nstarting$/);
+
+  // A daemon restart while the script still runs: the second start only waits for the first.
+  const counted = "#!/usr/bin/env bash\necho x >> runs.txt\nsleep 1\n";
+  const first = runRepoSetup(r, "sb", ws, counted, 30_000);
+  await new Promise((res) => setTimeout(res, 300));
+  await runRepoSetup(r, "sb", ws, counted, 30_000);
+  await first;
+  assert.equal(readFileSync(join(ws, "runs.txt"), "utf8"), "x\n");
+  assert.equal(existsSync(join(home, ".t3lizard", "repo-setup.sh")), true);
 });

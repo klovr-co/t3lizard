@@ -38,6 +38,7 @@ export const DEFAULT_CONFIG: Config = {
   sandboxUser: "user",
   tickSeconds: 15,
   accountRetryMinutes: 30,
+  setupTimeoutMinutes: 20,
   accounts: [],
 };
 
@@ -63,6 +64,7 @@ const ConfigFile = z
     sandboxUser: z.string(),
     tickSeconds: positive,
     accountRetryMinutes: positive,
+    setupTimeoutMinutes: positive,
   })
   .partial()
   .strict();

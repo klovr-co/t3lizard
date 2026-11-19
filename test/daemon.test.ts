@@ -10,6 +10,7 @@ import { Daemon } from "../src/daemon.ts";
 import { LizardLimitError } from "../src/lizard.ts";
 import { normalizeOrigin } from "../src/repo.ts";
 import type { Config } from "../src/types.ts";
+import { addStep, readSetup } from "../src/setup.ts";
 import { FakeLizard, FakeT3, noSleep } from "./fakes.ts";
 
 const MIN = 60_000;
@@ -366,4 +367,54 @@ test("a thread that hits a usage limit continues on the next account; with all l
   // A released lease takes its limited threads with it; the next holder's scan ignores older runs.
   await h.api("/release", { leaseId: granted.lease.leaseId });
   assert.equal(h.daemon.state.machines["sb-1"].limitedThreads, undefined);
+});
+
+test("bring-up runs the repo's setup script in the checkout after the clone and before the machine is ready", async (t) => {
+  const h = await harness(t);
+  addStep(h.home, "github.com/Acme/app", { line: "command -v bun >/dev/null || curl -fsSL https://bun.sh/install | bash", reason: "needs bun", now: h.clock.now });
+  h.lizard.on["repo-setup-log"] = () => ({ stdout: "bun was installed successfully\n", stderr: "", exitCode: 0 });
+  const t0 = await h.api("/acquire", { repo: REPO, ref: "main", holder: "a" });
+  await h.daemon.settled();
+  const m = h.lizard.machines.get("sb-1")!;
+  assert.match(m.files.get("repo-setup.sh")!.content, /# \d{4}-\d{2}-\d{2}: needs bun\ncommand -v bun/);
+  const at = (step: string) => m.steps.indexOf(step);
+  assert.ok(at("project") < at("repo-setup-start") && at("repo-setup-start") < at("pair"), m.steps.join(","));
+  assert.ok(h.logs.includes("setup sb-1: bun was installed successfully"));
+  assert.equal((await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 1 })).status, "granted");
+  assert.equal(h.daemon.state.machines["sb-1"].setupHash, readSetup(h.home, "github.com/Acme/app").hash);
+});
+
+test("a failing repo setup fails the bring-up with the script's last lines and backs creates off", async (t) => {
+  const h = await harness(t);
+  addStep(h.home, "github.com/Acme/app", { line: "bun install", reason: "deps", now: h.clock.now });
+  h.lizard.on["repo-setup-poll"] = () => ({ stdout: "exit=127\n", stderr: "", exitCode: 0 });
+  h.lizard.on["repo-setup-log"] = () => ({ stdout: "resolving\nbash: line 9: bun: command not found\n", stderr: "", exitCode: 0 });
+  const t0 = await h.api("/acquire", { repo: REPO, ref: "main", holder: "a" });
+  await h.daemon.settled();
+  assert.deepEqual(h.lizard.killed, ["sb-1"]);
+  assert.ok(h.logs.includes("setup sb-1: bash: line 9: bun: command not found"), "full output in the daemon log");
+  const v = await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 0 });
+  assert.match(v.reason, /creates back off .*bring-up of sb-1 failed: repo setup failed \(exit 127\):\nresolving\nbash: line 9: bun: command not found/);
+});
+
+test("a repo with no setup script skips the step", async (t) => {
+  const h = await harness(t);
+  await h.api("/acquire", { repo: REPO, ref: "main", holder: "a" });
+  await h.daemon.settled();
+  assert.ok(!h.lizard.machines.get("sb-1")!.steps.includes("repo-setup-start"));
+});
+
+test("setup add, show and remove through the API", async (t) => {
+  const h = await harness(t);
+  const added = await h.api("/setup/add", { repo: REPO, line: "command -v jq >/dev/null || sudo -n apt-get install -y jq", reason: "jq missing", by: "thread-7" });
+  assert.equal(added.added, true);
+  assert.equal(added.repo, "github.com/Acme/app");
+  assert.equal(added.path, join(h.home, "repos", "Acme", "app", "setup.sh"));
+  assert.equal((await h.api("/setup/add", { repo: REPO, line: "command -v jq >/dev/null || sudo -n apt-get install -y jq", reason: "again" })).added, false);
+  await assert.rejects(h.api("/setup/add", { repo: REPO, line: "a\nb", reason: "r" }), /one line/);
+  const shown = await h.api("/setup/show", { repo: REPO });
+  assert.deepEqual(shown.steps.map((s: { line: string }) => s.line), ["command -v jq >/dev/null || sudo -n apt-get install -y jq"]);
+  assert.equal(shown.history[0].by, "thread-7");
+  assert.equal((await h.api("/setup/remove", { repo: REPO, step: 1 })).removed.reason, "jq missing (thread-7)");
+  assert.equal((await h.api("/setup/show", { repo: REPO })).steps.length, 0);
 });
