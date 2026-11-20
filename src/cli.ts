@@ -2,6 +2,7 @@ import { appendFileSync, existsSync, mkdirSync, statSync } from "node:fs";
 import { hostname, userInfo } from "node:os";
 import { parseArgs } from "node:util";
 import { call, serveApi } from "./api.ts";
+import { startDashboard } from "./dashboard.ts";
 import { accountsFromSecrets, isAccountTokenKey, loadConfig, loadSecrets, paths, t3lizardHome } from "./config.ts";
 import { Daemon } from "./daemon.ts";
 import type { DaemonDeps } from "./daemon.ts";
@@ -34,6 +35,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
   await daemon.start();
   const server = await serveApi(daemon, paths(deps.home).socket);
   deps.log(`t3lizard daemon listening on ${paths(deps.home).socket}`);
+  const dashboards = await startDashboard(daemon, deps.config.dashboardPort, deps.config.publicBind ?? [], deps.log);
   const tick = () => daemon.tick().catch((e) => deps.log(`tick failed: ${e.stack ?? e}`));
   const timer = setInterval(tick, deps.config.tickSeconds * 1000);
   void tick();
@@ -44,6 +46,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
   // and start() resumes machines still installing or linking.
   clearInterval(timer);
   server.close();
+  for (const d of dashboards) d.close();
   deps.log("t3lizard daemon stopped");
   process.exit(0);
 }

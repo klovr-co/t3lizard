@@ -43,6 +43,9 @@ export const DEFAULT_CONFIG: Config = {
   tickSeconds: 15,
   accountRetryMinutes: 30,
   setupTimeoutMinutes: 20,
+  vcpuReserve: 0,
+  defaultSize: "medium",
+  dashboardPort: 47290,
   accounts: [],
 };
 
@@ -52,7 +55,8 @@ const ConfigFile = z
   .object({
     project: z.string(),
     template: z.string().min(1),
-    sizes: z.array(z.object({ size: SizeName, max: positive }).strict()).min(1),
+    /** max is optional with vcpuLimit: then the vCPU limit decides how many of each fit. */
+    sizes: z.array(z.object({ size: SizeName, max: positive.optional() }).strict()).min(1),
     /** Older configs: one size, at most totalCap machines. Read as sizes [{ size, max: totalCap }]. */
     size: SizeName,
     totalCap: positive,
@@ -75,6 +79,10 @@ const ConfigFile = z
     accountRetryMinutes: positive,
     setupTimeoutMinutes: positive,
     /** Extra addresses the devbox proxies listen on, e.g. the Tailscale IP, so a browser can open a machine. */
+    vcpuLimit: z.number().positive(),
+    vcpuReserve: z.number().min(0),
+    defaultSize: SizeName,
+    dashboardPort: z.number().int().min(0),
     publicBind: z.array(z.string().min(1)),
     /** The name a browser uses for those addresses, e.g. devbox.tailnet.ts.net. Used in `t3lizard connect` links. */
     publicHost: z.string().min(1),
@@ -109,7 +117,8 @@ export function parseConfig(json: unknown): Config {
     throw new Error('give "dailySmallMachineHours" (or its older name "dailyMachineHours"), not both');
   }
   const legacy = size !== undefined || totalCap !== undefined;
-  const ladder = sizes ?? (legacy ? [{ size: size ?? "small", max: totalCap ?? 1 }] : DEFAULT_CONFIG.sizes);
+  const ladder = (sizes ?? (legacy ? [{ size: size ?? "small", max: totalCap ?? 1 }] : DEFAULT_CONFIG.sizes)).map((x) => ({ size: x.size, max: x.max ?? Number.MAX_SAFE_INTEGER }));
+  if (!rest.vcpuLimit && ladder.some((x) => x.max === Number.MAX_SAFE_INTEGER)) throw new Error('a size without "max" needs "vcpuLimit"');
   const dup = ladder.find((s, i) => ladder.findIndex((o) => o.size === s.size) !== i);
   if (dup) throw new Error(`size "${dup.size}" is listed twice in "sizes"`);
   return {

@@ -9,6 +9,37 @@ export type Size = "nano" | "mini" | "small" | "medium" | "large" | "big";
  */
 export const SIZE_WEIGHT: Record<Size, number> = { nano: 0.25, mini: 0.5, small: 1, medium: 2, large: 4, big: 8 };
 
+/** vCPUs per size (Lizard): Pro plans limit the vCPUs running at once, not machines. */
+export const SIZE_VCPU: Record<Size, number> = { nano: 0.5, mini: 1, small: 2, medium: 4, large: 8, big: 16 };
+
+/** Lizard's price per hour in USD (sandbox docs), for the spend shown on the dashboard. */
+export const SIZE_USD_PER_HOUR: Record<Size, number> = { nano: 0.00405, mini: 0.0081, small: 0.0162, medium: 0.0324, large: 0.0648, big: 0.1296 };
+
+/** One finished lease, kept for learning each repo's size and for the dashboard. */
+export interface JobRecord {
+  repo: RepoKey;
+  holder: string;
+  size: Size;
+  machineId: MachineId;
+  grantedAt: number;
+  endedAt: number;
+  /** From ticket to grant. */
+  waitedMs: number;
+  /** Highest share of the machine's memory in use during the lease (guard.sh), when known. */
+  peakMemPct?: number;
+  /** Processes guard.sh killed for low memory during the lease. */
+  memKills?: number;
+  /** The machine stopped answering during the lease. */
+  froze?: boolean;
+}
+
+/** What a repo's next new machine should be, and why (learned from its jobs). */
+export interface RepoSizeChoice {
+  size: Size;
+  why: string;
+  at: number;
+}
+
 /** At most `max` machines of `size` at once. */
 export interface SizeSlot {
   size: Size;
@@ -77,6 +108,10 @@ export interface Lease {
   holder: string;
   grantedAt: number;
   expiresAt: number;
+  /** From ticket to grant. */
+  waitedMs?: number;
+  /** Lease start in guard.log terms: lines before it are not this lease's kills. */
+  guardLogLines?: number;
 }
 
 interface TicketBase {
@@ -125,6 +160,10 @@ export interface State {
   accounts?: Record<AccountId, AccountState>;
   /** Learned per repo: the smallest size its jobs fit in, raised when a machine stops answering mid-job. */
   repoMinSize?: Record<RepoKey, Size>;
+  /** Learned per repo: the size to create next (see learnSize). */
+  repoSize?: Record<RepoKey, RepoSizeChoice>;
+  /** The latest finished leases, newest first. */
+  jobs?: JobRecord[];
 }
 
 export interface Config {
@@ -154,6 +193,14 @@ export interface Config {
   setupTimeoutMinutes: number;
   /** How long an account that hit its usage limit is skipped before it is tried again. */
   accountRetryMinutes: number;
+  /** Pro limits vCPUs running at once (40 on Pro). Unset: only the per-size max applies. */
+  vcpuLimit?: number;
+  /** vCPUs the pool leaves free for others in the Lizard workspace. */
+  vcpuReserve: number;
+  /** A repo's first machine size, before anything is learned. */
+  defaultSize: Size;
+  /** The dashboard's port, on 127.0.0.1 and publicBind. 0 turns it off. */
+  dashboardPort: number;
   publicBind?: string[];
   publicHost?: string;
   /** Claude accounts in order. Not a config file key: one per CLAUDE_CODE_OAUTH_TOKEN[_N] secret. */

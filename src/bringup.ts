@@ -195,6 +195,8 @@ export const GUARD_SH = `#!/usr/bin/env bash
 exec 9>/run/t3lizard-guard.lock
 flock -n 9 || exit 0
 uid="$1"; log="$2"
+peakf="\${log%/*}/mem-peak"
+total_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
 floor_kb=$(awk '/MemTotal/ {f = int($2 / 20); print (f < 153600 ? 153600 : f)}' /proc/meminfo)
 while true; do
   prot=" $(pgrep -f 't3 serve --host 127\\.0\\.0\\.1|front\\.mjs|supervise\\.sh|t3lizard-guard|/usr/bin/envd' | tr '\\n' ' ') "
@@ -209,6 +211,10 @@ while true; do
     fi
   done
   avail_kb=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
+  # Highest memory use (percent) since the daemon last reset mem-peak: it reads and zeroes it per lease.
+  used_pct=$(( (total_kb - avail_kb) * 100 / total_kb ))
+  peak=$(cat "$peakf" 2>/dev/null || echo 0)
+  if [ "$used_pct" -gt "\${peak:-0}" ] 2>/dev/null; then echo "$used_pct" > "$peakf"; chown "$uid" "$peakf" 2>/dev/null; fi
   if [ "$avail_kb" -lt "$floor_kb" ]; then
     victim=$(ps -eo pid=,uid=,rss= --sort=-rss | awk -v prot="$prot" '$2 != 0 && index(prot, " " $1 " ") == 0 {print $1; exit}')
     if [ -n "$victim" ]; then

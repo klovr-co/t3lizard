@@ -348,7 +348,7 @@ test("a queue spread across sizes waits with the full ladder as the reason, and 
   const machines = [sized("s1", "a", "small", leased("s1")), sized("m1", "a", "mini", leased("m1")), sized("m2", "b", "mini", leased("m2"))];
   const s = state(machines, [queued("t1", "a", 3), queued("t2", "b", 2), queued("t3", "a", 1)]);
   assert.deepEqual(plan(s, NOW, trialLadder), []);
-  assert.equal(queueInfo(s, "t1", NOW, trialLadder).reason, "every machine size is in use (small 1/1, mini 2/2)");
+  assert.equal(queueInfo(s, "t1", NOW, trialLadder).reason, "no room for a new machine (small 1/1, mini 2/2); idle machines of other repos close to make room");
   assert.equal(queueInfo(s, "t3", NOW, trialLadder).position, 2);
   // The released small goes to the oldest ticket of its repo.
   const freed = state([sized("s1", "a", "small", idle(0)), machines[1], machines[2]], s.tickets);
@@ -406,4 +406,32 @@ test("an idle machine that stopped answering is closed, never granted", async ()
   const actions = plan(state, now, config);
   assert.equal(actions.filter((a: any) => a.kind === "grant").length, 0);
   assert.ok(actions.some((a: any) => a.kind === "close" && a.machineId === "m1" && a.reason === "unresponsive"));
+});
+
+test("vCPU limit: sizes without max fill up to the limit less the reserve, preferred size first, then smaller", async () => {
+  const { plan } = await import("../src/plan.ts");
+  const { parseConfig } = await import("../src/config.ts");
+  const { emptyState } = await import("../src/types.ts");
+  const config = parseConfig({ project: "p", template: "claude", sizes: [{ size: "medium" }, { size: "small" }], vcpuLimit: 40, vcpuReserve: 4, perRepoCap: 20, createsPerRepoPerHour: 50 });
+  const now = 1_000_000_000;
+  const state = emptyState();
+  for (let i = 0; i < 12; i++) state.tickets.push({ id: `t${i}`, repo: "github.com/o/r", ref: "main", holder: "h", status: "queued", enqueuedAt: now - 1000 } as any);
+  const sizes = plan(state, now, config).filter((a: any) => a.kind === "create").map((a: any) => a.size);
+  assert.deepEqual(sizes, Array(9).fill("medium"), "36 vCPU of mediums, then nothing fits");
+});
+
+test("learnSize: up after a tight job, down after 3 light ones, never below the learned minimum", async () => {
+  const { learnSize } = await import("../src/plan.ts");
+  const { parseConfig } = await import("../src/config.ts");
+  const config = parseConfig({ project: "p", template: "claude", sizes: [{ size: "large" }, { size: "medium" }, { size: "small" }], vcpuLimit: 40 });
+  const job = (size: string, extra: object = {}) => ({ repo: "r", holder: "h", size, machineId: "m", grantedAt: 0, endedAt: 1, waitedMs: 0, ...extra }) as any;
+  assert.equal(learnSize(config, "medium", [job("medium", { peakMemPct: 91 })])?.size, "large");
+  assert.equal(learnSize(config, "medium", [job("medium", { memKills: 1, peakMemPct: 60 })])?.size, "large");
+  assert.equal(learnSize(config, "medium", [job("medium", { froze: true })])?.size, "large");
+  assert.equal(learnSize(config, "medium", [job("medium", { peakMemPct: 60 })]), undefined);
+  const light = [job("medium", { peakMemPct: 30 }), job("medium", { peakMemPct: 22 }), job("medium", { peakMemPct: 35 })];
+  assert.equal(learnSize(config, "medium", light)?.size, "small");
+  assert.equal(learnSize(config, "medium", light, "medium"), undefined, "min size holds");
+  assert.equal(learnSize(config, "medium", light.slice(0, 2)), undefined, "needs 3");
+  assert.equal(learnSize(config, "medium", [job("medium", { peakMemPct: 30 }), job("medium"), job("medium", { peakMemPct: 30 })]), undefined, "unknown peak is not light");
 });

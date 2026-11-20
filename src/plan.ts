@@ -1,5 +1,5 @@
-import { SIZE_WEIGHT } from "./types.ts";
-import type { AccountId, Action, Config, CreateRecord, Machine, MachineId, RepoKey, Size, SizeSlot, State, Ticket } from "./types.ts";
+import { SIZE_VCPU, SIZE_WEIGHT } from "./types.ts";
+import type { AccountId, Action, Config, CreateRecord, JobRecord, Machine, MachineId, RepoKey, Size, SizeSlot, State, Ticket } from "./types.ts";
 
 const MINUTE = 60_000;
 export const DEADLINE_MARGIN_MS = 5 * MINUTE;
@@ -32,15 +32,67 @@ export function sizesInUse(machines: Machine[]): Map<Size, number> {
   return used;
 }
 
-/** The largest size on the ladder with room, given machines per size. */
-export function sizeWithRoom(ladder: SizeSlot[], used: Map<Size, number>): Size | undefined {
-  return ladder.find((s) => (used.get(s.size) ?? 0) < s.max)?.size;
+/** vCPUs still free for new machines: the limit, less the reserve, less every machine counted in `used`. */
+export function vcpuFree(config: Pick<Config, "vcpuLimit" | "vcpuReserve">, used: Map<Size, number>): number {
+  if (config.vcpuLimit === undefined) return Number.POSITIVE_INFINITY;
+  let inUse = 0;
+  for (const [size, n] of used) inUse += SIZE_VCPU[size] * n;
+  return config.vcpuLimit - (config.vcpuReserve ?? 0) - inUse;
 }
 
-/** The ladder a repo may use: sizes at least its learned minimum (state.repoMinSize). */
+/** The first size on the ladder with room (its own max, and the vCPU limit when there is one). */
+export function sizeWithRoom(ladder: SizeSlot[], used: Map<Size, number>, config?: Pick<Config, "vcpuLimit" | "vcpuReserve">): Size | undefined {
+  const free = config ? vcpuFree(config, used) : Number.POSITIVE_INFINITY;
+  return ladder.find((s) => (used.get(s.size) ?? 0) < s.max && SIZE_VCPU[s.size] <= free)?.size;
+}
+
+/**
+ * The sizes a repo may get, in the order to try: its learned size (state.repoSize, else
+ * config.defaultSize) first, then smaller ones, never below its learned minimum (state.repoMinSize).
+ */
 export function repoLadder(state: State, config: Config, repo: RepoKey): SizeSlot[] {
   const min = state.repoMinSize?.[repo];
-  return min ? config.sizes.filter((s) => SIZE_WEIGHT[s.size] >= SIZE_WEIGHT[min]) : config.sizes;
+  const allowed = min ? config.sizes.filter((s) => SIZE_WEIGHT[s.size] >= SIZE_WEIGHT[min]) : config.sizes;
+  const want = state.repoSize?.[repo]?.size ?? config.defaultSize;
+  if (!want) return allowed;
+  const fromWant = allowed.filter((s) => SIZE_WEIGHT[s.size] <= SIZE_WEIGHT[want]);
+  return fromWant.length ? fromWant : allowed.slice(-1);
+}
+
+/** The next size down from `size` on the ladder, if there is one. */
+export function nextSizeDown(config: Config, size: Size): Size | undefined {
+  return config.sizes.find((s) => SIZE_WEIGHT[s.size] < SIZE_WEIGHT[size])?.size;
+}
+
+/** Memory use (share of the machine) at or above which a job needed more room. */
+export const MEM_UP_PCT = 85;
+/** Memory use below which a job would have fitted a size down (half the memory). */
+export const MEM_DOWN_PCT = 40;
+/** Light jobs in a row, on the current size, before trying a size down. */
+export const DOWN_AFTER_JOBS = 3;
+
+/**
+ * What a repo's next machine should be, from its jobs (newest first). Up a size when the latest job
+ * froze the machine, had a process killed for memory, or used MEM_UP_PCT of memory; down a size
+ * after DOWN_AFTER_JOBS jobs in a row on the current size each used under MEM_DOWN_PCT. Never below
+ * the repo's learned minimum. Undefined: keep the current choice.
+ */
+export function learnSize(config: Config, current: Size, jobs: JobRecord[], min?: Size): { size: Size; why: string } | undefined {
+  const last = jobs[0];
+  if (!last) return undefined;
+  const tight = last.froze || (last.memKills ?? 0) > 0 || (last.peakMemPct ?? 0) >= MEM_UP_PCT;
+  if (tight) {
+    const up = nextSizeUp(config, last.size);
+    if (!up || SIZE_WEIGHT[up] <= SIZE_WEIGHT[current]) return undefined;
+    const what = last.froze ? "froze" : (last.memKills ?? 0) > 0 ? `had ${last.memKills} process(es) killed for memory` : `used ${last.peakMemPct}% of memory`;
+    return { size: up, why: `a ${last.size} ${what} during ${last.holder}` };
+  }
+  const recent = jobs.slice(0, DOWN_AFTER_JOBS);
+  const light = recent.length === DOWN_AFTER_JOBS && recent.every((j) => j.size === current && !j.froze && !(j.memKills ?? 0) && j.peakMemPct !== undefined && j.peakMemPct < MEM_DOWN_PCT);
+  if (!light) return undefined;
+  const down = nextSizeDown(config, current);
+  if (!down || (min && SIZE_WEIGHT[down] < SIZE_WEIGHT[min])) return undefined;
+  return { size: down, why: `the last ${DOWN_AFTER_JOBS} jobs on ${current} each used under ${MEM_DOWN_PCT}% of memory (highest ${Math.max(...recent.map((j) => j.peakMemPct!))}%)` };
 }
 
 /** The next size up from `size` on the ladder, if there is one. */
@@ -49,7 +101,7 @@ export function nextSizeUp(config: Config, size: Size): Size | undefined {
 }
 
 export function ladderText(ladder: SizeSlot[], used: Map<Size, number>): string {
-  return ladder.map((s) => `${s.size} ${used.get(s.size) ?? 0}/${s.max}`).join(", ");
+  return ladder.map((s) => `${s.size} ${used.get(s.size) ?? 0}${s.max < Number.MAX_SAFE_INTEGER ? `/${s.max}` : ""}`).join(", ");
 }
 
 /**
@@ -232,7 +284,7 @@ export function plan(state: State, now: number, config: Config): Action[] {
     // Each pass of the loop stands for one future create, so it also spends the hourly allowance.
     let allowance = config.createsPerRepoPerHour - (state.creates ?? []).filter((r) => r.repo === repo && now - r.at < HOUR).length;
     while (need > 0 && inRepo < config.perRepoCap && allowance-- > 0) {
-      const size = sizeWithRoom(repoLadder(state, config, repo), used);
+      const size = sizeWithRoom(repoLadder(state, config, repo), used, config);
       if (size) {
         creates.push({ kind: "create", repo, size });
         used.set(size, (used.get(size) ?? 0) + 1);
@@ -277,9 +329,11 @@ export function queueInfo(state: State, ticketId: string, now: number, config: C
   const used = sizesInUse(machines);
   const ladder = repoLadder(state, config, ticket.repo);
   if (!ladder.length) return { position, reason: `this repo needs ${state.repoMinSize?.[ticket.repo]} or larger, which the size ladder does not have` };
-  if (!sizeWithRoom(ladder, used)) {
+  if (!sizeWithRoom(ladder, used, config)) {
     const min = state.repoMinSize?.[ticket.repo];
-    return { position, reason: `every machine size${min ? ` this repo fits in (${min} or larger)` : ""} is in use (${ladderText(ladder, used)})` };
+    const free = vcpuFree(config, used);
+    const vcpu = Number.isFinite(free) ? `; ${Math.max(0, free)} vCPU free of ${config.vcpuLimit}` : "";
+    return { position, reason: `no room for a new machine${min ? ` of ${min} or larger` : ""} (${ladderText(ladder, used)}${vcpu}); idle machines of other repos close to make room` };
   }
   return { position };
 }

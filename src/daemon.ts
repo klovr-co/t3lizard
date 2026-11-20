@@ -6,14 +6,15 @@ import type { Account, Remote } from "./bringup.ts";
 import { paths } from "./config.ts";
 import { LizardLimitError, LizardPaymentError } from "./lizard.ts";
 import type { Lizard } from "./lizard.ts";
-import { nextSizeUp } from "./plan.ts";
+import { learnSize, nextSizeUp, vcpuFree } from "./plan.ts";
 import { accountLimited, accountWait, BRINGING_UP, BUDGET_UNIT, createBackoff, createBlock, nextFreeAccount, plan, queueInfo, repoCreateBlock, sizesInUse, usedSmallHours, utcDay } from "./plan.ts";
 import { startProxy } from "./proxy.ts";
 import { addStep, readHistory, readSetup, removeStep } from "./setup.ts";
 import type { RepoSetup } from "./setup.ts";
 import type { Proxy } from "./proxy.ts";
 import type { LocalT3 } from "./t3local.ts";
-import { emptyState, SIZE_WEIGHT } from "./types.ts";
+import { emptyState, SIZE_USD_PER_HOUR, SIZE_VCPU, SIZE_WEIGHT } from "./types.ts";
+import type { JobRecord } from "./types.ts";
 import type { AccountId, Action, CloseReason, Config, CreateRecord, Lease, Machine, MachineId, MachinePhase, RepoKey, Size, State, Ticket } from "./types.ts";
 
 const MINUTE = 60_000;
@@ -229,9 +230,105 @@ export class Daemon {
       (this.state.repoMinSize ??= {})[m.repo] = up;
       this.deps.log(`${m.repo} learned: a ${m.size} stopped answering during ${lease.holder}; it now gets ${up} or larger`);
     }
+    this.recordJob({ ...this.jobBase(lease, m.size), froze: true });
     this.deps.log(`closing machine ${m.id}: no answer for ${Math.round((now - m.unresponsiveSince) / MINUTE)} minutes`);
     this.apply({ kind: "close", machineId: m.id, reason: "unresponsive" });
     this.save();
+  }
+
+  private jobBase(lease: Lease, size: Size): JobRecord {
+    return {
+      repo: lease.repo,
+      holder: lease.holder,
+      size,
+      machineId: lease.machineId,
+      grantedAt: lease.grantedAt,
+      endedAt: this.deps.now(),
+      waitedMs: lease.waitedMs ?? 0,
+    };
+  }
+
+  /** At grant: zero the machine's mem-peak and note where guard.log ends, so the stats are this lease's. */
+  private async resetPeak(id: MachineId, leaseId: string): Promise<void> {
+    try {
+      const out = (await this.deps.lizard.exec(id, ["bash", "-c", 'D="$HOME/.t3lizard"; echo 0 > "$D/mem-peak" 2>/dev/null; wc -l < "$D/guard.log" 2>/dev/null || echo 0'], 30_000)).stdout;
+      const lease = this.state.leases[leaseId];
+      if (lease) {
+        lease.guardLogLines = Number(out.trim()) || 0;
+        this.save();
+      }
+    } catch {
+      // Stats for this lease are then unknown; learning skips it.
+    }
+  }
+
+  /** At release: read the lease's peak memory and memory kills from the machine, then record and learn. */
+  private async finishJob(lease: Lease, size: Size): Promise<void> {
+    const rec = this.jobBase(lease, size);
+    if (this.state.machines[lease.machineId] && !this.state.machines[lease.machineId].unresponsiveSince) {
+      try {
+        const from = (lease.guardLogLines ?? 0) + 1;
+        const out = (await this.deps.lizard.exec(
+          lease.machineId,
+          ["bash", "-c", 'D="$HOME/.t3lizard"; echo "peak=$(cat "$D/mem-peak" 2>/dev/null)"; echo "kills=$(tail -n +"$1" "$D/guard.log" 2>/dev/null | grep -c killed)"', "t3lizard", String(from)],
+          30_000,
+        )).stdout;
+        const peak = out.match(/peak=(\d+)/)?.[1];
+        const kills = out.match(/kills=(\d+)/)?.[1];
+        if (peak !== undefined && Number(peak) > 0) rec.peakMemPct = Number(peak);
+        if (kills !== undefined) rec.memKills = Number(kills);
+      } catch {
+        // A machine that does not answer gives no stats; noAnswer handles a freeze.
+      }
+    }
+    this.recordJob(rec);
+  }
+
+  /** Keeps the latest 500 jobs and updates the repo's learned size. */
+  private recordJob(rec: JobRecord): void {
+    const jobs = (this.state.jobs ??= []);
+    jobs.unshift(rec);
+    jobs.length = Math.min(jobs.length, 500);
+    const { config } = this.deps;
+    const current = this.state.repoSize?.[rec.repo]?.size ?? config.defaultSize;
+    const next = learnSize(config, current, jobs.filter((j) => j.repo === rec.repo), this.state.repoMinSize?.[rec.repo]);
+    if (next && next.size !== current) {
+      (this.state.repoSize ??= {})[rec.repo] = { ...next, at: this.deps.now() };
+      this.deps.log(`${rec.repo} learned: next machines are ${next.size} (${next.why})`);
+    }
+    this.save();
+  }
+
+  /** Jobs, spend and learned sizes for the dashboard. */
+  dashboard() {
+    const now = this.deps.now();
+    const { config } = this.deps;
+    const used = new Map<Size, number>();
+    for (const m of Object.values(this.state.machines)) used.set(m.size, (used.get(m.size) ?? 0) + 1);
+    const vcpuInUse = [...used].reduce((n, [size, k]) => n + SIZE_VCPU[size] * k, 0);
+    const usdPerSmallSecond = SIZE_USD_PER_HOUR.small / 3600;
+    const days = Object.entries(this.state.usage).sort(([a], [b]) => (a < b ? 1 : -1)).slice(0, 31);
+    const month = new Date(now).toISOString().slice(0, 7);
+    const spend = {
+      today: (this.state.usage[new Date(now).toISOString().slice(0, 10)] ?? 0) * usdPerSmallSecond,
+      thisMonth: days.filter(([d]) => d.startsWith(month)).reduce((n, [, v]) => n + v * usdPerSmallSecond, 0),
+      byDay: days.map(([day, v]) => ({ day, usd: v * usdPerSmallSecond })),
+    };
+    const repos = new Set([...Object.keys(this.state.repoSize ?? {}), ...(this.state.jobs ?? []).map((j) => j.repo)]);
+    const learned = [...repos].map((repo) => ({
+      repo,
+      size: this.state.repoSize?.[repo]?.size ?? config.defaultSize,
+      why: this.state.repoSize?.[repo]?.why ?? "default, nothing learned yet",
+      minSize: this.state.repoMinSize?.[repo],
+    }));
+    return {
+      now,
+      vcpu: { limit: config.vcpuLimit, reserve: config.vcpuReserve, inUse: vcpuInUse, free: vcpuFree(config, used) },
+      spend,
+      learned,
+      jobs: (this.state.jobs ?? []).slice(0, 100),
+      status: this.status(),
+    };
   }
 
   /**
@@ -535,7 +632,17 @@ export class Daemon {
       this.step();
       return;
     }
-    const lease: Lease = { id: randomUUID(), machineId, repo: m.repo, ref: current.ref, holder: current.holder, grantedAt: now, expiresAt: now + this.deps.config.leaseMinutes * MINUTE };
+    const lease: Lease = {
+      id: randomUUID(),
+      machineId,
+      repo: m.repo,
+      ref: current.ref,
+      holder: current.holder,
+      grantedAt: now,
+      expiresAt: now + this.deps.config.leaseMinutes * MINUTE,
+      waitedMs: Math.max(0, now - current.enqueuedAt),
+    };
+    this.launch(`peak-reset:${lease.id}`, () => this.resetPeak(machineId, lease.id));
     this.state.leases[lease.id] = lease;
     this.replaceTicket({ ...current, status: "granted", leaseId: lease.id });
     this.setPhase(m, { kind: "leased", leaseId: lease.id });
@@ -850,6 +957,10 @@ export class Daemon {
   private endLease(leaseId: string, how: "released" | "expired"): void {
     const lease = this.state.leases[leaseId];
     delete this.state.leases[leaseId];
+    if (lease) {
+      const size = this.state.machines[lease.machineId]?.size;
+      if (size) this.launch(`job:${leaseId}`, () => this.finishJob(lease, size));
+    }
     const m = this.state.machines[lease.machineId];
     if (m) {
       delete m.limitedThreads;
