@@ -159,9 +159,10 @@ export const SWAP_MB: Record<string, number> = { nano: 1024, mini: 2048, small: 
 /**
  * Best-effort machine prep, as root where sudo works, before T3 starts:
  * - the label T3 shows for this environment (PRETTY_HOSTNAME; every Lizard machine is "e2b.local"),
- * - a swap file, so a heavy job slows down instead of freezing the machine,
+ * - a swap file where the kernel allows one (Lizard's does not today),
  * - guard.sh, which keeps T3, the front proxy and their supervisors at high priority and last in
- *   line for the OOM killer, so the devbox keeps reaching the machine while a job thrashes.
+ *   line for the OOM killer, and kills the largest job process when memory is almost gone, so the
+ *   machine slows a job down or fails one command instead of freezing (logged in ~/.t3lizard/guard.log).
  * Never fails the bring-up: a machine without sudo still works, it just keeps the default label.
  */
 export const PREP_SH = `label="$1"; swap_mb="$2"; uid="$(id -u)"
@@ -180,18 +181,23 @@ if [ "$swap_mb" -gt 0 ] && ! sudo grep -q '^/swapfile ' /proc/swaps; then
       sudo chmod 600 /swapfile && sudo env PATH="/usr/sbin:/sbin:$PATH" mkswap /swapfile > /dev/null
     fi
   fi
-  [ -f /swapfile ] && { sudo env PATH="/usr/sbin:/sbin:$PATH" swapon /swapfile 2>/dev/null || echo "swapon failed"; }
+  # Lizard's kernel refuses swap today; drop the file then, so it does not hold disk for nothing.
+  [ -f /swapfile ] && { sudo env PATH="/usr/sbin:/sbin:$PATH" swapon /swapfile 2>/dev/null || { echo "swapon refused"; sudo rm -f /swapfile; }; }
 fi
-sudo setsid nohup bash "$D/guard.sh" "$uid" > /dev/null 2>&1 < /dev/null &
+sudo setsid nohup bash "$D/guard.sh" "$uid" "$D/guard.log" > /dev/null 2>&1 < /dev/null &
 echo "prep done: $(grep -c . /proc/swaps) swap line(s)"`;
 
 /** Runs as root. Protects T3's own processes; their children (agents, builds) are reset to normal. */
 export const GUARD_SH = `#!/usr/bin/env bash
+# Every 2 s: keep T3's own processes protected (their children reset to normal), and when memory is
+# almost gone, kill the largest other non-root process before the machine freezes. Lizard machines
+# have no swap, so a full machine thrashes for minutes before the kernel OOM killer acts.
 exec 9>/run/t3lizard-guard.lock
 flock -n 9 || exit 0
-uid="$1"
+uid="$1"; log="$2"
+floor_kb=$(awk '/MemTotal/ {f = int($2 / 20); print (f < 153600 ? 153600 : f)}' /proc/meminfo)
 while true; do
-  prot=" $(pgrep -u "$uid" -f 't3 serve --host 127\\.0\\.0\\.1|front\\.mjs|supervise\\.sh' | tr '\\n' ' ') "
+  prot=" $(pgrep -f 't3 serve --host 127\\.0\\.0\\.1|front\\.mjs|supervise\\.sh|t3lizard-guard|/usr/bin/envd' | tr '\\n' ' ') "
   for p in $(pgrep -u "$uid"); do
     f="/proc/$p/oom_score_adj"
     [ -w "$f" ] || continue
@@ -202,7 +208,15 @@ while true; do
       n="$(ps -o ni= -p "$p" 2>/dev/null | tr -d ' ')"; [ "\${n:-0}" -lt 0 ] 2>/dev/null && renice -n 0 -p "$p" > /dev/null 2>&1
     fi
   done
-  sleep 5
+  avail_kb=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
+  if [ "$avail_kb" -lt "$floor_kb" ]; then
+    victim=$(ps -eo pid=,uid=,rss= --sort=-rss | awk -v prot="$prot" '$2 != 0 && index(prot, " " $1 " ") == 0 {print $1; exit}')
+    if [ -n "$victim" ]; then
+      what="$(ps -o rss=,args= -p "$victim" | cut -c1-160)"
+      kill -9 "$victim" 2>/dev/null && echo "$(date -u +%FT%TZ) memory low ($((avail_kb / 1024)) MB free): killed $victim: $what" >> "$log"
+    fi
+  fi
+  sleep 2
 done
 `;
 

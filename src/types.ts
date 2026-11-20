@@ -123,6 +123,8 @@ export interface State {
   creates?: CreateRecord[];
   /** Per Claude account. Optional so older state files still load. */
   accounts?: Record<AccountId, AccountState>;
+  /** Learned per repo: the smallest size its jobs fit in, raised when a machine stops answering mid-job. */
+  repoMinSize?: Record<RepoKey, Size>;
 }
 
 export interface Config {
@@ -158,7 +160,7 @@ export interface Config {
   accounts: AccountId[];
 }
 
-export type CloseReason = "idle" | "recycle" | "deadline" | "failed" | "orphan" | "manual";
+export type CloseReason = "idle" | "recycle" | "deadline" | "failed" | "orphan" | "manual" | "unresponsive";
 
 export type Action =
   | { kind: "grant"; ticketId: string; machineId: MachineId }

@@ -6,6 +6,7 @@ import type { Account, Remote } from "./bringup.ts";
 import { paths } from "./config.ts";
 import { LizardLimitError, LizardPaymentError } from "./lizard.ts";
 import type { Lizard } from "./lizard.ts";
+import { nextSizeUp } from "./plan.ts";
 import { accountLimited, accountWait, BRINGING_UP, BUDGET_UNIT, createBackoff, createBlock, nextFreeAccount, plan, queueInfo, repoCreateBlock, sizesInUse, usedSmallHours, utcDay } from "./plan.ts";
 import { startProxy } from "./proxy.ts";
 import { addStep, readHistory, readSetup, removeStep } from "./setup.ts";
@@ -18,6 +19,8 @@ import type { AccountId, Action, CloseReason, Config, CreateRecord, Lease, Machi
 const MINUTE = 60_000;
 const PENDING = "pending:";
 const BUSY_LEASE_GRACE_MS = 10 * MINUTE;
+/** A leased machine that has not answered this long is closed (see noAnswer). */
+const UNRESPONSIVE_CLOSE_MS = 10 * MINUTE;
 /** How often a leased machine is checked for threads stopped on a usage limit. */
 const LIMIT_SCAN_EVERY_MS = MINUTE;
 /** Allowed difference between the machine's clock and the devbox's. */
@@ -208,6 +211,30 @@ export class Daemon {
   }
 
   /**
+   * A leased machine whose commands time out. After UNRESPONSIVE_CLOSE it is closed, so its slot
+   * frees, and its repo learns to use the next size up: a job that freezes a machine will freeze the
+   * next one of that size too (an aldrent push gate on a 2 GB mini did, twice).
+   */
+  private noAnswer(m: Machine, lease: Lease): void {
+    const now = this.deps.now();
+    if (!m.unresponsiveSince) {
+      m.unresponsiveSince = now;
+      this.save();
+      return;
+    }
+    if (now - m.unresponsiveSince < UNRESPONSIVE_CLOSE_MS || m.phase.kind !== "leased" || m.phase.leaseId !== lease.id) return;
+    const up = nextSizeUp(this.deps.config, m.size);
+    const known = this.state.repoMinSize?.[m.repo];
+    if (up && (!known || SIZE_WEIGHT[up] > SIZE_WEIGHT[known])) {
+      (this.state.repoMinSize ??= {})[m.repo] = up;
+      this.deps.log(`${m.repo} learned: a ${m.size} stopped answering during ${lease.holder}; it now gets ${up} or larger`);
+    }
+    this.deps.log(`closing machine ${m.id}: no answer for ${Math.round((now - m.unresponsiveSince) / MINUTE)} minutes`);
+    this.apply({ kind: "close", machineId: m.id, reason: "unresponsive" });
+    this.save();
+  }
+
+  /**
    * One-time pairing links a person opens (or pastes into Add environment) to see a machine's threads
    * in their own T3 app. Needs publicHost/publicBind, since 127.0.0.1 on the devbox is not the browser's.
    */
@@ -265,6 +292,8 @@ export class Daemon {
     for (const [repo, p] of Object.entries(pools)) {
       const n = (this.state.creates ?? []).filter((r) => r.repo === repo && now - r.at < 60 * MINUTE).length;
       if (n) p.createsLastHour = n;
+      const min = this.state.repoMinSize?.[repo];
+      if (min) (p as Record<string, unknown>).minSize = `${min} (learned: a smaller machine froze on this repo's jobs)`;
       const blocked = repoCreateBlock(this.state, repo, now, config);
       if (blocked) p.createsBlocked = blocked;
     }
@@ -674,10 +703,7 @@ export class Daemon {
     } catch (e) {
       this.deps.log(`limit scan of ${id} failed: ${(e as Error).message}`);
       const gone = this.state.machines[id];
-      if (gone && !gone.unresponsiveSince && /timeout|timed out|aborted/i.test((e as Error).message)) {
-        gone.unresponsiveSince = this.deps.now();
-        this.save();
-      }
+      if (gone && /timeout|timed out|aborted/i.test((e as Error).message)) this.noAnswer(gone, lease);
       return;
     }
     const m = this.state.machines[id];

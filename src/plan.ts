@@ -37,6 +37,17 @@ export function sizeWithRoom(ladder: SizeSlot[], used: Map<Size, number>): Size 
   return ladder.find((s) => (used.get(s.size) ?? 0) < s.max)?.size;
 }
 
+/** The ladder a repo may use: sizes at least its learned minimum (state.repoMinSize). */
+export function repoLadder(state: State, config: Config, repo: RepoKey): SizeSlot[] {
+  const min = state.repoMinSize?.[repo];
+  return min ? config.sizes.filter((s) => SIZE_WEIGHT[s.size] >= SIZE_WEIGHT[min]) : config.sizes;
+}
+
+/** The next size up from `size` on the ladder, if there is one. */
+export function nextSizeUp(config: Config, size: Size): Size | undefined {
+  return [...config.sizes].reverse().find((s) => SIZE_WEIGHT[s.size] > SIZE_WEIGHT[size])?.size;
+}
+
 export function ladderText(ladder: SizeSlot[], used: Map<Size, number>): string {
   return ladder.map((s) => `${s.size} ${used.get(s.size) ?? 0}/${s.max}`).join(", ");
 }
@@ -184,6 +195,9 @@ export function plan(state: State, now: number, config: Config): Action[] {
   const idleByRepo = new Map<RepoKey, Machine[]>();
   for (const m of machines) {
     if (m.phase.kind !== "idle" || closingNow.has(m.id)) continue;
+    // Too small for this repo's jobs (learned): left to close as idle, never granted.
+    const min = state.repoMinSize?.[m.repo];
+    if (min && SIZE_WEIGHT[m.size] < SIZE_WEIGHT[min]) continue;
     idleByRepo.set(m.repo, [...(idleByRepo.get(m.repo) ?? []), m]);
   }
   // The oldest ticket gets the largest idle machine; among equals, the one with the most time left.
@@ -213,7 +227,7 @@ export function plan(state: State, now: number, config: Config): Action[] {
     // Each pass of the loop stands for one future create, so it also spends the hourly allowance.
     let allowance = config.createsPerRepoPerHour - (state.creates ?? []).filter((r) => r.repo === repo && now - r.at < HOUR).length;
     while (need > 0 && inRepo < config.perRepoCap && allowance-- > 0) {
-      const size = sizeWithRoom(config.sizes, used);
+      const size = sizeWithRoom(repoLadder(state, config, repo), used);
       if (size) {
         creates.push({ kind: "create", repo, size });
         used.set(size, (used.get(size) ?? 0) + 1);
@@ -256,6 +270,11 @@ export function queueInfo(state: State, ticketId: string, now: number, config: C
   const repoBlock = repoCreateBlock(state, ticket.repo, now, config);
   if (repoBlock) return { position, reason: repoBlock };
   const used = sizesInUse(machines);
-  if (!sizeWithRoom(config.sizes, used)) return { position, reason: `every machine size is in use (${ladderText(config.sizes, used)})` };
+  const ladder = repoLadder(state, config, ticket.repo);
+  if (!ladder.length) return { position, reason: `this repo needs ${state.repoMinSize?.[ticket.repo]} or larger, which the size ladder does not have` };
+  if (!sizeWithRoom(ladder, used)) {
+    const min = state.repoMinSize?.[ticket.repo];
+    return { position, reason: `every machine size${min ? ` this repo fits in (${min} or larger)` : ""} is in use (${ladderText(ladder, used)})` };
+  }
   return { position };
 }
