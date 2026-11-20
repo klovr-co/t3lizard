@@ -371,6 +371,29 @@ test("a thread that hits a usage limit continues on the next account; with all l
   assert.equal(h.daemon.state.machines["sb-1"].limitedThreads, undefined);
 });
 
+test("an account added after a machine came up is given to that machine while it runs", async (t) => {
+  const A1 = "claudeAgent_acct1";
+  const A2 = "claudeAgent_acct2";
+  const first = await harness(t, { accounts: [A1] });
+  const q = await first.api("/acquire", { repo: REPO, ref: "main", holder: "a" });
+  await first.daemon.settled();
+  const granted = await first.api("/wait", { ticketId: q.ticketId, maxSeconds: 1 });
+  assert.equal(granted.lease.providerInstanceId, A1);
+  await first.advance(0);
+  const m = first.lizard.machines.get("sb-1")!;
+  const pushes = m.steps.filter((s) => s === "accounts").length;
+  assert.equal(pushes, 1, "an up-to-date machine is not pushed again");
+  await first.stop();
+
+  // A2 is added to the secrets and the daemon restarts: the leased machine gets it without a restart.
+  const second = await harness(t, { accounts: [A1, A2] }, first);
+  await second.advance(0);
+  assert.equal(m.steps.filter((s) => s === "accounts").length, pushes + 1);
+  assert.equal(m.files.get("accounts.json")!.content, JSON.stringify([{ id: A1, token: `token-of-${A1}` }, { id: A2, token: `token-of-${A2}` }]));
+  await second.advance(5);
+  assert.equal(m.steps.filter((s) => s === "accounts").length, pushes + 1, "pushed once");
+});
+
 test("bring-up runs the repo's setup script in the checkout after the clone and before the machine is ready", async (t) => {
   const h = await harness(t);
   addStep(h.home, "github.com/Acme/app", { line: "command -v bun >/dev/null || curl -fsSL https://bun.sh/install | bash", reason: "needs bun", now: h.clock.now });

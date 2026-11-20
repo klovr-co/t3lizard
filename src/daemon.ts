@@ -4,13 +4,13 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { busyThreads, configureFront, continueOnAccount, exportThreads, FRONT_PORT, install, machineLabel, pairAndLink, resetCheckout, runRepoSetup, scanLimits, setupProject } from "./bringup.ts";
+import { busyThreads, configureFront, pushAccounts, continueOnAccount, exportThreads, FRONT_PORT, install, machineLabel, pairAndLink, resetCheckout, runRepoSetup, scanLimits, setupProject } from "./bringup.ts";
 import type { Account, Remote } from "./bringup.ts";
 import { paths } from "./config.ts";
 import { LizardLimitError, LizardPaymentError } from "./lizard.ts";
 import type { Lizard } from "./lizard.ts";
 import { learnSize, nextSizeUp, repoGaps, repoIdleMs, vcpuFree } from "./plan.ts";
-import { accountLimited, accountWait, BRINGING_UP, BUDGET_UNIT, createBackoff, createBlock, nextFreeAccount, plan, queueInfo, repoCreateBlock, sizesInUse, usedSmallHours, utcDay } from "./plan.ts";
+import { accountLimited, accountWait, BRINGING_UP, BUDGET_UNIT, createBackoff, createBlock, machineAccounts, nextFreeAccount, plan, queueInfo, repoCreateBlock, sizesInUse, usedSmallHours, utcDay } from "./plan.ts";
 import { startProxy } from "./proxy.ts";
 import { addStep, readHistory, readSetup, removeStep } from "./setup.ts";
 import type { RepoSetup } from "./setup.ts";
@@ -88,6 +88,7 @@ export class Daemon {
   private changes = new EventEmitter();
   private t3Version?: string;
   private lastLimitScan = new Map<MachineId, number>();
+  private lastAccountPush = new Map<MachineId, number>();
   /** A continue that failed is retried after this time, not every tick. */
   private continueRetryAt = new Map<string, number>();
   private remote: Remote;
@@ -146,6 +147,7 @@ export class Daemon {
       this.reopenProxies();
       this.step();
       this.scanForLimits();
+      this.syncAccounts();
     } finally {
       this.ticking = false;
     }
@@ -484,8 +486,8 @@ export class Daemon {
     if (t.status === "queued") return { ticketId, status: "queued", ...queueInfo(this.state, ticketId, this.deps.now(), this.deps.config) };
     if (t.status === "granted") {
       const lease = this.state.leases[t.leaseId];
-      const account = this.accountFor();
       const m = lease && this.state.machines[lease.machineId];
+      const account = m && this.accountFor(m);
       if (!lease || !m?.environmentId || !m.projectId || !m.workspacePath) return { ticketId, status: "released" };
       return {
         ticketId,
@@ -603,7 +605,9 @@ export class Daemon {
       let m = this.state.machines[id];
       if (m?.phase.kind === "installing") {
         this.t3Version ??= await this.deps.t3.version();
-        await install(this.remote, id, this.deps.machineEnv, this.t3Version, this.accounts(), { label: machineLabel(m.repo, id, m.size), size: m.size });
+        const accounts = this.accounts();
+        await install(this.remote, id, this.deps.machineEnv, this.t3Version, accounts, { label: machineLabel(m.repo, id, m.size), size: m.size });
+        at("installing").accounts = accounts.map((a) => a.id);
         this.setPhase(at("installing"), { kind: "linking" });
       }
       m = at("linking");
@@ -832,8 +836,8 @@ export class Daemon {
   }
 
   /** The account a new delegation should use: the first free one, else the one that frees first. */
-  private accountFor(): AccountId | undefined {
-    const { accounts } = this.deps.config;
+  private accountFor(m: Machine): AccountId | undefined {
+    const accounts = machineAccounts(m, this.deps.config);
     const until = (a: AccountId) => this.state.accounts?.[a]?.limitedUntil ?? 0;
     return nextFreeAccount(this.state, this.deps.now(), accounts) ?? [...accounts].sort((a, b) => until(a) - until(b))[0];
   }
@@ -842,6 +846,36 @@ export class Daemon {
     const wait = accountWait(this.state, m, now, this.deps.config);
     if (!wait) return {};
     return "until" in wait ? { waitingForAccountUntil: new Date(wait.until).toISOString() } : { cannotWaitForAccount: wait.blocked };
+  }
+
+  /**
+   * A running machine whose accounts differ from the secrets (an account was added or removed
+   * after it came up) gets the current list, at most once a minute per machine.
+   */
+  private syncAccounts(): void {
+    const want = this.deps.config.accounts;
+    if (!want.length) return;
+    const now = this.deps.now();
+    for (const m of Object.values(this.state.machines)) {
+      if (m.phase.kind !== "leased" && m.phase.kind !== "idle") continue;
+      if (m.accounts && m.accounts.join() === want.join()) continue;
+      if (now - (this.lastAccountPush.get(m.id) ?? 0) < LIMIT_SCAN_EVERY_MS) continue;
+      this.lastAccountPush.set(m.id, now);
+      const id = m.id;
+      this.launch(`accounts:${id}`, async () => {
+        try {
+          await pushAccounts(this.remote, id, this.accounts());
+        } catch (e) {
+          this.deps.log(`machine ${id}: giving it the current Claude accounts failed: ${(e as Error).message}`);
+          return;
+        }
+        const cur = this.state.machines[id];
+        if (!cur) return;
+        cur.accounts = [...want];
+        this.save();
+        this.deps.log(`machine ${id}: Claude accounts now ${want.join(", ")}`);
+      });
+    }
   }
 
   /** Each leased machine, at most once a minute: find threads stopped on a usage limit. */

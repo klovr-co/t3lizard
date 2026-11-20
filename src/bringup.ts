@@ -288,6 +288,16 @@ export async function install(
   await pollUntil(r, HEALTH_TIMEOUT_MS, 3_000, async () => (await r.lizard.exec(id, health, 30_000)).exitCode === 0, "t3 serve start");
 }
 
+/**
+ * Gives a running machine the current account list. T3 reloads settings.json while it runs, so
+ * an account added to the secrets works on the machine without a restart (live test, 2026-11-21).
+ */
+export async function pushAccounts(r: Remote, id: MachineId, accounts: Account[]): Promise<void> {
+  await writeFile(r, id, "accounts.mjs", ACCOUNTS_JS, "600");
+  await writeFile(r, id, "accounts.json", JSON.stringify(accounts), "600");
+  await run(r, id, script("accounts", 'node "$D/accounts.mjs" configure "$D/accounts.json"'));
+}
+
 export function cloneUrl(repo: RepoKey): string {
   return `https://${repo}.git`;
 }

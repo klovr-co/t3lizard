@@ -192,15 +192,21 @@ export function nextFreeAccount(state: State, now: number, accounts: AccountId[]
   return undefined;
 }
 
+/** The accounts a machine can switch to: the ones it was brought up with. */
+export function machineAccounts(m: Machine, config: Config): AccountId[] {
+  return m.accounts ?? config.accounts;
+}
+
 /**
  * A leased machine with limited threads and no free account waits for the earliest account, plus
  * a margin. It keeps its lease and machine that long, but never past maxLifetimeMinutes or the
  * daily budget. Undefined when it need not wait.
  */
 export function accountWait(state: State, m: Machine, now: number, config: Config): { until: number } | { blocked: string } | undefined {
-  if (m.phase.kind !== "leased" || !m.limitedThreads?.length || !config.accounts.length) return undefined;
-  if (nextFreeAccount(state, now, config.accounts)) return undefined;
-  const frees = Math.min(...config.accounts.map((a) => state.accounts?.[a]?.limitedUntil ?? now));
+  const accounts = machineAccounts(m, config);
+  if (m.phase.kind !== "leased" || !m.limitedThreads?.length || !accounts.length) return undefined;
+  if (nextFreeAccount(state, now, accounts)) return undefined;
+  const frees = Math.min(...accounts.map((a) => state.accounts?.[a]?.limitedUntil ?? now));
   const until = frees + ACCOUNT_WAIT_MARGIN_MS;
   const cap = m.createdAt + config.maxLifetimeMinutes * MINUTE;
   if (until > cap) return { blocked: `the next Claude account frees at ${iso(frees)}, after this machine's maximum lifetime (${iso(cap)})` };
@@ -246,7 +252,7 @@ export function plan(state: State, now: number, config: Config): Action[] {
   for (const m of machines) {
     if (m.phase.kind !== "leased" || !m.limitedThreads?.length) continue;
     for (const t of m.limitedThreads) {
-      const account = nextFreeAccount(state, now, config.accounts, t.account);
+      const account = nextFreeAccount(state, now, machineAccounts(m, config), t.account);
       if (account) continues.push({ kind: "continueThread", machineId: m.id, threadId: t.threadId, runId: t.runId, account });
     }
     const wait = accountWait(state, m, now, config);

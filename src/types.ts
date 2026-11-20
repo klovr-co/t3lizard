@@ -96,6 +96,11 @@ export interface Machine {
   workspacePath?: string;
   /** sha256 of the repo setup script this machine ran to the end, so a resumed bring-up skips it. */
   setupHash?: string;
+  /**
+   * Claude accounts set up on this machine. T3 reads them once, at bring-up, so an account added to
+   * the secrets later is not on it. Missing on machines from before this field: all accounts.
+   */
+  accounts?: AccountId[];
   /** Threads that hit a usage limit and wait to continue on another account. From the last scan. */
   limitedThreads?: LimitedThread[];
   /** Runs already continued on another account, so a scan that raced the continue never repeats it. */

@@ -262,6 +262,15 @@ test("a thread limited on one account continues on the next free account", () =>
   assert.equal(accountWait(s, m, NOW, config), undefined);
 });
 
+test("a thread continues only on an account its machine was brought up with", () => {
+  // A3 was added to the secrets after m1 came up, so m1's T3 has no instance for it.
+  const { m, l } = limitedLease(A1, { accounts: [A1, A2] });
+  const s = state([m], [], { leases: { l1: l }, accounts: limited({ [A1]: NOW + 30 * MIN, [A2]: NOW + 50 * MIN }) });
+  const actions = plan(s, NOW, config);
+  assert.equal(actions.some((a) => a.kind === "continueThread"), false, "A3 is free but not on m1");
+  assert.deepEqual(accountWait(s, m, NOW, config), { until: NOW + 40 * MIN });
+});
+
 test("with every account limited the lease and machine are kept until the earliest frees, plus 10 minutes", () => {
   const { m, l } = limitedLease(A1, {}, { expiresAt: NOW + 30 * MIN });
   const s = state([m], [], { leases: { l1: l }, accounts: limited({ [A1]: NOW + 50 * MIN, [A2]: NOW + 90 * MIN, [A3]: NOW + 70 * MIN }) });
