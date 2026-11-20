@@ -100,6 +100,7 @@ const START_SUPERVISED = [
 export interface Remote {
   lizard: Lizard;
   sleep(ms: number): Promise<void>;
+  log?(line: string): void;
 }
 
 async function run(r: Remote, id: MachineId, cmd: string[], timeoutMs?: number): Promise<ExecResult> {
@@ -152,6 +153,64 @@ done
 if [ -n "$missing" ]; then echo "missing tools on this image:$missing" >&2; exit 1; fi
 echo "$(getconf GNU_LIBC_VERSION) $(uname -m)"`;
 
+/** Swap per machine size, in MB. A mini (2 GB, no swap) otherwise freezes outright on a heavy job. */
+export const SWAP_MB: Record<string, number> = { nano: 1024, mini: 2048, small: 2048, medium: 4096, large: 4096, big: 4096 };
+
+/**
+ * Best-effort machine prep, as root where sudo works, before T3 starts:
+ * - the label T3 shows for this environment (PRETTY_HOSTNAME; every Lizard machine is "e2b.local"),
+ * - a swap file, so a heavy job slows down instead of freezing the machine,
+ * - guard.sh, which keeps T3, the front proxy and their supervisors at high priority and last in
+ *   line for the OOM killer, so the devbox keeps reaching the machine while a job thrashes.
+ * Never fails the bring-up: a machine without sudo still works, it just keeps the default label.
+ */
+export const PREP_SH = `label="$1"; swap_mb="$2"; uid="$(id -u)"
+if ! sudo -n true 2>/dev/null; then
+  mkdir -p "$HOME/.local/bin"
+  printf '#!/bin/sh\\n[ "$1" = --pretty ] && exec cat "%s/label"\\nexit 1\\n' "$D" > "$HOME/.local/bin/hostnamectl"
+  chmod 755 "$HOME/.local/bin/hostnamectl"; printf '%s\\n' "$label" > "$D/label"
+  echo "no sudo: label through a hostnamectl shim, no swap or guard"; exit 0
+fi
+printf 'PRETTY_HOSTNAME="%s"\\n' "$label" | sudo tee /etc/machine-info > /dev/null
+if [ "$swap_mb" -gt 0 ] && ! sudo grep -q '^/swapfile ' /proc/swaps; then
+  if [ ! -f /swapfile ]; then
+    free_mb="$(df -Pm / | awk 'NR==2 {print $4}')"
+    if [ "\${free_mb:-0}" -gt $((swap_mb * 3)) ]; then
+      sudo fallocate -l "\${swap_mb}M" /swapfile 2>/dev/null || sudo dd if=/dev/zero of=/swapfile bs=1M count="$swap_mb" status=none
+      sudo chmod 600 /swapfile && sudo env PATH="/usr/sbin:/sbin:$PATH" mkswap /swapfile > /dev/null
+    fi
+  fi
+  [ -f /swapfile ] && { sudo env PATH="/usr/sbin:/sbin:$PATH" swapon /swapfile 2>/dev/null || echo "swapon failed"; }
+fi
+sudo setsid nohup bash "$D/guard.sh" "$uid" > /dev/null 2>&1 < /dev/null &
+echo "prep done: $(grep -c . /proc/swaps) swap line(s)"`;
+
+/** Runs as root. Protects T3's own processes; their children (agents, builds) are reset to normal. */
+export const GUARD_SH = `#!/usr/bin/env bash
+exec 9>/run/t3lizard-guard.lock
+flock -n 9 || exit 0
+uid="$1"
+while true; do
+  prot=" $(pgrep -u "$uid" -f 't3 serve --host 127\\.0\\.0\\.1|front\\.mjs|supervise\\.sh' | tr '\\n' ' ') "
+  for p in $(pgrep -u "$uid"); do
+    f="/proc/$p/oom_score_adj"
+    [ -w "$f" ] || continue
+    if [[ "$prot" == *" $p "* ]]; then
+      echo -900 > "$f" 2>/dev/null; renice -n -5 -p "$p" > /dev/null 2>&1
+    else
+      a="$(cat "$f" 2>/dev/null)"; [ "\${a:-0}" -lt 0 ] && echo 0 > "$f" 2>/dev/null
+      n="$(ps -o ni= -p "$p" 2>/dev/null | tr -d ' ')"; [ "\${n:-0}" -lt 0 ] 2>/dev/null && renice -n 0 -p "$p" > /dev/null 2>&1
+    fi
+  done
+  sleep 5
+done
+`;
+
+/** What T3 shows for the machine, e.g. "t3lizard aldrent · arrow-universe-1yxp (mini)". */
+export function machineLabel(repo: RepoKey, id: MachineId, size: string): string {
+  return `t3lizard ${repo.split("/").pop()} · ${id} (${size})`;
+}
+
 export interface Account {
   id: AccountId;
   token: string;
@@ -161,13 +220,21 @@ export interface Account {
  * Steps 1-3: secrets, install, Claude accounts, `t3 serve` supervisor. Each step converges when re-run.
  * Account tokens never go to the env file: each lives only in its own T3 provider instance.
  */
-export async function install(r: Remote, id: MachineId, secrets: Record<string, string>, t3Version: string, accounts: Account[]): Promise<void> {
+export async function install(
+  r: Remote,
+  id: MachineId,
+  secrets: Record<string, string>,
+  t3Version: string,
+  accounts: Account[],
+  machine: { label: string; size: string } = { label: id, size: "small" },
+): Promise<void> {
   await run(r, id, script("preflight", PREFLIGHT_SH));
   await writeFile(r, id, "env", envFile(secrets), "600");
   await writeFile(r, id, "install.sh", INSTALL_SH, "700");
   await writeFile(r, id, "supervise.sh", SUPERVISE_SH, "700");
   await writeFile(r, id, "front.mjs", FRONT_JS, "600");
   await writeFile(r, id, "accounts.mjs", ACCOUNTS_JS, "600");
+  await writeFile(r, id, "guard.sh", GUARD_SH, "755");
 
   await run(
     r,
@@ -193,6 +260,9 @@ export async function install(r: Remote, id: MachineId, secrets: Record<string, 
     await writeFile(r, id, "accounts.json", JSON.stringify(accounts), "600");
     await run(r, id, script("accounts", 'node "$D/accounts.mjs" configure "$D/accounts.json"'));
   }
+  // Before serve-start: T3 reads its label once, when it starts.
+  const prep = await r.lizard.exec(id, script("prep", PREP_SH, machine.label, String(SWAP_MB[machine.size] ?? 2048)), 300_000);
+  if (prep.exitCode !== 0) r.log?.(`machine ${id}: prep failed (continuing): ${(prep.stderr || prep.stdout).trim().slice(-300)}`);
   await run(r, id, script("serve-start", START_SUPERVISED));
   const health = script("health", `curl -fsS -m 5 http://127.0.0.1:${T3_PORT}/.well-known/t3/environment > /dev/null`);
   await pollUntil(r, HEALTH_TIMEOUT_MS, 3_000, async () => (await r.lizard.exec(id, health, 30_000)).exitCode === 0, "t3 serve start");

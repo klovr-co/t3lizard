@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { busyThreads, configureFront, continueOnAccount, FRONT_PORT, install, pairAndLink, resetCheckout, runRepoSetup, scanLimits, setupProject } from "./bringup.ts";
+import { busyThreads, configureFront, continueOnAccount, FRONT_PORT, install, machineLabel, pairAndLink, resetCheckout, runRepoSetup, scanLimits, setupProject } from "./bringup.ts";
 import type { Account, Remote } from "./bringup.ts";
 import { paths } from "./config.ts";
 import { LizardLimitError, LizardPaymentError } from "./lizard.ts";
@@ -88,7 +88,7 @@ export class Daemon {
   constructor(deps: DaemonDeps) {
     this.deps = deps;
     this.files = paths(deps.home);
-    this.remote = { lizard: deps.lizard, sleep: deps.sleep };
+    this.remote = { lizard: deps.lizard, sleep: deps.sleep, log: (l) => deps.log(l) };
     this.changes.setMaxListeners(0);
   }
 
@@ -207,6 +207,36 @@ export class Daemon {
     return { closing: true };
   }
 
+  /**
+   * One-time pairing links a person opens (or pastes into Add environment) to see a machine's threads
+   * in their own T3 app. Needs publicHost/publicBind, since 127.0.0.1 on the devbox is not the browser's.
+   */
+  async connect(req: { machineId?: string }): Promise<{ links: { machineId: string; label: string; url: string }[]; note?: string }> {
+    const { publicHost } = this.deps.config;
+    if (!publicHost) throw new ApiError(400, 'set "publicHost" and "publicBind" in config.json (the devbox Tailscale name and IP) first');
+    const ms = Object.values(this.state.machines).filter(
+      (m) => !m.id.startsWith(PENDING) && m.proxyPort && m.environmentId && (!req.machineId || m.id === req.machineId),
+    );
+    if (req.machineId && !ms.length) throw new ApiError(404, `no linked machine ${req.machineId}`);
+    const links = [];
+    for (const m of ms) {
+      const base = `http://${publicHost}:${m.proxyPort}`;
+      const minutesLeft = Math.max(5, Math.ceil((m.deadline - this.deps.now()) / MINUTE));
+      const out = (await this.deps.lizard.exec(
+        m.id,
+        ["bash", "-c", 'export PATH="$HOME/.local/bin:$PATH"; t3 auth pairing create --base-dir "$HOME/.t3" --json --ttl "$1m" --label "browser" --base-url "$2"', "t3lizard", String(minutesLeft), base],
+        60_000,
+      )).stdout;
+      const json = JSON.parse(out.slice(out.indexOf("{"), out.lastIndexOf("}") + 1)) as Record<string, unknown>;
+      const url = Object.values(json).find((v) => typeof v === "string" && v.includes("/pair#")) as string | undefined;
+      const credential = typeof json.credential === "string" ? json.credential : undefined;
+      const link = url ?? (credential ? `${base}/pair#token=${credential}` : undefined);
+      if (!link) throw new Error(`no pairing link from ${m.id}`);
+      links.push({ machineId: m.id, label: machineLabel(m.repo, m.id, m.size), url: link });
+    }
+    return { links, ...(links.length ? {} : { note: "no linked machines right now" }) };
+  }
+
   status() {
     const now = this.deps.now();
     const { config } = this.deps;
@@ -222,6 +252,8 @@ export class Daemon {
         ageMinutes: minutes(now - m.createdAt),
         deadlineInMinutes: minutes(m.deadline - now),
         environmentId: m.environmentId,
+        label: machineLabel(m.repo, m.id, m.size),
+        ...(m.unresponsiveSince ? { notAnswering: `no answer since ${minutes(now - m.unresponsiveSince)} min ago (likely out of memory)` } : {}),
         ...(m.limitedThreads?.length ? { limitedThreads: m.limitedThreads } : {}),
         ...this.waitView(m, now),
       });
@@ -384,7 +416,7 @@ export class Daemon {
       let m = this.state.machines[id];
       if (m?.phase.kind === "installing") {
         this.t3Version ??= await this.deps.t3.version();
-        await install(this.remote, id, this.deps.machineEnv, this.t3Version, this.accounts());
+        await install(this.remote, id, this.deps.machineEnv, this.t3Version, this.accounts(), { label: machineLabel(m.repo, id, m.size), size: m.size });
         this.setPhase(at("installing"), { kind: "linking" });
       }
       m = at("linking");
@@ -641,9 +673,19 @@ export class Daemon {
       found = await scanLimits(this.remote, id);
     } catch (e) {
       this.deps.log(`limit scan of ${id} failed: ${(e as Error).message}`);
+      const gone = this.state.machines[id];
+      if (gone && !gone.unresponsiveSince && /timeout|timed out|aborted/i.test((e as Error).message)) {
+        gone.unresponsiveSince = this.deps.now();
+        this.save();
+      }
       return;
     }
     const m = this.state.machines[id];
+    if (m?.unresponsiveSince) {
+      this.deps.log(`machine ${id} answers again`);
+      delete m.unresponsiveSince;
+      this.save();
+    }
     if (m?.phase.kind !== "leased" || m.phase.leaseId !== lease.id) return;
     const { accounts, accountRetryMinutes } = this.deps.config;
     const now = this.deps.now();
@@ -814,7 +856,7 @@ export class Daemon {
     const candidates = m.proxyPort ? [m.proxyPort] : Array.from({ length: hi - lo + 1 }, (_, i) => lo + i).filter((p) => !taken.has(p));
     for (const port of candidates) {
       try {
-        const proxy = await startProxy({ port, upstream: new URL(`https://${m.hostname}`), accessToken: m.accessToken! });
+        const proxy = await startProxy({ port, upstream: new URL(`https://${m.hostname}`), accessToken: m.accessToken!, extraHosts: this.deps.config.publicBind });
         this.proxies.set(m.id, proxy);
         m.proxyPort = port;
         this.save();

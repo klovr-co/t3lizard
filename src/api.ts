@@ -18,6 +18,7 @@ const routes: Record<string, (d: Daemon, body: unknown) => unknown> = {
         .parse(b),
     ),
   "POST /renew": (d, b) => d.renew(z.object({ leaseId: id }).parse(b)),
+  "POST /connect": (d, b) => d.connect(z.object({ machineId: id.optional() }).parse(b)),
   "POST /close": (d, b) => d.close(z.object({ machineId: id }).parse(b)),
   "POST /setup/add": (d, b) => d.setupAdd(z.object({ repo: id, line: id, reason: id, by: id.optional() }).parse(b)),
   "POST /setup/show": (d, b) => d.setupShow(z.object({ repo: id }).parse(b)),

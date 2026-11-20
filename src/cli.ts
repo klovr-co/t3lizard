@@ -20,6 +20,7 @@ const USAGE = `t3lizard: a pool of Lizard cloud machines running T3 Code, per re
   t3lizard renew <leaseId>                 push the lease expiry out by leaseMinutes
   t3lizard status                          pools, queues, leases, budget
   t3lizard close <machineId>               close one machine now
+  t3lizard connect [machineId]            pairing links to open a machine's threads in your T3 app
   t3lizard doctor                          check config, secrets and the daemon
   t3lizard setup add <repo> [--reason <why>] -- <shell line>
                                            add a step to the repo's machine setup (runs on new machines)
@@ -157,6 +158,14 @@ export async function main(argv: string[]): Promise<number> {
     case "status":
       print(await call(socket, "GET", "/status"));
       return 0;
+    case "connect": {
+      // Pairing links are credentials: printed for the person at this terminal, never logged.
+      const r = await call(socket, "POST", "/connect", args[0] ? { machineId: args[0] } : {});
+      if (!r.links?.length) console.log(r.note ?? "no linked machines");
+      for (const l of r.links ?? []) console.log(`${l.label}\n  ${l.url}\n`);
+      if (r.links?.length) console.log("Open a link, or paste it into T3: Settings → Connections → Add environment.");
+      return 0;
+    }
     case "close":
       need(1);
       print(await call(socket, "POST", "/close", { machineId: args[0] }));

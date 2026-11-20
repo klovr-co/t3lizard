@@ -74,6 +74,10 @@ const ConfigFile = z
     tickSeconds: positive,
     accountRetryMinutes: positive,
     setupTimeoutMinutes: positive,
+    /** Extra addresses the devbox proxies listen on, e.g. the Tailscale IP, so a browser can open a machine. */
+    publicBind: z.array(z.string().min(1)),
+    /** The name a browser uses for those addresses, e.g. devbox.tailnet.ts.net. Used in `t3lizard connect` links. */
+    publicHost: z.string().min(1),
   })
   .partial()
   .strict();

@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startProxy } from "../src/proxy.ts";
 // @ts-ignore: plain JS module that runs on the machine
-import { rewriteHeaders, startFront } from "../src/machine/front.mjs";
+import { clientHost, rewriteHeaders, startFront } from "../src/machine/front.mjs";
 
 const EDGE_HOST = "example-name-abcd-3774.sandbox.us-east-1.onlizard.com";
 const listening = (server: net.Server) => new Promise<number>((r) => server.listen(0, "127.0.0.1", () => r((server.address() as net.AddressInfo).port)));
@@ -195,4 +195,31 @@ test("without the front proxy, T3 sees the onlizard origin: the live-test failur
   const res = await fetch(`${base}/mcp`, { headers: { "x-signed-htu": `${base}/mcp` } });
   assert.equal(res.status, 401);
   assert.equal((await res.json()).error, `This server only issues tokens for https://${EDGE_HOST}/mcp`);
+});
+
+test("a browser on another devbox address (Tailscale) gets its own origin, through the same machine", async (t) => {
+  const t3 = await fakeT3();
+  const file = hostFile();
+  const front = await startFront({ listenPort: 0, t3Port: t3.port, hostFile: file, listenHost: "127.0.0.1" });
+  const edge = await fakeEdge(front.port);
+  const devbox = await startProxy({ port: 0, upstream: new URL(`http://127.0.0.1:${edge.port}`), accessToken: "secret", extraHosts: ["127.0.0.2"] });
+  t.after(async () => (await devbox.close(), await edge.close(), await front.close(), await t3.close()));
+  writeFileSync(file, `127.0.0.1:${devbox.port}\n`);
+
+  const local = `http://127.0.0.1:${devbox.port}`;
+  assert.deepEqual(await (await fetch(`${local}/mcp`, { headers: { "x-signed-htu": `${local}/mcp` } })).json(), { origin: local, url: `${local}/mcp` });
+
+  const browser = `http://127.0.0.2:${devbox.port}`;
+  // A client cannot pick the origin by sending the header itself: the devbox proxy replaces it.
+  const res = await fetch(`${browser}/mcp`, { headers: { "x-signed-htu": `${browser}/mcp`, "x-t3lizard-host": "evil.example:1" } });
+  assert.equal(res.status, 200, await res.clone().text());
+  assert.deepEqual(await res.json(), { origin: browser, url: `${browser}/mcp` });
+  assert.equal(t3.seen.at(-1)!["x-t3lizard-host"], undefined);
+});
+
+test("clientHost takes only host:port", () => {
+  assert.equal(clientHost(["X-T3lizard-Host", "devbox.tail.ts.net:47301"]), "devbox.tail.ts.net:47301");
+  assert.equal(clientHost(["x-t3lizard-host", "a b:1"]), undefined);
+  assert.equal(clientHost(["x-t3lizard-host", "host/path:1"]), undefined);
+  assert.equal(clientHost(["host", "x:1"]), undefined);
 });

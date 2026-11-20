@@ -54,6 +54,8 @@ export interface Machine {
   proxyPort?: number;
   /** What the machine's front proxy sends T3 as Host (127.0.0.1:<proxyPort>), once configured. */
   frontHost?: string;
+  /** When a command on the machine last timed out, if none has worked since: the machine is not answering. */
+  unresponsiveSince?: number;
   hostname?: string;
   accessToken?: string;
   environmentId?: string;
@@ -150,6 +152,8 @@ export interface Config {
   setupTimeoutMinutes: number;
   /** How long an account that hit its usage limit is skipped before it is tried again. */
   accountRetryMinutes: number;
+  publicBind?: string[];
+  publicHost?: string;
   /** Claude accounts in order. Not a config file key: one per CLAUDE_CODE_OAUTH_TOKEN[_N] secret. */
   accounts: AccountId[];
 }
