@@ -14,9 +14,9 @@ Use it for heavy work: builds, full typechecks, pre-push gates, long test runs.
 4. When granted, call delegate_task with target { environmentId, projectId, providerInstanceId } from the lease, a Claude model, and a self-contained prompt.
    providerInstanceId is the Claude account to use on the machine; always pass it, since the machine has no plain claudeAgent.
    Do not pass isolation "worktree": the lease is a whole machine with its checkout at lease.workspacePath, already at your ref.
-   lease.size says how big it is: small is 2 vCPU / 4 GB, mini 1 vCPU / 2 GB. When the small machines are busy you get a
-   mini instead of waiting; give a heavy build less parallelism there (one test worker, no Docker services):
-   a mini has 2 GB, and a job that fills it slows the machine to a crawl.
+   lease.size says how big it is: medium is 4 vCPU / 8 GB, small 2 vCPU / 4 GB. When the mediums are busy you get a
+   small instead of waiting; give a heavy build less parallelism there (one test worker, one dev server or browser at a time).
+   A repo whose jobs froze a smaller machine is never given that size again.
    If the delegated thread stops on a Claude usage limit, keep the lease and do not start over: t3lizard continues that
    thread on the next free account, or when the first account frees, and keeps the machine until then.
 5. Call pool_release with the leaseId as soon as the delegated work is done. Machines are shared and cost money.
