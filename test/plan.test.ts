@@ -392,3 +392,18 @@ test("a repo with a learned minimum size gets only that size or larger, and is n
   const creates = plan(state, now, config).filter((a: any) => a.kind === "create");
   assert.deepEqual(creates.map((a: any) => a.size), ["small"]);
 });
+
+test("an idle machine that stopped answering is closed, never granted", async () => {
+  const { plan } = await import("../src/plan.ts");
+  const { parseConfig } = await import("../src/config.ts");
+  const { emptyState } = await import("../src/types.ts");
+  const config = parseConfig({ project: "p", template: "claude", sizes: [{ size: "small", max: 1 }, { size: "mini", max: 2 }] });
+  const repo = "github.com/o/r";
+  const now = 1_000_000_000;
+  const state = emptyState();
+  state.machines["m1"] = { id: "m1", repo, size: "small", createdAt: now - 60_000, deadline: now + 3_000_000, unresponsiveSince: now - 60_000, phase: { kind: "idle", since: now - 1000 } } as any;
+  state.tickets.push({ id: "t1", repo, ref: "main", holder: "h", status: "queued", enqueuedAt: now - 1000 } as any);
+  const actions = plan(state, now, config);
+  assert.equal(actions.filter((a: any) => a.kind === "grant").length, 0);
+  assert.ok(actions.some((a: any) => a.kind === "close" && a.machineId === "m1" && a.reason === "unresponsive"));
+});

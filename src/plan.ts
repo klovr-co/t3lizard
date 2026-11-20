@@ -195,6 +195,11 @@ export function plan(state: State, now: number, config: Config): Action[] {
   const idleByRepo = new Map<RepoKey, Machine[]>();
   for (const m of machines) {
     if (m.phase.kind !== "idle" || closingNow.has(m.id)) continue;
+    // A machine that stopped answering is never handed out again.
+    if (m.unresponsiveSince) {
+      close(m, "unresponsive");
+      continue;
+    }
     // Too small for this repo's jobs (learned): left to close as idle, never granted.
     const min = state.repoMinSize?.[m.repo];
     if (min && SIZE_WEIGHT[m.size] < SIZE_WEIGHT[min]) continue;
