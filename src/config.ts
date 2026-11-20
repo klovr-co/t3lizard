@@ -44,6 +44,7 @@ export const DEFAULT_CONFIG: Config = {
   accountRetryMinutes: 30,
   setupTimeoutMinutes: 20,
   vcpuReserve: 0,
+  idleMaxMinutes: 30,
   defaultSize: "medium",
   dashboardPort: 47290,
   accounts: [],
@@ -80,6 +81,7 @@ const ConfigFile = z
     setupTimeoutMinutes: positive,
     /** Extra addresses the devbox proxies listen on, e.g. the Tailscale IP, so a browser can open a machine. */
     vcpuLimit: z.number().positive(),
+    idleMaxMinutes: positive,
     vcpuReserve: z.number().min(0),
     defaultSize: SizeName,
     dashboardPort: z.number().int().min(0),

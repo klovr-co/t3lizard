@@ -435,3 +435,27 @@ test("learnSize: up after a tight job, down after 3 light ones, never below the 
   assert.equal(learnSize(config, "medium", light.slice(0, 2)), undefined, "needs 3");
   assert.equal(learnSize(config, "medium", [job("medium", { peakMemPct: 30 }), job("medium"), job("medium", { peakMemPct: 30 })]), undefined, "unknown peak is not light");
 });
+
+test("repoIdleMs: waits long enough for 3 in 4 recent gaps, within idleCloseMinutes..idleMaxMinutes", async () => {
+  const { repoIdleMs, plan } = await import("../src/plan.ts");
+  const { parseConfig } = await import("../src/config.ts");
+  const { emptyState } = await import("../src/types.ts");
+  const M = 60_000;
+  const config = parseConfig({ project: "p", template: "claude", sizes: [{ size: "medium" }], vcpuLimit: 40, idleCloseMinutes: 10, idleMaxMinutes: 30 });
+  const state = emptyState();
+  const repo = "github.com/o/r";
+  const at = (start: number, len: number) => ({ repo, holder: "h", size: "medium", machineId: "m", grantedAt: start * M, endedAt: (start + len) * M, waitedMs: 0 }) as any;
+  assert.equal(repoIdleMs(state, config, repo), 10 * M, "no history: default");
+  // gaps of 15, 18, 12, 16 minutes
+  state.jobs = [at(0, 5), at(20, 5), at(43, 5), at(60, 5), at(81, 5)];
+  assert.equal(repoIdleMs(state, config, repo), 18 * M);
+  state.jobs = [at(0, 5), at(65, 5), at(130, 5), at(195, 5)]; // hour-long gaps
+  assert.equal(repoIdleMs(state, config, repo), 10 * M, "gaps past the max do not raise it");
+  // An idle machine of this repo at 15 minutes stays when the learned wait is 18.
+  state.jobs = [at(0, 5), at(20, 5), at(43, 5), at(60, 5), at(81, 5)];
+  const now = 10_000 * M;
+  state.machines["m1"] = { id: "m1", repo, size: "medium", createdAt: now - 30 * M, deadline: now + 60 * M, phase: { kind: "idle", since: now - 15 * M } } as any;
+  assert.ok(!plan(state, now, config).some((a: any) => a.kind === "close"));
+  (state.machines["m1"].phase as any).since = now - 19 * M;
+  assert.ok(plan(state, now, config).some((a: any) => a.kind === "close" && a.reason === "idle"));
+});

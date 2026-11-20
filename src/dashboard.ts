@@ -64,7 +64,7 @@ td.wrapcell{white-space:normal;min-width:220px}.pill{display:inline-block;paddin
 <div class="tiles" id="tiles"></div>
 <h2>Machines</h2><div class="wrap"><table id="machines"></table></div>
 <h2>Queue</h2><div class="wrap"><table id="queue"></table></div>
-<h2>Size per repo (learned)</h2><div class="wrap"><table id="learned"></table></div>
+<h2>Per repo (learned)</h2><div class="wrap"><table id="learned"></table></div>
 <h2>Recent jobs</h2><div class="wrap"><table id="jobs"></table></div>
 <h2>Spend by day (UTC)</h2><div class="wrap"><table id="days"></table></div>
 </main><script>
@@ -85,7 +85,7 @@ document.getElementById("tiles").innerHTML=[
 table("machines",["Machine","Repo","Size","Phase","Holder","Age","Ends in"],machines.map(m=>[esc(m.id),repo(m.repo),'<span class="pill">'+esc(m.size)+'</span>',
 (m.notAnswering?'<span class="bad">not answering</span>':m.phase==="failed"?'<span class="bad">failed</span>':esc(m.phase)),esc(m.lease?.holder??""),m.ageMinutes+" min",m.deadlineInMinutes+" min"]),"No machines running.");
 table("queue",["Repo","Holder","Waited","Why"],queue.map(q=>[repo(q.repo),esc(q.holder),q.waitedMinutes+" min",esc(q.reason??"")]),"Nobody waiting.");
-table("learned",["Repo","Next machines","Never below","Why"],d.learned.map(l=>[repo(l.repo),'<span class="pill">'+esc(l.size)+'</span>',esc(l.minSize??"—"),esc(l.why)]),"Nothing learned yet.");
+table("learned",["Repo","Next machines","Never below","Why this size","Keep idle","Why","Jobs","Reused"],d.learned.map(l=>[repo(l.repo),'<span class="pill">'+esc(l.size)+'</span>',esc(l.minSize??"—"),esc(l.why),l.keepIdleMinutes+" min",esc(l.idleWhy),l.jobs,l.reusePct==null?"—":l.reusePct+"%"]),"Nothing learned yet.");
 table("jobs",["Ended","Repo","Holder","Size","Waited","Ran","Peak memory","Result"],d.jobs.map(j=>[ago(j.endedAt),repo(j.repo),esc(j.holder),esc(j.size),min(j.waitedMs),min(j.endedAt-j.grantedAt),
 j.peakMemPct==null?"—":'<span class="'+(j.peakMemPct>=85?"bad":j.peakMemPct<40?"ok":"")+'">'+j.peakMemPct+'%</span>',
 j.froze?'<span class="bad">froze</span>':j.memKills?'<span class="warn">'+j.memKills+' killed for memory</span>':'<span class="ok">ok</span>']),"No jobs recorded yet.");

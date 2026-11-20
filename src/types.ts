@@ -195,6 +195,8 @@ export interface Config {
   accountRetryMinutes: number;
   /** Pro limits vCPUs running at once (40 on Pro). Unset: only the per-size max applies. */
   vcpuLimit?: number;
+  /** The longest a learned idle wait can be (see repoIdleMs); idleCloseMinutes is the shortest. */
+  idleMaxMinutes?: number;
   /** vCPUs the pool leaves free for others in the Lizard workspace. */
   vcpuReserve: number;
   /** A repo's first machine size, before anything is learned. */

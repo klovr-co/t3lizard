@@ -6,7 +6,7 @@ import type { Account, Remote } from "./bringup.ts";
 import { paths } from "./config.ts";
 import { LizardLimitError, LizardPaymentError } from "./lizard.ts";
 import type { Lizard } from "./lizard.ts";
-import { learnSize, nextSizeUp, vcpuFree } from "./plan.ts";
+import { learnSize, nextSizeUp, repoGaps, repoIdleMs, vcpuFree } from "./plan.ts";
 import { accountLimited, accountWait, BRINGING_UP, BUDGET_UNIT, createBackoff, createBlock, nextFreeAccount, plan, queueInfo, repoCreateBlock, sizesInUse, usedSmallHours, utcDay } from "./plan.ts";
 import { startProxy } from "./proxy.ts";
 import { addStep, readHistory, readSetup, removeStep } from "./setup.ts";
@@ -315,12 +315,26 @@ export class Daemon {
       byDay: days.map(([day, v]) => ({ day, usd: v * usdPerSmallSecond })),
     };
     const repos = new Set([...Object.keys(this.state.repoSize ?? {}), ...(this.state.jobs ?? []).map((j) => j.repo)]);
-    const learned = [...repos].map((repo) => ({
+    const learned = [...repos].map((repo) => {
+      const jobs = (this.state.jobs ?? []).filter((j) => j.repo === repo);
+      const seen = new Set<string>();
+      let reused = 0;
+      for (const j of [...jobs].sort((a, b) => a.grantedAt - b.grantedAt)) {
+        if (seen.has(j.machineId)) reused++;
+        seen.add(j.machineId);
+      }
+      const gaps = repoGaps(this.state, repo);
+      return {
       repo,
+      keepIdleMinutes: Math.round(repoIdleMs(this.state, config, repo) / MINUTE),
+      idleWhy: gaps.length < 3 ? `default (${gaps.length} of 3 gaps seen)` : `3 in 4 of the last ${gaps.length} gaps between jobs were under ${Math.round([...gaps].sort((a, b) => a - b)[Math.ceil(gaps.length * 0.75) - 1] / MINUTE)} min`,
+      jobs: jobs.length,
+      reusePct: jobs.length ? Math.round((reused / jobs.length) * 100) : undefined,
       size: this.state.repoSize?.[repo]?.size ?? config.defaultSize,
       why: this.state.repoSize?.[repo]?.why ?? "default, nothing learned yet",
       minSize: this.state.repoMinSize?.[repo],
-    }));
+      };
+    });
     return {
       now,
       vcpu: { limit: config.vcpuLimit, reserve: config.vcpuReserve, inUse: vcpuInUse, free: vcpuFree(config, used) },

@@ -64,6 +64,39 @@ export function nextSizeDown(config: Config, size: Size): Size | undefined {
   return config.sizes.find((s) => SIZE_WEIGHT[s.size] < SIZE_WEIGHT[size])?.size;
 }
 
+/** Gaps between a repo's jobs that idle learning looks at, newest first. */
+export const IDLE_GAPS = 10;
+
+/**
+ * How long an idle machine of `repo` waits for its next job. From the gaps between the repo's jobs
+ * (a job's end to the next job's grant on any machine): long enough for 3 in 4 of the recent gaps,
+ * plus a 2-minute margin, between idleCloseMinutes and idleMaxMinutes. Fewer than 3 gaps: idleCloseMinutes.
+ * A machine past its own idle time can still be closed earlier to make room (plan's steal).
+ */
+export function repoIdleMs(state: State, config: Config, repo: RepoKey): number {
+  const base = config.idleCloseMinutes * MINUTE;
+  const max = Math.max(base, (config.idleMaxMinutes ?? config.idleCloseMinutes) * MINUTE);
+  const gaps = repoGaps(state, repo);
+  if (gaps.length < 3) return base;
+  const sorted = [...gaps].sort((a, b) => a - b);
+  const p75 = sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.75) - 1)];
+  // A gap longer than max is not worth waiting for; it does not raise the wait either.
+  if (p75 > max) return base;
+  return Math.min(max, Math.max(base, p75 + 2 * MINUTE));
+}
+
+/** The recent gaps (ms) between one of the repo's jobs ending and its next job starting. */
+export function repoGaps(state: State, repo: RepoKey): number[] {
+  const jobs = (state.jobs ?? []).filter((j) => j.repo === repo).sort((a, b) => a.grantedAt - b.grantedAt);
+  const gaps: number[] = [];
+  for (let i = 1; i < jobs.length; i++) {
+    // Ended before the next one started: a real gap. Overlapping jobs ran on separate machines.
+    const gap = jobs[i].grantedAt - jobs[i - 1].endedAt;
+    if (gap > 0) gaps.push(gap);
+  }
+  return gaps.slice(-IDLE_GAPS);
+}
+
 /** Memory use (share of the machine) at or above which a job needed more room. */
 export const MEM_UP_PCT = 85;
 /** Memory use below which a job would have fitted a size down (half the memory). */
@@ -303,7 +336,7 @@ export function plan(state: State, now: number, config: Config): Action[] {
   for (const list of idleByRepo.values()) {
     for (const m of list) {
       if (closingNow.has(m.id) || m.phase.kind !== "idle") continue;
-      if (now - m.phase.since >= config.idleCloseMinutes * MINUTE) close(m, "idle");
+      if (now - m.phase.since >= repoIdleMs(state, config, m.repo)) close(m, "idle");
     }
   }
 
