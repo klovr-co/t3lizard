@@ -1,7 +1,10 @@
+import { execFileSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { busyThreads, configureFront, continueOnAccount, FRONT_PORT, install, machineLabel, pairAndLink, resetCheckout, runRepoSetup, scanLimits, setupProject } from "./bringup.ts";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { busyThreads, configureFront, continueOnAccount, exportThreads, FRONT_PORT, install, machineLabel, pairAndLink, resetCheckout, runRepoSetup, scanLimits, setupProject } from "./bringup.ts";
 import type { Account, Remote } from "./bringup.ts";
 import { paths } from "./config.ts";
 import { LizardLimitError, LizardPaymentError } from "./lizard.ts";
@@ -281,7 +284,44 @@ export class Daemon {
         // A machine that does not answer gives no stats; noAnswer handles a freeze.
       }
     }
+    if (this.state.machines[lease.machineId]?.workspacePath && !this.state.machines[lease.machineId].unresponsiveSince) {
+      rec.chats = await this.saveChats(lease).catch((e) => {
+        this.deps.log(`saving chats of ${lease.machineId} failed: ${(e as Error).message}`);
+        return undefined;
+      });
+    }
     this.recordJob(rec);
+  }
+
+  /** The machine's threads of this lease, saved to <home>/transcripts/<machine>/<n>.json. */
+  private async saveChats(lease: Lease): Promise<JobRecord["chats"]> {
+    const m = this.state.machines[lease.machineId];
+    const since = new Date(lease.grantedAt - CLOCK_SKEW_MS).toISOString();
+    const tgz = await exportThreads(this.remote, m.id, m.workspacePath!, since);
+    if (!tgz.length) return [];
+    const dir = join(this.transcriptsDir(), m.id);
+    mkdirSync(dir, { recursive: true });
+    const tmp = mkdtempSync(join(tmpdir(), "t3lizard-chats-"));
+    try {
+      execFileSync("tar", ["-xzf", "-", "-C", tmp], { input: tgz });
+      const chats: NonNullable<JobRecord["chats"]> = [];
+      for (const f of readdirSync(tmp).filter((x) => x.endsWith(".json"))) {
+        const data = JSON.parse(readFileSync(join(tmp, f), "utf8")) as { thread?: { threadId?: string; title?: string }; messages?: unknown[] };
+        const threadId = data.thread?.threadId;
+        if (!threadId) continue;
+        const file = `${m.id}/${threadId.replace(/[^A-Za-z0-9._-]/g, "_").slice(-120)}.json`;
+        writeFileSync(join(this.transcriptsDir(), file), JSON.stringify({ ...data, savedAt: new Date(this.deps.now()).toISOString(), machineId: m.id, repo: m.repo, holder: lease.holder }));
+        chats.push({ threadId, title: data.thread?.title ?? threadId, file, messages: data.messages?.length ?? 0 });
+      }
+      if (chats.length) this.deps.log(`saved ${chats.length} chat(s) of ${m.id} (${lease.holder})`);
+      return chats;
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+
+  transcriptsDir(): string {
+    return join(this.deps.home, "transcripts");
   }
 
   /** Keeps the latest 500 jobs and updates the repo's learned size. */

@@ -1,12 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, statSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { call, serveApi } from "../src/api.ts";
 import { DEFAULT_CONFIG, paths } from "../src/config.ts";
 import { Daemon } from "../src/daemon.ts";
+import { startDashboard } from "../src/dashboard.ts";
 import { LizardLimitError } from "../src/lizard.ts";
 import { normalizeOrigin } from "../src/repo.ts";
 import type { Config } from "../src/types.ts";
@@ -437,4 +439,33 @@ test("a mini lease shows its size, status shows the ladder, and usage is weighte
   assert.deepEqual(status.pools["github.com/Acme/app"].machines.map((m: { size: string }) => m.size).sort(), ["mini", "small"]);
   assert.match(status.budget.unit, /^small-machine-hours/);
   assert.equal(status.budget.usedToday, 0.75, "30 min of small (0.5) + 30 min of mini (0.25)");
+});
+
+test("a released lease saves its machine's chats on the devbox and the pool page serves them", async (t) => {
+  const h = await harness(t);
+  const t0 = await h.api("/acquire", { repo: REPO, ref: "main", holder: "thread-a" });
+  await h.daemon.settled();
+  const granted = await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 1 });
+  const out = mkdtempSync(join(tmpdir(), "t3lizard-export-"));
+  writeFileSync(join(out, "1.json"), JSON.stringify({ thread: { threadId: "thread:x:1", title: "Run the gate" }, messages: [{ role: "user", text: "brief <b>" }, { role: "assistant", text: "done" }] }));
+  const tgz = execFileSync("tar", ["-C", out, "-czf", "-", "."]).toString("base64");
+  let since = "";
+  h.lizard.on["export"] = (_m, args) => ((since = args[1]), { stdout: tgz, stderr: "", exitCode: 0 });
+
+  await h.api("/release", { leaseId: granted.lease.leaseId });
+  await h.daemon.settled();
+
+  assert.ok(Date.parse(since) <= h.clock.now, "exports threads from the lease start, with clock skew");
+  const job = h.daemon.state.jobs!.at(-1)!;
+  assert.deepEqual(job.chats, [{ threadId: "thread:x:1", title: "Run the gate", file: "sb-1/thread_x_1.json", messages: 2 }]);
+  const saved = JSON.parse(readFileSync(join(h.daemon.transcriptsDir(), "sb-1/thread_x_1.json"), "utf8"));
+  assert.equal(saved.holder, "thread-a");
+  assert.equal(saved.messages[1].text, "done");
+
+  const [server] = await startDashboard(h.daemon, 47398, ["127.0.0.1"], () => {});
+  t.after(() => new Promise((r) => server.close(r)));
+  const page = await (await fetch("http://127.0.0.1:47398/chat?f=sb-1/thread_x_1.json")).text();
+  assert.match(page, /Run the gate/);
+  assert.match(page, /brief &lt;b&gt;/);
+  assert.equal((await fetch("http://127.0.0.1:47398/chat?f=../secrets.env")).status, 400);
 });

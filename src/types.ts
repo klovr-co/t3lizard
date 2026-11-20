@@ -31,6 +31,8 @@ export interface JobRecord {
   memKills?: number;
   /** The machine stopped answering during the lease. */
   froze?: boolean;
+  /** Chats saved on the devbox (transcripts dir), one per T3 thread the lease used. */
+  chats?: { threadId: string; title: string; file: string; messages: number }[];
 }
 
 /** What a repo's next new machine should be, and why (learned from its jobs). */

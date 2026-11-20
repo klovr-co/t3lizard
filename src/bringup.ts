@@ -399,8 +399,26 @@ export async function resetCheckout(r: Remote, id: MachineId, workspacePath: str
   return { ok: true };
 }
 
+/**
+ * The machine's T3 threads updated since `sinceIso`, each with its messages (t3 thread show --json),
+ * as one gzipped tar in base64. Saved on the devbox before the machine is gone.
+ */
+export async function exportThreads(r: Remote, id: MachineId, workspacePath: string, sinceIso: string): Promise<Buffer> {
+  // A machine brought up by an older t3lizard has an accounts.mjs without `export`.
+  await writeFile(r, id, "accounts.mjs", ACCOUNTS_JS, "600");
+  const body = `out="$D/export"; rm -rf "$out"; mkdir -p "$out"
+node "$D/accounts.mjs" export "$2" "$out" > /dev/null
+tar -C "$out" -czf - . | base64 -w0`;
+  const out = (await run(r, id, script("export", body, workspacePath, sinceIso), 180_000)).stdout.trim();
+  return Buffer.from(out, "base64");
+}
+
 /** How many of the machine's T3 threads are still working. */
 export async function busyThreads(r: Remote, id: MachineId, workspacePath: string): Promise<number> {
+  // The CLI's list leaves sub-agent threads out, and every delegated job is one: ask T3's MCP tools.
+  const viaMcp = await r.lizard.exec(id, script("busy", 'node "$D/accounts.mjs" busy'), 120_000);
+  const m = viaMcp.exitCode === 0 ? viaMcp.stdout.match(/"busy":(\d+)/) : null;
+  if (m) return Number(m[1]);
   const out = (await run(r, id, script("threads", 't3 thread list --json --project "$1" --base-dir "$HOME/.t3"', workspacePath))).stdout;
   const rows = JSON.parse(out.trim() || "[]") as { status?: unknown }[];
   return rows.filter((t) => BUSY_STATUSES.has(String(t.status))).length;

@@ -2,6 +2,8 @@
 //
 //   node accounts.mjs configure <accounts.json>   one claudeAgent_acct<N> provider instance per account
 //   node accounts.mjs scan                         JSON: threads whose latest run failed on a usage limit
+//   node accounts.mjs busy                         JSON: threads still working, sub-agents included
+//   node accounts.mjs export <sinceIso> <outDir>   threads updated since then, with messages, as JSON files
 //   node accounts.mjs continue <thread> <run> <account>
 //                                                  switch the thread to that account and send "continue"
 //
@@ -205,6 +207,48 @@ export async function continueThread(tools, threadId, runId, account) {
   return { threadId, account, runId: sent.runId, delivery: sent.delivery };
 }
 
+/** Threads (sub-agents included) still working: the T3 CLI's list leaves sub-agent threads out. */
+export async function busy(tools) {
+  const statuses = ["waiting", "running", "starting", "queued", "preparing"];
+  let n = 0;
+  for (let cursor = 0; cursor !== null; ) {
+    const page = await tools.call("t3_thread_list", { allProjects: true, statuses, includeSubagents: true, limit: 100, cursor });
+    n += page.threads.length;
+    cursor = page.nextCursor;
+  }
+  return n;
+}
+
+/**
+ * Every thread (sub-agents included) updated since `since`, with its messages oldest first, written
+ * to <outDir>/<n>.json as { thread, messages: [{ role, text }] }. Returns how many were written.
+ */
+export async function exportThreads(tools, since, outDir) {
+  mkdirSync(outDir, { recursive: true });
+  let written = 0;
+  for (let cursor = 0; cursor !== null; ) {
+    const page = await tools.call("t3_thread_list", { allProjects: true, includeSubagents: true, limit: 100, cursor });
+    for (const t of page.threads) {
+      if ((t.updatedAt ?? "") < since) continue;
+      const messages = [];
+      let thread = t;
+      for (let after = -1; after !== null; ) {
+        const read = await tools.call("t3_thread_read", { threadId: t.threadId, view: "messages", afterPosition: after, limit: 100, maxCharsPerItem: 20000 });
+        thread = read.thread ?? thread;
+        for (const it of read.items ?? []) {
+          if (it.type !== "user_message" && it.type !== "assistant_message") continue;
+          messages.push({ role: it.type === "user_message" ? "user" : "assistant", text: (it.text ?? "") + (it.textTruncated ? "\n[cut at 20,000 characters]" : "") });
+        }
+        after = read.hasMore && read.nextPosition !== undefined && read.nextPosition !== null && read.nextPosition !== after ? read.nextPosition : null;
+      }
+      written++;
+      writeFileSync(join(outDir, `${written}.json`), JSON.stringify({ thread, messages }));
+    }
+    cursor = page.nextCursor;
+  }
+  return written;
+}
+
 export async function main(argv, env = process.env) {
   const baseDir = env.T3LIZARD_T3_BASE_DIR ?? join(homedir(), ".t3");
   const opts = {
@@ -217,6 +261,8 @@ export async function main(argv, env = process.env) {
   if (cmd === "configure") return configure(baseDir, args[0]);
   if (cmd === "scan") return { limited: await scan(await connect(opts)) };
   if (cmd === "continue") return continueThread(await connect(opts), args[0], args[1], args[2]);
+  if (cmd === "busy") return { busy: await busy(await connect(opts)) };
+  if (cmd === "export") return { written: await exportThreads(await connect(opts), args[0], args[1]) };
   throw new Error(`usage: accounts.mjs configure <file> | scan | continue <thread> <run> <account>`);
 }
 

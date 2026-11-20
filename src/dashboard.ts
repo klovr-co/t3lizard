@@ -1,4 +1,6 @@
+import { readFileSync } from "node:fs";
 import http from "node:http";
+import { join } from "node:path";
 import type { Daemon } from "./daemon.ts";
 
 /**
@@ -17,6 +19,21 @@ export async function startDashboard(daemon: Daemon, port: number, hosts: string
     if (path === "/data.json") {
       res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
       res.end(JSON.stringify(daemon.dashboard()));
+      return;
+    }
+    if (path === "/chat") {
+      const f = new URL(req.url ?? "/", "http://x").searchParams.get("f") ?? "";
+      if (!/^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+\.json$/.test(f)) {
+        res.writeHead(400).end("bad chat file");
+        return;
+      }
+      try {
+        const data = JSON.parse(readFileSync(join(daemon.transcriptsDir(), f), "utf8"));
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
+        res.end(chatPage(data));
+      } catch {
+        res.writeHead(404).end("no such chat");
+      }
       return;
     }
     if (path === "/") {
@@ -86,9 +103,30 @@ table("machines",["Machine","Repo","Size","Phase","Holder","Age","Ends in"],mach
 (m.notAnswering?'<span class="bad">not answering</span>':m.phase==="failed"?'<span class="bad">failed</span>':esc(m.phase)),esc(m.lease?.holder??""),m.ageMinutes+" min",m.deadlineInMinutes+" min"]),"No machines running.");
 table("queue",["Repo","Holder","Waited","Why"],queue.map(q=>[repo(q.repo),esc(q.holder),q.waitedMinutes+" min",esc(q.reason??"")]),"Nobody waiting.");
 table("learned",["Repo","Next machines","Never below","Why this size","Keep idle","Why","Jobs","Reused"],d.learned.map(l=>[repo(l.repo),'<span class="pill">'+esc(l.size)+'</span>',esc(l.minSize??"—"),esc(l.why),l.keepIdleMinutes+" min",esc(l.idleWhy),l.jobs,l.reusePct==null?"—":l.reusePct+"%"]),"Nothing learned yet.");
-table("jobs",["Ended","Repo","Holder","Size","Waited","Ran","Peak memory","Result"],d.jobs.map(j=>[ago(j.endedAt),repo(j.repo),esc(j.holder),esc(j.size),min(j.waitedMs),min(j.endedAt-j.grantedAt),
+table("jobs",["Ended","Repo","Holder","Size","Waited","Ran","Peak memory","Result","Chat"],d.jobs.map(j=>[ago(j.endedAt),repo(j.repo),esc(j.holder),esc(j.size),min(j.waitedMs),min(j.endedAt-j.grantedAt),
 j.peakMemPct==null?"—":'<span class="'+(j.peakMemPct>=85?"bad":j.peakMemPct<40?"ok":"")+'">'+j.peakMemPct+'%</span>',
-j.froze?'<span class="bad">froze</span>':j.memKills?'<span class="warn">'+j.memKills+' killed for memory</span>':'<span class="ok">ok</span>']),"No jobs recorded yet.");
+j.froze?'<span class="bad">froze</span>':j.memKills?'<span class="warn">'+j.memKills+' killed for memory</span>':'<span class="ok">ok</span>',
+(j.chats||[]).map(c=>'<a href="chat?f='+encodeURIComponent(c.file)+'">'+esc(c.title)+'</a>').join("<br>")||"—"]),"No jobs recorded yet.");
 table("days",["Day","Spend"],d.spend.byDay.map(x=>[esc(x.day),usd(x.usd)]),"No usage yet.")}
 load();setInterval(load,10000);
 </script></body></html>`;
+
+const escHtml = (v: unknown) => String(v ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]!);
+
+/** One saved chat: the thread's messages, oldest first, as plain text. */
+function chatPage(d: { thread?: { title?: string; threadId?: string; model?: string }; messages?: { role?: string; text?: string }[]; savedAt?: string; machineId?: string; repo?: string; holder?: string }): string {
+  const msgs = (d.messages ?? [])
+    .map((m) => `<div class="m ${m.role === "user" ? "u" : "a"}"><div class="r">${m.role === "user" ? "Brief" : "Agent"}</div><div class="t">${escHtml(m.text)}</div></div>`)
+    .join("");
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escHtml(d.thread?.title ?? "Chat")}</title><style>
+:root{--bg:#fbfbfa;--card:#fff;--ink:#1d1d1b;--muted:#6b6b66;--line:#e6e5e1;--u:#f1f4f1}
+@media (prefers-color-scheme:dark){:root{--bg:#151514;--card:#1d1d1b;--ink:#ecece8;--muted:#9a9a93;--line:#2c2c29;--u:#222a24}}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 ui-sans-serif,system-ui,-apple-system,sans-serif}main{max-width:860px;margin:0 auto;padding:20px 16px 48px}
+h1{font-size:18px;margin:0 0 4px}.sub{color:var(--muted);font-size:13px;margin-bottom:18px}a{color:inherit}
+.m{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin:10px 0}.m.u{background:var(--u)}
+.r{color:var(--muted);font-size:12px;font-weight:600;margin-bottom:4px}.t{white-space:pre-wrap;overflow-wrap:anywhere}
+</style></head><body><main><div class="sub"><a href="/">← pool</a></div><h1>${escHtml(d.thread?.title)}</h1>
+<div class="sub">${escHtml(d.holder)} · ${escHtml(d.repo)} · machine ${escHtml(d.machineId)} · ${escHtml(d.thread?.model)} · saved ${escHtml(d.savedAt)}</div>
+${msgs || '<div class="sub">No messages.</div>'}</main></body></html>`;
+}
