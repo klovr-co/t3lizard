@@ -327,7 +327,14 @@ export class Daemon {
       return {
       repo,
       keepIdleMinutes: Math.round(repoIdleMs(this.state, config, repo) / MINUTE),
-      idleWhy: gaps.length < 3 ? `default (${gaps.length} of 3 gaps seen)` : `3 in 4 of the last ${gaps.length} gaps between jobs were under ${Math.round([...gaps].sort((a, b) => a - b)[Math.ceil(gaps.length * 0.75) - 1] / MINUTE)} min`,
+      idleWhy: (() => {
+        if (gaps.length < 3) return `default: ${gaps.length} of 3 gaps between jobs seen so far`;
+        const p75 = Math.round([...gaps].sort((a, b) => a - b)[Math.ceil(gaps.length * 0.75) - 1] / MINUTE);
+        const max = config.idleMaxMinutes ?? config.idleCloseMinutes;
+        return p75 > max
+          ? `jobs usually come more than ${max} min apart (3 in 4 gaps under ${p75} min): not worth waiting`
+          : `3 in 4 of the last ${gaps.length} gaps between jobs were under ${p75} min`;
+      })(),
       jobs: jobs.length,
       reusePct: jobs.length ? Math.round((reused / jobs.length) * 100) : undefined,
       size: this.state.repoSize?.[repo]?.size ?? config.defaultSize,
