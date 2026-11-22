@@ -476,7 +476,7 @@ export class Daemon {
       lastLizardError: this.state.lastLizardError,
       accounts: config.accounts.map((id) => {
         const until = this.state.accounts?.[id]?.limitedUntil;
-        return { id, free: !accountLimited(this.state, id, now), ...(until && until > now ? { limitedUntil: new Date(until).toISOString() } : {}) };
+        return { id, free: !accountLimited(this.state, id, now), ...(until && until > now ? { limitedUntil: new Date(until).toISOString() } : {}), ...(until && until > now && this.state.accounts?.[id]?.disabled ? { disabled: true } : {}) };
       }),
     };
   }
@@ -915,7 +915,7 @@ export class Daemon {
       this.save();
     }
     if (m?.phase.kind !== "leased" || m.phase.leaseId !== lease.id) return;
-    const { accounts, accountRetryMinutes } = this.deps.config;
+    const { accounts, accountRetryMinutes, accountDisabledMinutes } = this.deps.config;
     const now = this.deps.now();
     const known = new Set((m.limitedThreads ?? []).map((t) => t.runId));
     const continued = new Set(m.continuedRuns ?? []);
@@ -925,8 +925,10 @@ export class Daemon {
     for (const t of limited) {
       if (known.has(t.runId)) continue;
       const account = ((this.state.accounts ??= {})[t.account] ??= {});
-      account.limitedUntil = Math.max(account.limitedUntil ?? 0, now + accountRetryMinutes * MINUTE);
-      this.deps.log(`thread ${t.threadId} on ${id} stopped on the usage limit of ${t.account} ("${t.notice}"); ${t.account} skipped until ${new Date(account.limitedUntil).toISOString()}`);
+      const minutes = t.disabled ? accountDisabledMinutes : accountRetryMinutes;
+      account.limitedUntil = Math.max(account.limitedUntil ?? 0, now + minutes * MINUTE);
+      if (t.disabled) account.disabled = true;
+      this.deps.log(`thread ${t.threadId} on ${id} stopped on ${t.disabled ? "disabled access" : "the usage limit"} of ${t.account} ("${t.notice}"); ${t.account} skipped until ${new Date(account.limitedUntil).toISOString()}`);
     }
     m.limitedThreads = limited.map(({ threadId, runId, account }) => ({ threadId, runId, account }));
     if (!m.limitedThreads.length) delete m.limitedThreads;

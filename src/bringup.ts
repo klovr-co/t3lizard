@@ -56,7 +56,12 @@ if [ "$major" = "" ] || [ "$major" -lt 22 ]; then
 fi
 
 npm_g() { npm install -g --prefix "$HOME/.local" --no-fund --no-audit "$@"; }
-command -v claude >/dev/null || npm_g @anthropic-ai/claude-code
+# Newer models need a newer CLI (Haiku 5.5 needs 2.1.293): install when missing or older than the minimum.
+min_claude=2.1.293
+cur_claude="$(claude --version 2>/dev/null | awk '{print $1}')"
+if [ -z "$cur_claude" ] || [ "$(printf '%s\n%s\n' "$min_claude" "$cur_claude" | sort -V | head -n1)" != "$min_claude" ]; then
+  npm_g @anthropic-ai/claude-code@latest
+fi
 command -v codex >/dev/null || npm_g @openai/codex || echo "codex install failed, continuing"
 
 mkdir -p "$HOME/.t3/userdata"
@@ -435,7 +440,7 @@ export async function busyThreads(r: Remote, id: MachineId, workspacePath: strin
 }
 
 /** Threads on the machine whose latest run failed on a usage limit, with the account it ran on. */
-export async function scanLimits(r: Remote, id: MachineId): Promise<(LimitedThread & { notice: string; requestedAt: string })[]> {
+export async function scanLimits(r: Remote, id: MachineId): Promise<(LimitedThread & { notice: string; requestedAt: string; disabled?: boolean })[]> {
   const out = (await run(r, id, script("scan", 'node "$D/accounts.mjs" scan'), 120_000)).stdout;
   return JSON.parse(out.trim()).limited;
 }

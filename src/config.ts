@@ -42,6 +42,7 @@ export const DEFAULT_CONFIG: Config = {
   sandboxUser: "user",
   tickSeconds: 15,
   accountRetryMinutes: 30,
+  accountDisabledMinutes: 360,
   setupTimeoutMinutes: 20,
   vcpuReserve: 0,
   idleMaxMinutes: 30,
@@ -78,6 +79,7 @@ const ConfigFile = z
     sandboxUser: z.string(),
     tickSeconds: positive,
     accountRetryMinutes: positive,
+    accountDisabledMinutes: positive,
     setupTimeoutMinutes: positive,
     /** Extra addresses the devbox proxies listen on, e.g. the Tailscale IP, so a browser can open a machine. */
     vcpuLimit: z.number().positive(),

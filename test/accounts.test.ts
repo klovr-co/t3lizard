@@ -7,7 +7,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 // @ts-ignore: plain JS module that runs on the machine
-import { applyAccounts, CONTINUE_MESSAGE, limitNotice, main } from "../src/machine/accounts.mjs";
+import { applyAccounts, CONTINUE_MESSAGE, isDisabledNotice, limitNotice, main } from "../src/machine/accounts.mjs";
 
 const NOTICE = "Claude usage limit reached. This turn is paused until the 5-hour limit resets in 2h 2m.";
 
@@ -145,7 +145,7 @@ test("scan signs in once through MCP OAuth, caches the token and finds the limit
   const { env } = machineEnv(t3.origin);
 
   const out = await main(["scan"], env);
-  assert.deepEqual(out, { limited: [{ threadId: "t-1", runId: "run-1", account: "claudeAgent_acct1", requestedAt: "2026-11-19T12:00:00.000Z", notice: NOTICE }] });
+  assert.deepEqual(out, { limited: [{ threadId: "t-1", runId: "run-1", account: "claudeAgent_acct1", requestedAt: "2026-11-19T12:00:00.000Z", notice: NOTICE, disabled: false }] });
   assert.equal(readFileSync(env.T3LIZARD_MCP_TOKEN_FILE, "utf8"), [...t3.issued][0]);
   assert.equal(statSync(env.T3LIZARD_MCP_TOKEN_FILE).mode & 0o777, 0o600);
 
@@ -174,4 +174,12 @@ test("continue switches the thread's account, keeps its model, sends continue on
   const repeat = await main(["continue", "t-1", "run-1", "claudeAgent_acct2"], env);
   assert.match(repeat.skipped, /running at run run-2/);
   assert.equal(t3.calls.filter((c) => c.name === "t3_thread_send").length, 1);
+});
+
+test("an admin-disabled account is a limit notice that is marked disabled", () => {
+  const text = "Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access";
+  const items = [{ runId: "run-1", title: "error", text }];
+  assert.equal(limitNotice("run-1", items), text);
+  assert.equal(isDisabledNotice(text), true);
+  assert.equal(isDisabledNotice(NOTICE), false);
 });

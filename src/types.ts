@@ -67,6 +67,8 @@ export type AccountId = string;
 export interface AccountState {
   /** The account hit its usage limit; it is skipped until this time, then tried again. */
   limitedUntil?: number;
+  /** An admin disabled this account's Claude access ("organization has disabled ..."); skipped for accountDisabledMinutes. */
+  disabled?: boolean;
 }
 
 /** A thread on a leased machine whose latest run failed on an account's usage limit. */
@@ -200,6 +202,8 @@ export interface Config {
   setupTimeoutMinutes: number;
   /** How long an account that hit its usage limit is skipped before it is tried again. */
   accountRetryMinutes: number;
+  /** How long an account whose Claude access was disabled is skipped before it is tried again. */
+  accountDisabledMinutes: number;
   /** Pro limits vCPUs running at once (40 on Pro). Unset: only the per-size max applies. */
   vcpuLimit?: number;
   /** The longest a learned idle wait can be (see repoIdleMs); idleCloseMinutes is the shortest. */

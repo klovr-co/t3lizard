@@ -26,7 +26,10 @@ const ACCOUNT_INSTANCE = /^claudeAgent_acct\d+$/;
  * T3's limit notice ("Claude usage limit reached. This turn is paused until ...") or Claude's own
  * reply ("You've hit your session limit · resets ..."). A plain API rate limit (429) is not one.
  */
-const LIMIT_TEXT = /usage limit reached|you['\u2019]ve hit your [\w-]+ limit/i;
+const LIMIT_TEXT = /usage limit reached|you['\u2019]ve hit your [\w-]+ limit|organization has disabled claude subscription access/i;
+/** The account's access was turned off by an admin: it will not free up on its own soon. */
+const DISABLED_TEXT = /organization has disabled claude subscription access/i;
+export const isDisabledNotice = (text) => DISABLED_TEXT.test(text ?? "");
 
 /** Settings with one enabled provider instance per account, each holding only its own token. */
 export function applyAccounts(settings, accounts) {
@@ -190,7 +193,7 @@ export async function scan(tools) {
       const latest = read.recentRuns.find((r) => r.runId === t.latestRunId);
       if (latest?.status !== "failed") continue;
       const notice = limitNotice(latest.runId, read.items);
-      if (notice) limited.push({ threadId: t.threadId, runId: latest.runId, account: latest.providerInstanceId, requestedAt: latest.requestedAt, notice });
+      if (notice) limited.push({ threadId: t.threadId, runId: latest.runId, account: latest.providerInstanceId, requestedAt: latest.requestedAt, notice, disabled: isDisabledNotice(notice) });
     }
     cursor = page.nextCursor;
   }
