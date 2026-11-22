@@ -551,3 +551,27 @@ test("exec runs a command on the leased machine with no agent, waits for it, and
   await h.api("/release", { leaseId });
   await assert.rejects(h.api("/exec", { leaseId, command: "ls" }), /no lease/);
 });
+
+test("an account shows as disabled only while a disabled notice decides its block, not after a later plain usage limit", async (t) => {
+  const A1 = "claudeAgent_acct1";
+  const A2 = "claudeAgent_acct2";
+  const h = await harness(t, { accounts: [A1, A2], accountRetryMinutes: 30, accountDisabledMinutes: 5, leaseMinutes: 120, lifetimeMinutes: 120, maxLifetimeMinutes: 240 });
+  const queued = await h.api("/acquire", { repo: REPO, ref: "main", holder: "thread-a" });
+  await h.daemon.settled();
+  await h.api("/wait", { ticketId: queued.ticketId, maxSeconds: 1 });
+  const notice = (runId: string, disabled: boolean) =>
+    h.lizard.limited.set("sb-1", [{ threadId: `t-${runId}`, runId, account: A1, requestedAt: new Date(h.clock.now).toISOString(), notice: disabled ? "Your organization has disabled Claude subscription access" : "Claude usage limit reached.", disabled } as never]);
+  const acct1 = async () => (await h.api("/status")).accounts.find((a: { id: string }) => a.id === A1);
+
+  notice("r1", true);
+  await h.advance(1);
+  assert.equal((await acct1()).disabled, true);
+
+  // After the disabled window, the account hits a plain usage limit: it is limited, not disabled.
+  await h.advance(10);
+  notice("r2", false);
+  await h.advance(1);
+  const a = await acct1();
+  assert.equal(a.free, false);
+  assert.equal(a.disabled, undefined);
+});

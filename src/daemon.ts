@@ -1007,8 +1007,14 @@ export class Daemon {
       if (known.has(t.runId)) continue;
       const account = ((this.state.accounts ??= {})[t.account] ??= {});
       const minutes = t.disabled ? accountDisabledMinutes : accountRetryMinutes;
-      account.limitedUntil = Math.max(account.limitedUntil ?? 0, now + minutes * MINUTE);
-      if (t.disabled) account.disabled = true;
+      const until = now + minutes * MINUTE;
+      // The longer block decides what the account is shown as: a plain usage limit after an old
+      // "disabled" must not keep the flag, but a disabled notice inside a usage-limit window sets it.
+      if (until >= (account.limitedUntil ?? 0)) {
+        account.limitedUntil = until;
+        if (t.disabled) account.disabled = true;
+        else delete account.disabled;
+      }
       this.deps.log(`thread ${t.threadId} on ${id} stopped on ${t.disabled ? "disabled access" : "the usage limit"} of ${t.account} ("${t.notice}"); ${t.account} skipped until ${new Date(account.limitedUntil).toISOString()}`);
     }
     m.limitedThreads = limited.map(({ threadId, runId, account }) => ({ threadId, runId, account }));
