@@ -42,6 +42,12 @@ if [ -f "$D/env" ]; then set -a; . "$D/env"; set +a; fi
 
 have="$(t3 --version 2>/dev/null || true)"; have="\${have#t3 v}"
 if [ "$have" != "$V" ]; then
+  # The T3 binary links libatomic.so.1, which the claude image (Debian 12) lacks: without it t3 does not run.
+  if ! PATH="/usr/sbin:/sbin:$PATH" ldconfig -p 2>/dev/null | grep -q 'libatomic\\.so\\.1 '; then
+    echo "installing libatomic1"
+    sudo -n apt-get update -qq && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libatomic1 ||
+      echo "could not install libatomic1 (no sudo?); t3 will not run without it"
+  fi
   echo "installing t3 $V"
   curl -fsSL https://t3.codes/install.sh | T3CODE_VERSION="$V" T3CODE_INSTALL_BIN_DIR="$HOME/.local/bin" sh
 fi
