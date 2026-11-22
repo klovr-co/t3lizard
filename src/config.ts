@@ -42,7 +42,7 @@ export const DEFAULT_CONFIG: Config = {
   sandboxUser: "user",
   tickSeconds: 15,
   accountRetryMinutes: 30,
-  accountDisabledMinutes: 360,
+  accountDisabledMinutes: 30,
   setupTimeoutMinutes: 20,
   vcpuReserve: 0,
   idleMaxMinutes: 30,
