@@ -23,6 +23,8 @@ Use it for heavy work: builds, full typechecks, pre-push gates, long test runs.
 4c. A job that needs a login or an .env file (a staging sign-in, an API key for tests): from a shell on the devbox, run
    t3lizard put <leaseId> <path under ~> [--mode 600] < file
    It writes stdin to that file on the leased machine only, mode 600 by default, and never logs or echoes it.
+   A relative path is under ~, not the checkout. t3lizard removes the file when the lease ends; delete files the job made from it
+   (a browser state with cookies) yourself before you release.
    Never put a secret in a pool_exec command, a delegate_task prompt or any tool argument: those are saved in transcripts.
 5. Call pool_release with the leaseId as soon as the delegated work is done. Machines are shared and cost money.
    A lease expires after about 90 minutes unless you call pool_renew; a busy thread on the machine keeps it alive.
