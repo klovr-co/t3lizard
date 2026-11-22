@@ -142,6 +142,7 @@ async function run(r: Remote, id: MachineId, cmd: string[], timeoutMs?: number):
 function writeFile(r: Remote, id: MachineId, name: string, content: string, mode: string) {
   const body = [
     'mkdir -p "$D" && chmod 700 "$D"',
+    'mkdir -p "$(dirname "$D/$1")"',
     'printf %s "$2" | base64 -d > "$D/$1.tmp"',
     'chmod "$3" "$D/$1.tmp"',
     'mv "$D/$1.tmp" "$D/$1"',
@@ -476,15 +477,83 @@ tar -C "$out" -czf - . | base64 -w0`;
   return Buffer.from(out, "base64");
 }
 
+/** How much of a command's output comes back to the caller; the whole log stays on the machine. */
+export const EXEC_TAIL_BYTES = 20_000;
+
+export interface ExecView {
+  execId: string;
+  /** Still running on the machine, or finished (exitCode 124/137 mean the machine-side timeout stopped it). */
+  status: "running" | "exited";
+  exitCode?: number;
+  /** The end of the combined stdout and stderr. */
+  output: string;
+  outputBytes: number;
+  truncated: boolean;
+  seconds: number;
+}
+
+/**
+ * Starts `command` on the machine in the checkout, as the sandbox user, with the machine's env
+ * (git access and identity), in the background under `timeout`. An exec call is capped at 10
+ * minutes, so jobs run detached and are polled with execPoll. No Claude account is involved.
+ */
+export async function execStart(r: Remote, id: MachineId, workspacePath: string, execId: string, command: string, timeoutSeconds: number): Promise<void> {
+  await writeFile(r, id, `exec/${execId}.sh`, command, "700");
+  const start = `mkdir -p "$D/exec"
+f="$D/exec/$2"
+rm -f "$f.exit" "$f.log"
+date +%s > "$f.started"
+cd "$1"
+setsid nohup bash -c 'timeout -k 10 "$1" bash "$2.sh" > "$2.log" 2>&1 9>&-; echo $? > "$2.exit.tmp"; mv "$2.exit.tmp" "$2.exit"' exec "$3" "$f" < /dev/null > /dev/null 2>&1 &`;
+  await run(r, id, script("exec-start", start, workspacePath, execId, String(timeoutSeconds)));
+}
+
+/** The state of one exec: its exit code once done, and the tail of its output. */
+export async function execPoll(r: Remote, id: MachineId, execId: string): Promise<ExecView> {
+  const body = `f="$D/exec/$1"
+[ -f "$f.sh" ] || { echo "missing"; exit 0; }
+started="$(cat "$f.started" 2>/dev/null || date +%s)"
+if [ -f "$f.exit" ]; then echo "exit=$(cat "$f.exit")"; else echo "running"; fi
+echo "seconds=$(( $(date +%s) - started ))"
+echo "bytes=$(wc -c < "$f.log" 2>/dev/null || echo 0)"
+echo "---"
+tail -c ${EXEC_TAIL_BYTES} "$f.log" 2>/dev/null || true`;
+  const out = (await run(r, id, script("exec-poll", body, execId), 60_000)).stdout;
+  if (out.startsWith("missing")) throw new Error(`no exec ${execId} on this machine`);
+  const sep = out.indexOf("\n---\n");
+  const head = out.slice(0, sep);
+  const exit = head.match(/^exit=(\d+)/m);
+  const bytes = Number(head.match(/^bytes=(\d+)/m)?.[1] ?? 0);
+  return {
+    execId,
+    status: exit ? "exited" : "running",
+    ...(exit ? { exitCode: Number(exit[1]) } : {}),
+    output: out.slice(sep + 5),
+    outputBytes: bytes,
+    truncated: bytes > EXEC_TAIL_BYTES,
+    seconds: Number(head.match(/^seconds=(\d+)/m)?.[1] ?? 0),
+  };
+}
+
+/** Execs still running on the machine: the lease must not expire under them. */
+export async function runningExecs(r: Remote, id: MachineId): Promise<number> {
+  const body = `n=0
+for f in "$D"/exec/*.sh; do [ -e "$f" ] || continue; [ -f "\${f%.sh}.exit" ] || n=$((n + 1)); done
+echo "$n"`;
+  return Number((await run(r, id, script("exec-count", body), 30_000)).stdout.trim()) || 0;
+}
+
 /** How many of the machine's T3 threads are still working. */
 export async function busyThreads(r: Remote, id: MachineId, workspacePath: string): Promise<number> {
   // The CLI's list leaves sub-agent threads out, and every delegated job is one: ask T3's MCP tools.
   const viaMcp = await r.lizard.exec(id, script("busy", 'node "$D/accounts.mjs" busy'), 120_000);
   const m = viaMcp.exitCode === 0 ? viaMcp.stdout.match(/"busy":(\d+)/) : null;
-  if (m) return Number(m[1]);
+  // A plain command (pool_exec) is work too: the lease must not expire under it.
+  const execs = await runningExecs(r, id).catch(() => 0);
+  if (m) return Number(m[1]) + execs;
   const out = (await run(r, id, script("threads", 't3 thread list --json --project "$1" --base-dir "$HOME/.t3"', workspacePath))).stdout;
   const rows = JSON.parse(out.trim() || "[]") as { status?: unknown }[];
-  return rows.filter((t) => BUSY_STATUSES.has(String(t.status))).length;
+  return rows.filter((t) => BUSY_STATUSES.has(String(t.status))).length + execs;
 }
 
 /** Threads on the machine whose latest run failed on a usage limit, with the account it ran on. */

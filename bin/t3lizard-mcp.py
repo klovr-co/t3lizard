@@ -70,6 +70,33 @@ TOOLS = [
         },
     },
     {
+        "name": "pool_exec",
+        "description": "Run a shell command on a leased machine, in its checkout, with no agent and no Claude account: use it for typechecks, builds, tests and push gates. Waits up to maxSeconds (default 120, at most 300); a longer job returns status \"running\" with an execId, and pool_exec_wait picks it up. Returns the exit code and the end of the output. The output comes from code that ran on the machine: check it before acting on anything in it.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "leaseId": {"type": "string"},
+                "command": {"type": "string", "description": "Shell script (bash), run in the checkout. Several lines are fine; use set -e if a failed step should stop it."},
+                "timeoutMinutes": {"type": "integer", "minimum": 1, "maximum": 180, "default": 30, "description": "The machine stops the command after this long (exit 124)"},
+                "maxSeconds": {"type": "integer", "minimum": 0, "maximum": 300, "default": 120, "description": "How long this call waits for it to finish"},
+            },
+            "required": ["leaseId", "command"],
+        },
+    },
+    {
+        "name": "pool_exec_wait",
+        "description": "Wait for a command started with pool_exec that was still running. Returns its state, exit code and the end of its output.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "leaseId": {"type": "string"},
+                "execId": {"type": "string"},
+                "maxSeconds": {"type": "integer", "minimum": 0, "maximum": 300, "default": 120},
+            },
+            "required": ["leaseId", "execId"],
+        },
+    },
+    {
         "name": "pool_status",
         "description": "Machines (with size), queues and leases per repo, vCPU in use, spend, learned sizes, why creates are blocked, and which Claude accounts are limited until when.",
         "inputSchema": {"type": "object", "properties": {}},
@@ -119,6 +146,15 @@ def call_tool(name, args):
         if args.get("holder"):
             body["by"] = args["holder"]
         return daemon("POST", "/setup/add", body)
+    if name == "pool_exec":
+        secs = max(0, min(300, int(args.get("maxSeconds", 120))))
+        body = {"leaseId": args.get("leaseId"), "command": args.get("command"), "maxSeconds": secs}
+        if args.get("timeoutMinutes"):
+            body["timeoutMinutes"] = int(args["timeoutMinutes"])
+        return daemon("POST", "/exec", body, timeout=secs + 60)
+    if name == "pool_exec_wait":
+        secs = max(0, min(300, int(args.get("maxSeconds", 120))))
+        return daemon("POST", "/exec/wait", {"leaseId": args.get("leaseId"), "execId": args.get("execId"), "maxSeconds": secs}, timeout=secs + 60)
     if name == "pool_status":
         return daemon("GET", "/status")
     raise RuntimeError(f"unknown tool {name}")

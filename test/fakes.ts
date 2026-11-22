@@ -36,6 +36,12 @@ export class FakeLizard implements Lizard, SandboxDirectory {
   /** Each `accounts.mjs continue` call: [machine, thread, run, account]. */
   continued: [MachineId, string, string, string][] = [];
   getInfoCalls: MachineId[] = [];
+  /** Commands started with pool_exec, by exec id. */
+  execs = new Map<string, { command: string; workspace: string; timeout: string; polls: number }>();
+  /** How many polls an exec stays "running" before it exits, its exit code and its output. */
+  execRunsFor = 0;
+  execExit = 0;
+  execOutput = "";
   /** Sandboxes created but missing from listSandboxes(), as a lagging listing would. */
   hiddenFromList = new Set<MachineId>();
   private n = 0;
@@ -99,6 +105,17 @@ export class FakeLizard implements Lizard, SandboxDirectory {
         return ok(`{"credential":"pair-${id}-${m.steps.length}"}\n`);
       case "repo-setup-poll":
         return ok("exit=0\n");
+      case "exec-start":
+        this.execs.set(args[1], { command: m.files.get(`exec/${args[1]}.sh`)?.content ?? "", workspace: args[0], timeout: args[2], polls: 0 });
+        return ok();
+      case "exec-poll": {
+        const e = this.execs.get(args[0]);
+        if (!e) return ok("missing\n");
+        const done = ++e.polls > this.execRunsFor;
+        return ok(`${done ? `exit=${this.execExit}` : "running"}\nseconds=${e.polls * 3}\nbytes=${this.execOutput.length}\n---\n${this.execOutput}`);
+      }
+      case "exec-count":
+        return ok(`${[...this.execs.values()].filter((e) => this.execRunsFor > e.polls).length}\n`);
       case "threads":
         return ok(JSON.stringify(this.threads));
       case "scan":

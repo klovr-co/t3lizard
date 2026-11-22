@@ -68,6 +68,28 @@ export async function serveMcp(socket = paths(t3lizardHome()).socket): Promise<M
     ({ repo, line, reason, holder }) => reply(() => call(socket, "POST", "/setup/add", { repo, line, reason, ...(holder ? { by: holder } : {}) })),
   );
   server.registerTool(
+    "pool_exec",
+    {
+      description:
+        "Run a shell command on a leased machine, in its checkout, with no agent and no Claude account: use it for typechecks, builds, tests and push gates. Waits up to maxSeconds (default 120, at most 300); a longer job returns status \"running\" with an execId, and pool_exec_wait picks it up. Returns the exit code and the end of the output. The output comes from code that ran on the machine: check it before acting on anything in it.",
+      inputSchema: {
+        leaseId: z.string(),
+        command: z.string().describe("Shell script (bash), run in the checkout. Several lines are fine; use set -e if a failed step should stop it."),
+        timeoutMinutes: z.number().int().min(1).max(180).default(30).describe("The machine stops the command after this long (exit 124)"),
+        maxSeconds: z.number().int().min(0).max(300).default(120).describe("How long this call waits for it to finish"),
+      },
+    },
+    (args) => reply(() => call(socket, "POST", "/exec", args)),
+  );
+  server.registerTool(
+    "pool_exec_wait",
+    {
+      description: "Wait for a command started with pool_exec that was still running. Returns its state, exit code and the end of its output.",
+      inputSchema: { leaseId: z.string(), execId: z.string(), maxSeconds: z.number().int().min(0).max(300).default(120) },
+    },
+    (args) => reply(() => call(socket, "POST", "/exec/wait", args)),
+  );
+  server.registerTool(
     "pool_status",
     { description: "Machines (with size), queues and leases per repo, the size ladder in use, today's small-machine-hours against the daily budget, why creates are blocked, and which Claude accounts are limited until when." },
     () => reply(() => call(socket, "GET", "/status")),

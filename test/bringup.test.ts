@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ACCOUNTS_JS, busyThreads, configureFront, FRONT_JS, install, pairAndLink, PREFLIGHT_SH, resetCheckout, runRepoSetup, setupProject } from "../src/bringup.ts";
+import { ACCOUNTS_JS, busyThreads, configureFront, execPoll, execStart, FRONT_JS, install, pairAndLink, PREFLIGHT_SH, resetCheckout, runRepoSetup, setupProject } from "../src/bringup.ts";
 import { realLocalT3 } from "../src/t3local.ts";
 import { FakeLizard, FakeT3, noSleep } from "./fakes.ts";
 
@@ -243,4 +243,30 @@ test("runRepoSetup runs the repo script in the checkout in a real shell: output,
   await first;
   assert.equal(readFileSync(join(ws, "runs.txt"), "utf8"), "x\n");
   assert.equal(existsSync(join(home, ".t3lizard", "repo-setup.sh")), true);
+});
+
+test("execStart saves the command as a script and runs it in the checkout under a timeout; execPoll reads the tail", async () => {
+  const { r, id, m } = await machine();
+  await execStart(r, id, "/home/user/app", "abc12345", "bun run typecheck\necho done", 600);
+  assert.deepEqual(m.files.get("exec/abc12345.sh"), { content: "bun run typecheck\necho done", mode: "700" });
+  assert.ok(m.steps.includes("exec-start"));
+  r.lizard.execRunsFor = 1;
+  r.lizard.execOutput = "line 1\nline 2\n";
+  const running = await execPoll(r, id, "abc12345");
+  assert.equal(running.status, "running");
+  assert.equal(running.exitCode, undefined);
+  r.lizard.execExit = 2;
+  const done = await execPoll(r, id, "abc12345");
+  assert.deepEqual({ status: done.status, exitCode: done.exitCode, output: done.output, truncated: done.truncated }, { status: "exited", exitCode: 2, output: "line 1\nline 2\n", truncated: false });
+  await assert.rejects(execPoll(r, id, "nope"), /no exec nope/);
+});
+
+test("a running exec counts as work, so the lease cannot expire under it", async () => {
+  const { r, id } = await machine();
+  r.lizard.threads = [];
+  r.lizard.execRunsFor = 5;
+  await execStart(r, id, "/home/user/app", "e1", "sleep 1", 600);
+  assert.equal(await busyThreads(r, id, "/home/user/app"), 1);
+  r.lizard.execRunsFor = 0;
+  assert.equal(await busyThreads(r, id, "/home/user/app"), 0);
 });

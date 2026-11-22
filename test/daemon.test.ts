@@ -520,3 +520,34 @@ test("when Antigravity is configured, new machines install it and leases default
   assert.equal(status.defaultModel, "gemini-4-neon");
   assert.equal(status.pools["github.com/Acme/app"].machines[0].antigravity, true);
 });
+
+test("exec runs a command on the leased machine with no agent, waits for it, and refuses a lease that ended", async (t) => {
+  const h = await harness(t);
+  const a0 = await h.api("/acquire", { repo: REPO, ref: "main", holder: "thread-a" });
+  await h.daemon.settled();
+  const a = await h.api("/wait", { ticketId: a0.ticketId, maxSeconds: 1 });
+  const leaseId = a.lease.leaseId;
+
+  h.lizard.execOutput = "typecheck ok\n";
+  h.lizard.execRunsFor = 2;
+  const r = await h.api("/exec", { leaseId, command: "bun run typecheck", timeoutMinutes: 45 });
+  assert.equal(r.status, "exited");
+  assert.equal(r.exitCode, 0);
+  assert.equal(r.output, "typecheck ok\n");
+  const started = [...h.lizard.execs.values()][0];
+  assert.equal(started.command, "bun run typecheck");
+  assert.equal(started.workspace, "/home/user/app");
+  assert.equal(started.timeout, String(45 * 60));
+
+  // A job longer than maxSeconds comes back running, and exec/wait picks it up.
+  h.lizard.execRunsFor = 1000;
+  const slow = await h.api("/exec", { leaseId, command: "sleep 600", maxSeconds: 0 });
+  assert.equal(slow.status, "running");
+  h.lizard.execRunsFor = 0;
+  const later = await h.api("/exec/wait", { leaseId, execId: slow.execId, maxSeconds: 5 });
+  assert.equal(later.status, "exited");
+
+  await assert.rejects(h.api("/exec", { leaseId: "nope", command: "ls" }), /no lease nope/);
+  await h.api("/release", { leaseId });
+  await assert.rejects(h.api("/exec", { leaseId, command: "ls" }), /no lease/);
+});

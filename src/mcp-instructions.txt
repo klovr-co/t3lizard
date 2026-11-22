@@ -5,7 +5,14 @@ Use it for heavy work: builds, full typechecks, pre-push gates, long test runs.
    It returns status "granted" with a lease, or "queued" with a position and a reason.
 3. While queued, call pool_wait with the ticketId. Each call waits up to 300 seconds and returns early on a grant.
    Do not create machines any other way. If you stop waiting, call pool_release with the ticketId.
-4. When granted, call delegate_task with target { environmentId, projectId, providerInstanceId } from the lease (and target.model from lease.model when present), plus a self-contained prompt.
+4. Two ways to use a granted machine:
+   a. A command with no agent (cheaper, no Claude usage): pool_exec with the leaseId and a shell script. Use it for
+      typechecks, builds, tests, installs and push gates: anything where you only need the exit code and the output.
+      It waits up to maxSeconds (at most 300); a longer job returns "running" with an execId, and pool_exec_wait picks it up.
+      You get the exit code and the last 20 KB of the output. Run several commands, or set -e, in one script.
+      To push from the machine: set up the checkout as the repo's notes say (install, git hooks), then git push origin HEAD:<branch>.
+   b. An agent thread, when the job needs judgment (fixing a failing test, a screen check): delegate_task as below.
+4b. For an agent thread, call delegate_task with target { environmentId, projectId, providerInstanceId } from the lease (and target.model from lease.model when present), plus a self-contained prompt.
    Always pass target.providerInstanceId (and target.model when lease.model is set). New machines default to Antigravity (gemini-4-neon); if you explicitly need Claude instead, pass lease.claudeProviderInstanceId with a Claude model (the machine has no plain claudeAgent).
    Do not pass isolation "worktree": the lease is a whole machine with its checkout at lease.workspacePath, already at your ref.
    lease.size says how big it is: medium is 4 vCPU / 8 GB, small 2 vCPU / 4 GB. When the mediums are busy you get a

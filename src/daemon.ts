@@ -4,8 +4,8 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { busyThreads, configureFront, pushAccounts, continueOnAccount, exportThreads, FRONT_PORT, install, machineLabel, pairAndLink, resetCheckout, runRepoSetup, scanLimits, setupProject } from "./bringup.ts";
-import type { Account, Remote } from "./bringup.ts";
+import { busyThreads, configureFront, pushAccounts, continueOnAccount, execPoll, execStart, exportThreads, FRONT_PORT, install, machineLabel, pairAndLink, resetCheckout, runRepoSetup, scanLimits, setupProject } from "./bringup.ts";
+import type { Account, ExecView, Remote } from "./bringup.ts";
 import { paths } from "./config.ts";
 import { LizardLimitError, LizardPaymentError } from "./lizard.ts";
 import type { Lizard } from "./lizard.ts";
@@ -185,6 +185,47 @@ export class Daemon {
 
   wait(req: { ticketId: string; maxSeconds: number }): Promise<TicketView> {
     return this.waitUntil(req.ticketId, Math.min(req.maxSeconds, 300), (v) => v.status !== "queued");
+  }
+
+  /**
+   * Runs a command on a leased machine, in its checkout, with no agent and no Claude account. Waits up
+   * to maxSeconds; a longer job comes back as "running" and execWait picks it up. The lease's holder
+   * is trusted with the machine already (a delegated thread could run the same command).
+   */
+  async exec(req: { leaseId: string; command: string; timeoutMinutes?: number; maxSeconds?: number }): Promise<ExecView> {
+    const { lease, machine } = this.leased(req.leaseId);
+    if (!req.command.trim()) throw new ApiError(400, "empty command");
+    if (Buffer.byteLength(req.command) > 200_000) throw new ApiError(400, "command is over 200 KB; put a long script in the repo and run that");
+    const minutes = Math.min(Math.max(req.timeoutMinutes ?? 30, 1), 180);
+    const execId = randomUUID().slice(0, 8);
+    await execStart(this.remote, machine.id, machine.workspacePath!, execId, req.command, minutes * 60);
+    this.deps.log(`exec ${execId} on ${machine.id} for ${lease.holder}: ${req.command.split("\n")[0].slice(0, 100)}`);
+    return this.execWait({ leaseId: lease.id, execId, maxSeconds: req.maxSeconds ?? 120 });
+  }
+
+  /** Waits for an exec to finish, up to maxSeconds (at most 300), and returns its state and output tail. */
+  async execWait(req: { leaseId: string; execId: string; maxSeconds?: number }): Promise<ExecView> {
+    const { machine } = this.leased(req.leaseId);
+    const until = this.deps.now() + Math.min(Math.max(req.maxSeconds ?? 120, 0), 300) * 1000;
+    for (;;) {
+      const view = await execPoll(this.remote, machine.id, req.execId).catch((e) => {
+        throw new ApiError(502, `cannot read exec ${req.execId} on ${machine.id}: ${(e as Error).message}`);
+      });
+      if (view.status === "exited" || this.deps.now() >= until) return view;
+      await this.deps.sleep(Math.min(3000, Math.max(0, until - this.deps.now())));
+      // The lease may have ended while waiting: stop then, the machine is gone or reassigned.
+      this.leased(req.leaseId);
+    }
+  }
+
+  private leased(leaseId: string): { lease: Lease; machine: Machine } {
+    const lease = this.state.leases[leaseId];
+    if (!lease) throw new ApiError(404, `no lease ${leaseId}`);
+    const machine = this.state.machines[lease.machineId];
+    if (!machine || machine.phase.kind !== "leased" || machine.phase.leaseId !== leaseId || !machine.workspacePath) {
+      throw new ApiError(409, `the machine of lease ${leaseId} is not available`);
+    }
+    return { lease, machine };
   }
 
   /** Ends a lease, or cancels a ticket (releasing its lease if it has one). */
