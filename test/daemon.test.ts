@@ -276,7 +276,7 @@ test("usage is counted per machine-second and the state file keeps no other secr
 
 test("machines that vanish right after create cannot loop: backoff, hourly cap and budget charge", async (t) => {
   // The live test made 7 sandboxes in 90 s. Here every sandbox is gone by its first step.
-  const h = await harness(t, { ticketMaxWaitMinutes: 180, sizes: [{ size: "small", max: 1 }] });
+  const h = await harness(t, { ticketMaxWaitMinutes: 180, sizes: [{ size: "small", max: 1 }], createsPerRepoPerHour: 3 });
   h.lizard.on.preflight = (m) => {
     for (const [id, x] of h.lizard.machines) if (x === m) h.lizard.machines.delete(id);
     return { stdout: "", stderr: "sandbox not found", exitCode: 1 };
