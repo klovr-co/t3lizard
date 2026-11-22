@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { busyThreads, configureFront, pushAccounts, continueOnAccount, execPoll, execStart, exportThreads, FRONT_PORT, install, machineLabel, pairAndLink, PUT_MAX_BYTES, putFile, resetCheckout, runRepoSetup, scanLimits, setupProject } from "./bringup.ts";
+import { busyThreads, configureFront, pushAccounts, continueOnAccount, execPoll, execStart, exportThreads, FRONT_PORT, install, machineLabel, pairAndLink, PUT_MAX_BYTES, putFile, removePutFiles, resetCheckout, runRepoSetup, scanLimits, setupProject } from "./bringup.ts";
 import type { Account, ExecView, Remote } from "./bringup.ts";
 import { paths } from "./config.ts";
 import { LizardLimitError, LizardPaymentError } from "./lizard.ts";
@@ -230,6 +230,9 @@ export class Daemon {
     if (!/^[A-Za-z0-9+/]*={0,2}$/.test(req.contentBase64) || req.contentBase64.length % 4 !== 0) throw new ApiError(400, "contentBase64 is not base64");
     const content = Buffer.from(req.contentBase64, "base64");
     if (content.length > PUT_MAX_BYTES) throw new ApiError(400, `the file is over ${PUT_MAX_BYTES / 1024} KB`);
+    // Recorded before the write, so a write that half-worked is still cleaned up.
+    machine.putFiles = [...new Set([...(machine.putFiles ?? []), rel])];
+    this.save();
     let path: string;
     try {
       path = await putFile(this.remote, machine.id, rel, req.contentBase64, mode);
@@ -241,6 +244,20 @@ export class Daemon {
     }
     this.deps.log(`put ~/${rel} (${content.length} bytes, mode ${mode}) on ${machine.id} for ${lease.holder}`);
     return { path, bytes: content.length, mode };
+  }
+
+  /** Removes the files put wrote on a machine. Throws when the machine cannot confirm it. */
+  private async cleanPuts(machineId: MachineId): Promise<void> {
+    const files = this.state.machines[machineId]?.putFiles;
+    if (!files?.length) return;
+    await removePutFiles(this.remote, machineId, files);
+    const m = this.state.machines[machineId];
+    if (m?.putFiles) {
+      m.putFiles = m.putFiles.filter((f) => !files.includes(f));
+      if (!m.putFiles.length) delete m.putFiles;
+      this.save();
+    }
+    this.deps.log(`removed ${files.length} put file(s) on ${machineId}`);
   }
 
   private leased(leaseId: string): { lease: Lease; machine: Machine } {
@@ -784,6 +801,8 @@ export class Daemon {
     const t = this.ticket(ticketId);
     let result: Awaited<ReturnType<typeof resetCheckout>>;
     try {
+      // A file the last holder put there must never reach the next one: no clean, no grant.
+      await this.cleanPuts(machineId);
       result = await resetCheckout(this.remote, machineId, this.state.machines[machineId].workspacePath!, t.ref);
     } catch (e) {
       const m = reserved();
@@ -1168,6 +1187,9 @@ export class Daemon {
     if (m) {
       delete m.limitedThreads;
       delete m.continuedRuns;
+      if (m.putFiles?.length) {
+        this.launch(`put-clean:${m.id}`, () => this.cleanPuts(m.id).catch((e) => this.deps.log(`removing put files on ${m.id} failed; the next grant tries again: ${(e as Error).message}`)));
+      }
     }
     if (m?.phase.kind === "leased" && m.phase.leaseId === leaseId) this.setPhase(m, { kind: "idle", since: this.deps.now() });
     this.deps.log(`lease ${leaseId} ${how}`);

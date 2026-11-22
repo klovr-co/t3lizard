@@ -112,6 +112,8 @@ export interface Machine {
   limitedThreads?: LimitedThread[];
   /** Runs already continued on another account, so a scan that raced the continue never repeats it. */
   continuedRuns?: string[];
+  /** Files `put` wrote this lease, relative to the home folder (paths only, never content). Removed before the machine is reused. */
+  putFiles?: string[];
 }
 
 export interface Lease {

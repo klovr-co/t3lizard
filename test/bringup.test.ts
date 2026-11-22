@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ACCOUNTS_JS, busyThreads, configureFront, execPoll, execStart, FRONT_JS, install, pairAndLink, PREFLIGHT_SH, putFile, resetCheckout, runRepoSetup, setupProject } from "../src/bringup.ts";
+import { ACCOUNTS_JS, busyThreads, configureFront, execPoll, execStart, FRONT_JS, install, pairAndLink, PREFLIGHT_SH, putFile, removePutFiles, resetCheckout, runRepoSetup, setupProject } from "../src/bringup.ts";
 import { realLocalT3 } from "../src/t3local.ts";
 import { FakeLizard, FakeT3, noSleep } from "./fakes.ts";
 
@@ -305,4 +305,10 @@ test("putFile writes under the home folder in a real shell, with the mode, and n
   await assert.rejects(putFile(r, "sb-1", "escape/x.env", b64, "600"), (e: Error) => /leaves the home folder/.test(e.message) && !e.message.includes(b64));
   assert.throws(() => readFileSync(join(outside, "x.env")));
   await assert.rejects(putFile(r, "sb-1", "afolder", b64, "600"), /is a folder/);
+
+  // Cleanup removes the file, and never a file a link leads to outside home.
+  writeFileSync(join(outside, "keep.txt"), "keep");
+  await removePutFiles(r, "sb-1", [".config/test-org/secrets.env", "escape/keep.txt", "never-written"]);
+  assert.throws(() => readFileSync(path));
+  assert.equal(readFileSync(join(outside, "keep.txt"), "utf8"), "keep");
 });

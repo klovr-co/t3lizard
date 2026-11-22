@@ -607,3 +607,35 @@ test("a body that is not JSON is refused without quoting it back", async (t) => 
   assert.match(raw, /not valid JSON/);
   assert.ok(!raw.includes("c2VjcmV0"));
 });
+
+test("files put on a machine are removed when the lease ends, and a machine that cannot remove them is never granted again", async (t) => {
+  const h = await harness(t, { perRepoCap: 1, sizes: [{ size: "small", max: 1 }] });
+  const grant = async (holder: string) => {
+    const a0 = await h.api("/acquire", { repo: REPO, ref: "main", holder });
+    await h.daemon.settled();
+    return (await h.api("/wait", { ticketId: a0.ticketId, maxSeconds: 1 })).lease;
+  };
+  const contentBase64 = Buffer.from("TEST_ORG_PASSWORD=x\n").toString("base64");
+
+  const first = await grant("thread-a");
+  await h.api("/put", { leaseId: first.leaseId, path: "~/.config/aldrent/test-org.json", contentBase64 });
+  const m = h.lizard.machines.get(first.machineId)!;
+  assert.ok(m.files.has("~/.config/aldrent/test-org.json"));
+  await h.api("/release", { leaseId: first.leaseId });
+  await h.daemon.settled();
+  assert.ok(!m.files.has("~/.config/aldrent/test-org.json"), "removed at release");
+  assert.ok(h.logs.some((l) => l.includes(`removed 1 put file(s) on ${first.machineId}`)));
+
+  // The removal failed at release: the next grant tries again, and refuses the machine if it still fails.
+  const second = await grant("thread-b");
+  assert.equal(second.machineId, first.machineId, "the idle machine is reused");
+  await h.api("/put", { leaseId: second.leaseId, path: ".env", contentBase64 });
+  h.lizard.on["put-clean"] = () => ({ stdout: "", stderr: "rm: cannot remove", exitCode: 1 });
+  await h.api("/release", { leaseId: second.leaseId });
+  await h.daemon.settled();
+  assert.ok(m.files.has("~/.env"));
+  const a3 = await h.api("/acquire", { repo: REPO, ref: "main", holder: "thread-c" });
+  await h.daemon.settled();
+  const third = await h.api("/wait", { ticketId: a3.ticketId, maxSeconds: 1 });
+  assert.notEqual(third.lease?.machineId, first.machineId, "never handed out with the last holder's file on it");
+});

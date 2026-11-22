@@ -181,6 +181,16 @@ echo "PATH=$dir/$name"`;
   return path;
 }
 
+/** Removes files `put` wrote (paths relative to $HOME), so the next lease on the machine never sees them. */
+export async function removePutFiles(r: Remote, id: MachineId, rels: string[]): Promise<void> {
+  const body = `home="$(realpath "$HOME")"
+for rel in "$@"; do
+  dir="$(realpath -m "$(dirname "$home/$rel")")"
+  case "$dir/" in "$home"/*) rm -f -- "$dir/$(basename "$rel")" ;; esac
+done`;
+  await run(r, id, script("put-clean", body, ...rels));
+}
+
 export function envFile(env: Record<string, string>): string {
   return Object.entries(env)
     .map(([k, v]) => `${k}='${v.replace(/'/g, `'\\''`)}'\n`)
