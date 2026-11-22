@@ -650,6 +650,8 @@ export async function scanLimits(r: Remote, id: MachineId): Promise<(LimitedThre
 
 /** Moves a limited thread to `account` and sends "continue". Skips a thread that moved on from `runId`. */
 export async function continueOnAccount(r: Remote, id: MachineId, t: LimitedThread): Promise<{ skipped?: string }> {
+  // A machine brought up by an older t3lizard has an older accounts.mjs.
+  await writeFile(r, id, "accounts.mjs", ACCOUNTS_JS, "600");
   const out = (await run(r, id, script("continue", 'node "$D/accounts.mjs" continue "$1" "$2" "$3"', t.threadId, t.runId, t.account), 120_000)).stdout;
   return JSON.parse(out.trim());
 }

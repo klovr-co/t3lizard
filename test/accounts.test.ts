@@ -18,7 +18,8 @@ type Thread = { threadId: string; status: string; latestRunId: string; instanceI
  * gives a csrf token; the token exchange checks PKCE) and an MCP endpoint that answers with
  * server-sent events and refuses any token it did not issue.
  */
-async function fakeT3(threads: Thread[]) {
+async function fakeT3(threads: Thread[], opts: { backgroundWork?: boolean } = {}) {
+  let backgroundWork = opts.backgroundWork ?? false;
   const calls: { name: string; args: any }[] = [];
   const issued = new Set<string>();
   const codes = new Map<string, string>();
@@ -72,8 +73,12 @@ async function fakeT3(threads: Thread[]) {
           recentRuns: [{ runId: thread!.latestRunId, status: thread!.status, providerInstanceId: thread!.instanceId, requestedAt: "2026-11-19T12:00:00.000Z" }],
           items: thread!.items,
         });
+      case "t3_thread_interrupt":
+        backgroundWork = false;
+        return tool({ threadId: thread!.threadId });
       case "t3_thread_configure":
         if (args.modelSelection) {
+          if (backgroundWork) return sse({ isError: true, content: [{ type: "text", text: "The session still has background agents or commands running; stop them first." }] });
           thread!.instanceId = args.modelSelection.instanceId;
           return tool({ sequence: 7 });
         }
@@ -174,6 +179,19 @@ test("continue switches the thread's account, keeps its model, sends continue on
   const repeat = await main(["continue", "t-1", "run-1", "claudeAgent_acct2"], env);
   assert.match(repeat.skipped, /running at run run-2/);
   assert.equal(t3.calls.filter((c) => c.name === "t3_thread_send").length, 1);
+});
+
+test("continue stops background work that blocks the account switch, then switches", async (t) => {
+  const thread = limitedThread();
+  const t3 = await fakeT3([thread], { backgroundWork: true });
+  t.after(t3.close);
+  const { env } = machineEnv(t3.origin);
+
+  const out = await main(["continue", "t-1", "run-1", "claudeAgent_acct2"], env);
+  assert.equal(out.account, "claudeAgent_acct2");
+  const names = t3.calls.map((c) => c.name).filter((n) => n === "t3_thread_interrupt" || n === "t3_thread_configure" || n === "t3_thread_send");
+  assert.deepEqual(names, ["t3_thread_configure", "t3_thread_configure", "t3_thread_interrupt", "t3_thread_configure", "t3_thread_send"]);
+  assert.deepEqual(t3.calls.find((c) => c.name === "t3_thread_interrupt")?.args, { threadId: "t-1", stop: true });
 });
 
 test("an admin-disabled account is a limit notice that is marked disabled", () => {

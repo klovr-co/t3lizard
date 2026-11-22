@@ -249,7 +249,18 @@ export async function continueThread(tools, threadId, runId, account) {
   const { thread } = await tools.call("t3_thread_read", { threadId, limit: 1, runLimit: 1 });
   if (thread.latestRunId !== runId || thread.status !== "failed") return { threadId, skipped: `thread is ${thread.status} at run ${thread.latestRunId}` };
   const { modelSelection } = await tools.call("t3_thread_configure", { threadId });
-  if (modelSelection.instanceId !== account) await tools.call("t3_thread_configure", { threadId, modelSelection: { ...modelSelection, instanceId: account } });
+  if (modelSelection.instanceId !== account) {
+    const move = () => tools.call("t3_thread_configure", { threadId, modelSelection: { ...modelSelection, instanceId: account } });
+    try {
+      await move();
+    } catch (e) {
+      // T3 will not switch a session that still has background agents or commands. The thread is
+      // stopped on a limit and cannot use their output anyway, so stop them and switch.
+      if (!/background/i.test(String(e?.message))) throw e;
+      await tools.call("t3_thread_interrupt", { threadId, stop: true });
+      await move();
+    }
+  }
   const sent = await tools.call("t3_thread_send", { threadId, message: CONTINUE_MESSAGE, mode: "auto", clientRequestId: `t3lizard-continue-${runId}` });
   return { threadId, account, runId: sent.runId, delivery: sent.delivery };
 }
