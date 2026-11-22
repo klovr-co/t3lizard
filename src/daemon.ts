@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { busyThreads, configureFront, pushAccounts, continueOnAccount, execPoll, execStart, exportThreads, FRONT_PORT, install, machineLabel, pairAndLink, resetCheckout, runRepoSetup, scanLimits, setupProject } from "./bringup.ts";
@@ -688,6 +688,7 @@ export class Daemon {
         );
         const installed = at("installing");
         installed.accounts = accounts.map((a) => a.id);
+        installed.accountsKey = this.accountsKey();
         if (antigravity) installed.antigravity = true;
         this.setPhase(installed, { kind: "linking" });
       }
@@ -912,6 +913,11 @@ export class Daemon {
 
   // ---- Claude accounts ----
 
+  /** Changes when an account is added, removed or given a new token. Not reversible to a token. */
+  private accountsKey(): string {
+    return createHash("sha256").update(JSON.stringify(this.accounts())).digest("hex").slice(0, 16);
+  }
+
   private accounts(): Account[] {
     return this.deps.config.accounts.map((id) => ({ id, token: this.deps.accountTokens[id] }));
   }
@@ -936,10 +942,11 @@ export class Daemon {
   private syncAccounts(): void {
     const want = this.deps.config.accounts;
     if (!want.length) return;
+    const key = this.accountsKey();
     const now = this.deps.now();
     for (const m of Object.values(this.state.machines)) {
       if (m.phase.kind !== "leased" && m.phase.kind !== "idle") continue;
-      if (m.accounts && m.accounts.join() === want.join()) continue;
+      if (m.accounts && m.accounts.join() === want.join() && m.accountsKey === key) continue;
       if (now - (this.lastAccountPush.get(m.id) ?? 0) < LIMIT_SCAN_EVERY_MS) continue;
       this.lastAccountPush.set(m.id, now);
       const id = m.id;
@@ -953,6 +960,7 @@ export class Daemon {
         const cur = this.state.machines[id];
         if (!cur) return;
         cur.accounts = [...want];
+        cur.accountsKey = key;
         this.save();
         this.deps.log(`machine ${id}: Claude accounts now ${want.join(", ")}`);
       });

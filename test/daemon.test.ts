@@ -575,3 +575,26 @@ test("an account shows as disabled only while a disabled notice decides its bloc
   assert.equal(a.free, false);
   assert.equal(a.disabled, undefined);
 });
+
+test("a replaced account token reaches machines that are already running, not only a changed account list", async (t) => {
+  const A1 = "claudeAgent_acct1";
+  const h = await harness(t, { accounts: [A1], leaseMinutes: 120, lifetimeMinutes: 120, maxLifetimeMinutes: 240 });
+  const queued = await h.api("/acquire", { repo: REPO, ref: "main", holder: "thread-a" });
+  await h.daemon.settled();
+  await h.api("/wait", { ticketId: queued.ticketId, maxSeconds: 1 });
+  const m = h.lizard.machines.get("sb-1")!;
+  assert.match(m.files.get("accounts.json")!.content, /token-of-claudeAgent_acct1/);
+
+  await h.advance(2);
+  assert.match(m.files.get("accounts.json")!.content, /token-of-claudeAgent_acct1/, "same token: nothing pushed");
+  const pushes = () => m.steps.filter((s) => s === "accounts").length;
+  const before = pushes();
+  await h.advance(2);
+  assert.equal(pushes(), before, "an unchanged machine is not touched again");
+
+  (h.daemon as unknown as { deps: { accountTokens: Record<string, string> } }).deps.accountTokens[A1] = "replacement-token";
+  await h.advance(2);
+  assert.match(m.files.get("accounts.json")!.content, /replacement-token/);
+  assert.equal(pushes(), before + 1);
+  assert.doesNotMatch(readFileSync(paths(h.home).state, "utf8"), /replacement-token/, "the state file keeps only a fingerprint");
+});

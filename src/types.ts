@@ -106,6 +106,8 @@ export interface Machine {
    * the secrets later is not on it. Missing on machines from before this field: all accounts.
    */
   accounts?: AccountId[];
+  /** A fingerprint of the account ids and tokens the machine holds, so a replaced token is pushed too. */
+  accountsKey?: string;
   /** True when Antigravity (agy binary + OAuth token) was installed and configured on this machine. */
   antigravity?: boolean;
   /** Threads that hit a usage limit and wait to continue on another account. From the last scan. */
