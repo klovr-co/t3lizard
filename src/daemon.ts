@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { busyThreads, configureFront, pushAccounts, continueOnAccount, execPoll, execStart, exportThreads, FRONT_PORT, install, machineLabel, pairAndLink, PUT_MAX_BYTES, putFile, removePutFiles, resetCheckout, runRepoSetup, scanLimits, setupProject } from "./bringup.ts";
+import { busyThreads, cloneRepo, configureFront, pushAccounts, continueOnAccount, execPoll, execStart, exportThreads, FRONT_PORT, install, machineLabel, pairAndLink, PUT_MAX_BYTES, putFile, removePutFiles, resetCheckout, runRepoSetup, scanLimits, scrubForSnapshot, setupProject } from "./bringup.ts";
 import type { Account, ExecView, Remote } from "./bringup.ts";
 import { paths } from "./config.ts";
 import { LizardLimitError, LizardPaymentError } from "./lizard.ts";
@@ -18,7 +18,7 @@ import type { RepoSetup } from "./setup.ts";
 import type { Proxy } from "./proxy.ts";
 import type { LocalT3 } from "./t3local.ts";
 import { emptyState, SIZE_USD_PER_HOUR, SIZE_VCPU, SIZE_WEIGHT } from "./types.ts";
-import type { JobRecord } from "./types.ts";
+import type { JobRecord, SnapshotRecord } from "./types.ts";
 import type { AccountId, Action, CloseReason, Config, CreateRecord, Lease, Machine, MachineId, MachinePhase, RepoKey, Size, State, Ticket } from "./types.ts";
 
 const MINUTE = 60_000;
@@ -28,6 +28,12 @@ const BUSY_LEASE_GRACE_MS = 10 * MINUTE;
 const UNRESPONSIVE_CLOSE_MS = 10 * MINUTE;
 /** An account whose thread failed to authenticate is skipped this long, unless a probe says it works. */
 const AUTH_BLOCK_MINUTES = 10;
+/** A snapshot older than this is rebuilt (newer Claude CLI, tools and dependencies). */
+const SNAPSHOT_MAX_AGE_MS = 14 * 24 * 60 * MINUTE;
+/** A failed or skipped snapshot build is tried again no sooner than this. */
+const BAKE_RETRY_MS = 30 * MINUTE;
+const BAKE_LIFETIME_MINUTES = 40;
+const snapKey = (repo: RepoKey, size: Size) => `${repo}|${size}`;
 /** How often a working account is asked again (only while a machine is leased), and a broken one. */
 const PROBE_OK_EVERY_MS = 60 * MINUTE;
 const PROBE_AUTH_EVERY_MS = 30 * MINUTE;
@@ -111,6 +117,9 @@ export class Daemon {
   private lastLimitScan = new Map<MachineId, number>();
   private lastAccountPush = new Map<MachineId, number>();
   private probing = false;
+  /** The snapshot being built (`<repo>|<size>`), at most one at a time. */
+  private baking: string | undefined;
+  private lastBakeTry = new Map<string, number>();
   /** Accounts to probe at the next chance: a thread just failed on them. */
   private probeNow = new Set<AccountId>();
   /** A continue that failed is retried after this time, not every tick. */
@@ -173,6 +182,7 @@ export class Daemon {
       this.scanForLimits();
       this.syncAccounts();
       this.probeAccounts();
+      this.maintainSnapshots();
     } finally {
       this.ticking = false;
     }
@@ -589,6 +599,9 @@ export class Daemon {
     }
     return {
       pools,
+      snapshots: Object.values(this.state.snapshots ?? {}).map((s) => ({ repo: s.repo, size: s.size, id: s.id, ageMinutes: minutes(now - s.builtAt), ...this.snapshotStale(s, now) })),
+      ...(this.baking ? { baking: this.baking } : {}),
+      ...(this.state.lastBake ? { lastBake: { ...this.state.lastBake, at: new Date(this.state.lastBake.at).toISOString() } } : {}),
       budget: {
         unit: `${BUDGET_UNIT}: 1 h of small = 1, mini = 0.5, nano = 0.25 (Lizard per-hour prices)`,
         usedToday: Number(usedSmallHours(this.state, now).toFixed(2)),
@@ -693,6 +706,7 @@ export class Daemon {
     const { config } = this.deps;
     const now = this.deps.now();
     const lifetimeMs = config.lifetimeMinutes * MINUTE;
+    const snap = this.state.snapshots?.[snapKey(repo, size)];
     const pendingId = `${PENDING}${randomUUID()}`;
     this.state.machines[pendingId] = { id: pendingId, repo, size, createdAt: now, deadline: now + lifetimeMs, phase: { kind: "creating" } };
     const record: CreateRecord = { machineId: pendingId, repo, at: now, outcome: "pending" };
@@ -700,23 +714,30 @@ export class Daemon {
     this.createsInFlight++;
     this.launch(`create:${pendingId}`, async () => {
       try {
-        const { id, deadline } = await this.deps.lizard.create(repo, size, lifetimeMs);
+        const { id, deadline } = await this.deps.lizard.create(repo, size, lifetimeMs, snap?.id);
         const pending = this.state.machines[pendingId];
         delete this.state.machines[pendingId];
-        this.state.machines[id] = { ...pending, id, deadline, phase: { kind: "installing" } };
+        // From a snapshot the tools and the repo's setup are already on disk: bring-up finds them and skips them.
+        this.state.machines[id] = { ...pending, id, deadline, phase: { kind: "installing" }, ...(snap ? { fromSnapshot: snap.id, ...(snap.setupHash ? { setupHash: snap.setupHash } : {}) } : {}) };
         record.machineId = id;
         // Every machine counts at least createChargeMinutes, so a create loop of short-lived
         // machines still runs into the daily budget. accrueUsage skips that first stretch.
         const day = utcDay(pending.createdAt);
         this.state.usage[day] = (this.state.usage[day] ?? 0) + config.createChargeMinutes * 60 * SIZE_WEIGHT[size];
-        this.deps.log(`machine ${id} (${size}) created for ${repo}`);
+        this.deps.log(`machine ${id} (${size}) created for ${repo}${snap ? " from its snapshot" : ""}`);
         this.save();
         this.launch(`bringup:${id}`, () => this.bringUp(id));
       } catch (e) {
         delete this.state.machines[pendingId];
         // Lizard made no machine, so this is not a create for the breaker; recordLizardError pauses creates.
         this.state.creates = this.state.creates?.filter((r) => r !== record);
-        this.recordLizardError(e as Error);
+        if (snap && !(e instanceof LizardLimitError) && !(e instanceof LizardPaymentError)) {
+          // The snapshot may be gone or broken: forget it, so the next machine starts the long way.
+          delete this.state.snapshots?.[snapKey(repo, size)];
+          this.deps.log(`snapshot ${snap.id} of ${repo} could not be used and is dropped: ${(e as Error).message}`);
+        } else {
+          this.recordLizardError(e as Error);
+        }
         this.save();
       } finally {
         this.createsInFlight--;
@@ -736,6 +757,103 @@ export class Daemon {
     this.deps.log(`Lizard create failed, creates paused for ${Math.round(pauseMs / 1000)} s: ${e.message}`);
   }
 
+  private antigravityConfig() {
+    return this.deps.antigravityToken
+      ? {
+          token: this.deps.antigravityToken,
+          defaultModel: this.deps.config.defaultModel ?? DEFAULT_ANTIGRAVITY_MODEL,
+          makeDefault: (this.deps.config.defaultProvider ?? "antigravity") === "antigravity",
+        }
+      : undefined;
+  }
+
+  /** Why a snapshot needs rebuilding, or nothing: the repo's setup changed, T3 moved on, or it is old. */
+  private snapshotStale(s: SnapshotRecord, now: number): { stale?: string } {
+    if ((this.repoSetup(s.repo)?.hash ?? "") !== s.setupHash) return { stale: "the repo's setup script changed" };
+    if (this.t3Version && s.t3Version !== this.t3Version) return { stale: "T3 Code has a newer version" };
+    if (now - s.builtAt > SNAPSHOT_MAX_AGE_MS) return { stale: "older than 14 days" };
+    return {};
+  }
+
+  /**
+   * Builds a snapshot of a prepared machine for `repo` at `size` and starts it in the background: a
+   * normal machine installs the tools and the repo's setup, but never gets a login or runs T3; the
+   * secrets file is removed (and the build refuses if a secret is found anywhere else) before the
+   * snapshot is saved, then the builder is killed. Machines for that repo and size then start from it.
+   */
+  async bake(req: { repo: string; size?: Size }): Promise<{ baking: string; size: Size }> {
+    const { config } = this.deps;
+    const repo = await this.setupRepo(req.repo);
+    const size = req.size ?? config.defaultSize;
+    if (!config.sizes.some((s) => s.size === size)) throw new ApiError(400, `size ${size} is not on the ladder (${config.sizes.map((s) => s.size).join(", ")})`);
+    if (this.baking) throw new ApiError(409, `already building ${this.baking}`);
+    const block = createBlock(this.state, this.deps.now(), config);
+    if (block) throw new ApiError(409, block);
+    const used = sizesInUse(Object.values(this.state.machines));
+    if (vcpuFree(config, used) < SIZE_VCPU[size]) throw new ApiError(409, `no room for a ${size} machine right now`);
+    const key = snapKey(repo, size);
+    this.baking = key;
+    this.lastBakeTry.set(key, this.deps.now());
+    this.launch(`bake:${key}`, () => this.runBake(repo, size).finally(() => void (this.baking = undefined)));
+    return { baking: repo, size };
+  }
+
+  private async runBake(repo: RepoKey, size: Size): Promise<void> {
+    const { config } = this.deps;
+    const key = snapKey(repo, size);
+    const startedAt = this.deps.now();
+    let id: MachineId | undefined;
+    try {
+      this.t3Version ??= await this.deps.t3.version();
+      const setup = this.repoSetup(repo);
+      const created = await this.deps.lizard.create(repo, size, BAKE_LIFETIME_MINUTES * MINUTE);
+      id = created.id;
+      this.state.machines[id] = { id, repo, size, createdAt: startedAt, deadline: created.deadline, phase: { kind: "baking" } };
+      const day = utcDay(startedAt);
+      this.state.usage[day] = (this.state.usage[day] ?? 0) + config.createChargeMinutes * 60 * SIZE_WEIGHT[size];
+      this.deps.log(`machine ${id} (${size}) created to build the snapshot of ${repo}`);
+      this.save();
+      await install(this.remote, id, this.deps.machineEnv, this.t3Version, [], { label: `${machineLabel(repo, id, size)} (snapshot build)`, size }, this.antigravityConfig(), { bake: true });
+      const workspacePath = await cloneRepo(this.remote, id, repo);
+      if (setup?.script) await runRepoSetup(this.remote, id, workspacePath, setup.script, config.setupTimeoutMinutes * MINUTE, (log) => this.logSetupOutput(id!, log));
+      await scrubForSnapshot(this.remote, id);
+      const snapshotId = await this.deps.lizard.snapshot(id, `t3lizard-${repo.split("/").pop()}-${size}-${new Date(this.deps.now()).toISOString().slice(0, 10)}`);
+      const old = this.state.snapshots?.[key];
+      (this.state.snapshots ??= {})[key] = { id: snapshotId, repo, size, setupHash: setup?.hash ?? "", t3Version: this.t3Version, builtAt: this.deps.now() };
+      this.state.lastBake = { at: this.deps.now(), repo, size, ok: true };
+      this.save();
+      this.deps.log(`snapshot ${snapshotId} of ${repo} (${size}) built in ${Math.round((this.deps.now() - startedAt) / 1000)} s`);
+      if (old && old.id !== snapshotId) {
+        await this.deps.lizard.deleteSnapshot(old.id).catch((e) => this.deps.log(`old snapshot ${old.id} was not deleted: ${(e as Error).message}`));
+      }
+    } catch (e) {
+      const message = (e as Error).message.slice(0, 600);
+      this.state.lastBake = { at: this.deps.now(), repo, size, ok: false, message };
+      this.deps.log(`snapshot build of ${repo} (${size}) failed, no snapshot changed: ${message}`);
+      if (e instanceof LizardLimitError || e instanceof LizardPaymentError) this.recordLizardError(e);
+      this.save();
+    } finally {
+      if (id && this.state.machines[id]) this.beginClose(id, "manual");
+    }
+  }
+
+  /** Rebuilds a stale snapshot when nobody is waiting for a machine of its repo and there is room. */
+  private maintainSnapshots(): void {
+    if (this.baking || !this.state.snapshots) return;
+    const now = this.deps.now();
+    const { config } = this.deps;
+    if (createBlock(this.state, now, config)) return;
+    for (const [key, s] of Object.entries(this.state.snapshots)) {
+      if (!this.snapshotStale(s, now).stale) continue;
+      if (now - (this.lastBakeTry.get(key) ?? 0) < BAKE_RETRY_MS) continue;
+      if (this.state.tickets.some((t) => t.status === "queued" && t.repo === s.repo)) continue;
+      if (vcpuFree(config, sizesInUse(Object.values(this.state.machines))) < SIZE_VCPU[s.size]) continue;
+      this.lastBakeTry.set(key, now);
+      this.bake({ repo: s.repo, size: s.size }).catch((e) => this.deps.log(`snapshot rebuild of ${s.repo} did not start: ${(e as Error).message}`));
+      return;
+    }
+  }
+
   /** Bring-up steps 1-6. Idempotent, so a daemon restart simply runs it again. */
   private async bringUp(id: MachineId): Promise<void> {
     const at = (kind: MachinePhase["kind"]) => {
@@ -749,13 +867,7 @@ export class Daemon {
       if (m?.phase.kind === "installing") {
         this.t3Version ??= await this.deps.t3.version();
         const accounts = this.accounts();
-        const antigravity = this.deps.antigravityToken
-          ? {
-              token: this.deps.antigravityToken,
-              defaultModel: this.deps.config.defaultModel ?? DEFAULT_ANTIGRAVITY_MODEL,
-              makeDefault: (this.deps.config.defaultProvider ?? "antigravity") === "antigravity",
-            }
-          : undefined;
+        const antigravity = this.antigravityConfig();
         await install(
           this.remote,
           id,

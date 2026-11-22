@@ -36,6 +36,12 @@ export class FakeLizard implements Lizard, SandboxDirectory {
   /** Each `accounts.mjs continue` call: [machine, thread, run, account]. */
   continued: [MachineId, string, string, string][] = [];
   getInfoCalls: MachineId[] = [];
+  /** Snapshots taken (id by order) and deleted; what each created machine was started from. */
+  snapshots: { id: string; from: MachineId; name: string }[] = [];
+  deletedSnapshots: string[] = [];
+  createdFrom = new Map<MachineId, string | undefined>();
+  /** Make a create from a snapshot fail, as when the snapshot is gone. */
+  snapshotCreateError?: Error;
   /** Commands started with pool_exec, by exec id. */
   execs = new Map<string, { command: string; workspace: string; timeout: string; polls: number }>();
   /** How many polls an exec stays "running" before it exits, its exit code and its output. */
@@ -52,7 +58,8 @@ export class FakeLizard implements Lizard, SandboxDirectory {
     this.now = now;
   }
 
-  async create(repo: RepoKey, size: Size, lifetimeMs: number) {
+  async create(repo: RepoKey, size: Size, lifetimeMs: number, snapshotId?: string) {
+    if (snapshotId && this.snapshotCreateError) throw this.snapshotCreateError;
     if (this.nextCreateError) {
       const e = this.nextCreateError;
       this.nextCreateError = undefined;
@@ -61,7 +68,19 @@ export class FakeLizard implements Lizard, SandboxDirectory {
     const id = `sb-${++this.n}`;
     const deadline = this.now() + lifetimeMs;
     this.machines.set(id, { metadata: { t3lizard: "1", repo }, status: "running", repo, size, deadline, files: new Map(), steps: [] });
+    this.createdFrom.set(id, snapshotId);
     return { id, deadline };
+  }
+
+  async snapshot(id: MachineId, name: string) {
+    if (!this.machines.has(id)) throw new Error(`sandbox ${id} not found`);
+    const snap = { id: `snap-${this.snapshots.length + 1}`, from: id, name };
+    this.snapshots.push(snap);
+    return snap.id;
+  }
+
+  async deleteSnapshot(snapshotId: string) {
+    this.deletedSnapshots.push(snapshotId);
   }
 
   /** A sandbox someone else started in the same project. */
@@ -111,6 +130,10 @@ export class FakeLizard implements Lizard, SandboxDirectory {
         return ok(`{"credential":"pair-${id}-${m.steps.length}"}\n`);
       case "repo-setup-poll":
         return ok("exit=0\n");
+      case "clone":
+        return ok(`WORKSPACE=/home/user/${args[1]}\n`);
+      case "scrub":
+        return ok("scrubbed\n");
       case "exec-start":
         this.execs.set(args[1], { command: m.files.get(`exec/${args[1]}.sh`)?.content ?? "", workspace: args[0], timeout: args[2], polls: 0 });
         return ok();

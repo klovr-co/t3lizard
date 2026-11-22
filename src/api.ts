@@ -17,6 +17,7 @@ const routes: Record<string, (d: Daemon, body: unknown) => unknown> = {
         .refine((r) => r.leaseId || r.ticketId, "give leaseId or ticketId")
         .parse(b),
     ),
+  "POST /bake": (d, b) => d.bake(z.object({ repo: id, size: z.enum(["nano", "mini", "small", "medium", "large", "big"]).optional() }).parse(b)),
   "POST /exec": (d, b) =>
     d.exec(z.object({ leaseId: id, command: id, timeoutMinutes: z.number().min(1).max(180).optional(), maxSeconds: z.number().min(0).max(300).optional() }).parse(b)),
   "POST /exec/wait": (d, b) => d.execWait(z.object({ leaseId: id, execId: id, maxSeconds: z.number().min(0).max(300).optional() }).parse(b)),

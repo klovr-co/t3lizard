@@ -327,6 +327,8 @@ export async function install(
   accounts: Account[],
   machine: { label: string; size: string } = { label: id, size: "small" },
   antigravity?: AntigravityConfig,
+  /** bake: install the tools only, for a snapshot. No accounts, no T3, no label: nothing machine-specific. */
+  opts: { bake?: boolean } = {},
 ): Promise<void> {
   await run(r, id, script("preflight", PREFLIGHT_SH));
   await writeFile(r, id, "env", envFile(secrets), "600");
@@ -359,6 +361,8 @@ export async function install(
     if (out.startsWith("failed")) throw new Error(`install failed:\n${out.slice("failed".length).trim()}`);
     return out.startsWith("done");
   }, "install");
+
+  if (opts.bake) return;
 
   if (accounts.length) {
     await writeFile(r, id, "accounts.json", JSON.stringify(accounts), "600");
@@ -395,6 +399,43 @@ export async function pushAccounts(r: Remote, id: MachineId, accounts: Account[]
   await writeFile(r, id, "accounts.mjs", ACCOUNTS_JS, "600");
   await writeFile(r, id, "accounts.json", JSON.stringify(accounts), "600");
   await run(r, id, script("accounts", 'node "$D/accounts.mjs" configure "$D/accounts.json"'));
+}
+
+/** Clone the repo into the home directory, without T3: for a snapshot build. Returns the checkout path. */
+export async function cloneRepo(r: Remote, id: MachineId, repo: RepoKey): Promise<string> {
+  const name = repo.split("/").pop() ?? "repo";
+  const body = `dir="$HOME/$2"
+if [ ! -d "$dir/.git" ]; then git clone "$1" "$dir"; fi
+echo "WORKSPACE=$dir"`;
+  const out = (await run(r, id, script("clone", body, cloneUrl(repo), name), 600_000)).stdout;
+  const path = out.match(/^WORKSPACE=(.+)$/m)?.[1];
+  if (!path) throw new Error(`clone printed no checkout path: ${out.trim()}`);
+  return path;
+}
+
+/**
+ * Last step before a snapshot: removes what must not be copied into it (the secrets file and anything
+ * that held a login), and refuses when a secret value is found anywhere else in the home directory or
+ * when T3 has already run here (its identity would be copied into every machine started from it).
+ */
+export const SCRUB_SH = `leak=""
+if [ -f "$D/env" ]; then
+  while IFS= read -r line; do
+    case "\${line%%=*}" in *TOKEN*|*SECRET*|*KEY*|*PASS*) ;; *) continue ;; esac
+    q="$(printf '\\047')"; v="\${line#*=}"; v="\${v#"$q"}"; v="\${v%"$q"}"
+    [ "\${#v}" -ge 12 ] || continue
+    if timeout 300 grep -rIlF --exclude-dir=node_modules --exclude-dir=.bun --exclude-dir=.npm --exclude-dir=.cache --exclude=env -- "$v" "$HOME" 2>/dev/null | head -1 | grep -q .; then leak="$leak \${line%%=*}"; fi
+  done < "$D/env"
+fi
+if [ -n "$leak" ]; then echo "secret(s) found outside the env file:$leak" >&2; exit 1; fi
+for f in "$HOME/.t3/userdata/environment-id" "$HOME/.t3/userdata/statev2.sqlite" "$HOME/.t3/userdata/server-owner.sqlite"; do
+  if [ -e "$f" ]; then echo "T3 has run on this machine ($f exists)" >&2; exit 1; fi
+done
+rm -rf "$D/env" "$D/accounts.json" "$D/antigravity.json" "$D/exec" "$D/export" "$D/repo-setup.sh" "$D/repo-setup.log" "$D/repo-setup.exit" "$D/install.log" "$D/project-id" "$D/front-host" "$D/label"
+echo scrubbed`;
+
+export async function scrubForSnapshot(r: Remote, id: MachineId): Promise<void> {
+  await run(r, id, script("scrub", SCRUB_SH), 600_000);
 }
 
 export function cloneUrl(repo: RepoKey): string {

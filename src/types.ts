@@ -55,6 +55,7 @@ export type MachinePhase =
   | { kind: "idle"; since: number }
   | { kind: "resetting"; ticketId: string }
   | { kind: "leased"; leaseId: string }
+  | { kind: "baking" }
   | { kind: "closing" }
   | { kind: "failed"; error: string };
 
@@ -112,6 +113,8 @@ export interface Machine {
    * the secrets later is not on it. Missing on machines from before this field: all accounts.
    */
   accounts?: AccountId[];
+  /** The snapshot this machine was started from, if any. */
+  fromSnapshot?: string;
   /** A fingerprint of the account ids and tokens the machine holds, so a replaced token is pushed too. */
   accountsKey?: string;
   /** True when Antigravity (agy binary + OAuth token) was installed and configured on this machine. */
@@ -170,6 +173,17 @@ export interface CreateRecord {
   reason?: string;
 }
 
+/** A saved image of a prepared machine for one repo at one size (Lizard snapshot). It holds no logins and no T3 identity. */
+export interface SnapshotRecord {
+  id: string;
+  repo: RepoKey;
+  size: Size;
+  /** The repo setup script it was built with (hash), so a changed script triggers a rebuild. */
+  setupHash: string;
+  t3Version: string;
+  builtAt: number;
+}
+
 export interface State {
   machines: Record<MachineId, Machine>;
   leases: Record<string, Lease>;
@@ -186,6 +200,10 @@ export interface State {
   repoMinSize?: Record<RepoKey, Size>;
   /** Learned per repo: the size to create next (see learnSize). */
   repoSize?: Record<RepoKey, RepoSizeChoice>;
+  /** Snapshots by `<repo>|<size>`. */
+  snapshots?: Record<string, SnapshotRecord>;
+  /** The last snapshot build, for status: when, which, and why it failed. */
+  lastBake?: { at: number; repo: RepoKey; size: Size; ok: boolean; message?: string };
   /** The latest finished leases, newest first. */
   jobs?: JobRecord[];
 }

@@ -780,3 +780,107 @@ test("a lease that ends during a put leaves nothing behind: the cleanup waits fo
   await h.daemon.settled();
   assert.ok(!m.files.has("~/.env"), "the file written after release is removed");
 });
+
+const SNAP_REPO = "github.com/Acme/app";
+
+test("bake builds a snapshot without logins or T3, saves it, kills the builder; new machines start from it and skip the setup it holds", async (t) => {
+  const A1 = "claudeAgent_acct1";
+  const h = await harness(t, { accounts: [A1], sizes: [{ size: "small", max: 4 }], defaultSize: "small" });
+  addStep(h.home, SNAP_REPO, { line: "bun install", reason: "deps", now: h.clock.now });
+  const hash = readSetup(h.home, SNAP_REPO)!.hash;
+
+  const started = await h.api("/bake", { repo: REPO, size: "small" });
+  assert.deepEqual(started, { baking: SNAP_REPO, size: "small" });
+  await h.daemon.settled();
+
+  const builder = h.lizard.machines.get("sb-1");
+  assert.equal(builder, undefined, "the builder is killed once the snapshot is saved");
+  assert.deepEqual(h.lizard.killed, ["sb-1"]);
+  assert.equal(h.lizard.snapshots.length, 1);
+  const state = h.daemon.state.snapshots![`${SNAP_REPO}|small`];
+  assert.deepEqual({ id: state.id, setupHash: state.setupHash, size: state.size }, { id: "snap-1", setupHash: hash, size: "small" });
+  assert.equal((await h.api("/status")).snapshots[0].id, "snap-1");
+  assert.equal((await h.api("/status")).lastBake.ok, true);
+
+  // A machine for the repo starts from the snapshot, and its bring-up does not run the setup again.
+  const t0 = await h.api("/acquire", { repo: REPO, ref: "main", holder: "a" });
+  await h.daemon.settled();
+  await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 1 });
+  const id = [...h.lizard.createdFrom].find(([, snap]) => snap)![0];
+  assert.equal(h.lizard.createdFrom.get(id), "snap-1");
+  const m = h.lizard.machines.get(id)!;
+  assert.ok(!m.steps.includes("repo-setup-start"), "the setup is already in the snapshot");
+  assert.ok(m.steps.includes("serve-start"), "T3 starts as usual");
+  assert.equal(h.daemon.state.machines[id].fromSnapshot, "snap-1");
+});
+
+test("the bake never installs a login or starts T3 on the builder, and scrubs before it saves", async (t) => {
+  const h = await harness(t, { accounts: ["claudeAgent_acct1"], sizes: [{ size: "small", max: 4 }], defaultSize: "small" });
+  const log: string[] = [];
+  const orig = h.lizard.exec.bind(h.lizard);
+  h.lizard.exec = async (id, cmd, timeout) => {
+    log.push(String(cmd[2]).match(/# t3lizard:([\w-]+)/)?.[1] ?? "?");
+    return orig(id, cmd, timeout);
+  };
+  const snap = h.lizard.snapshot.bind(h.lizard);
+  h.lizard.snapshot = async (id, name) => (log.push("SNAPSHOT"), snap(id, name));
+  await h.api("/bake", { repo: REPO, size: "small" });
+  await h.daemon.settled();
+  for (const never of ["accounts", "serve-start", "health", "pair", "prep", "project"]) assert.ok(!log.includes(never), `no ${never} step on the builder`);
+  assert.ok(log.indexOf("scrub") > log.indexOf("clone") && log.indexOf("scrub") < log.indexOf("SNAPSHOT"), "scrub runs after the clone and before the snapshot");
+});
+
+test("a refused scrub saves no snapshot, keeps the old one, kills the builder and says why", async (t) => {
+  const h = await harness(t, { sizes: [{ size: "small", max: 4 }], defaultSize: "small" });
+  await h.api("/bake", { repo: REPO, size: "small" });
+  await h.daemon.settled();
+  assert.equal(h.daemon.state.snapshots![`${SNAP_REPO}|small`].id, "snap-1");
+
+  h.lizard.on.scrub = () => ({ stdout: "", stderr: "secret(s) found outside the env file: GH_TOKEN", exitCode: 1 });
+  h.clock.now += 40 * MIN;
+  await h.api("/bake", { repo: REPO, size: "small" });
+  await h.daemon.settled();
+  assert.equal(h.lizard.snapshots.length, 1, "no second snapshot");
+  assert.equal(h.daemon.state.snapshots![`${SNAP_REPO}|small`].id, "snap-1");
+  assert.deepEqual(h.lizard.deletedSnapshots, []);
+  const s = await h.api("/status");
+  assert.equal(s.lastBake.ok, false);
+  assert.match(s.lastBake.message, /GH_TOKEN/);
+  assert.ok(h.lizard.killed.length >= 2, "both builders are gone");
+});
+
+test("a changed setup script rebuilds the snapshot by itself and deletes the old one; a fresh one is left alone", async (t) => {
+  const h = await harness(t, { sizes: [{ size: "small", max: 4 }], defaultSize: "small" });
+  addStep(h.home, SNAP_REPO, { line: "bun install", reason: "deps", now: h.clock.now });
+  await h.api("/bake", { repo: REPO, size: "small" });
+  await h.daemon.settled();
+  await h.advance(1);
+  assert.equal(h.lizard.snapshots.length, 1, "fresh: nothing rebuilt");
+
+  addStep(h.home, SNAP_REPO, { line: "command -v ffmpeg || true", reason: "video", now: h.clock.now });
+  assert.match((await h.api("/status")).snapshots[0].stale, /setup script changed/);
+  await h.advance(5);
+  assert.equal(h.lizard.snapshots.length, 1, "a rebuild waits 30 minutes after the last build");
+  await h.advance(30);
+  await h.daemon.settled();
+  assert.equal(h.lizard.snapshots.length, 2, "rebuilt");
+  assert.equal(h.daemon.state.snapshots![`${SNAP_REPO}|small`].id, "snap-2");
+  assert.deepEqual(h.lizard.deletedSnapshots, ["snap-1"]);
+  assert.equal((await h.api("/status")).snapshots[0].stale, undefined);
+});
+
+test("a snapshot that cannot be used is dropped and the machine is not lost: the next one starts the long way", async (t) => {
+  const h = await harness(t, { sizes: [{ size: "small", max: 4 }], defaultSize: "small" });
+  await h.api("/bake", { repo: REPO, size: "small" });
+  await h.daemon.settled();
+  h.lizard.snapshotCreateError = new Error("snapshot snap-1 not found");
+  const t0 = await h.api("/acquire", { repo: REPO, ref: "main", holder: "a" });
+  await h.daemon.settled();
+  assert.equal(h.daemon.state.snapshots![`${SNAP_REPO}|small`], undefined, "the broken snapshot is forgotten");
+  assert.equal(h.daemon.state.createsPausedUntil, undefined, "creates are not paused for it");
+  await h.advance(1);
+  await h.daemon.settled();
+  const granted = await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 1 });
+  assert.equal(granted.status, "granted");
+  assert.match(h.logs.join("\n"), /snapshot snap-1 of github.com\/Acme\/app could not be used and is dropped/);
+});

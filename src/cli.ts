@@ -24,6 +24,8 @@ const USAGE = `t3lizard: a pool of Lizard cloud machines running T3 Code, per re
                                            the content is never logged or echoed
   t3lizard renew <leaseId>                 push the lease expiry out by leaseMinutes
   t3lizard status                          pools, queues, leases, budget
+  t3lizard bake <repo> [size]              build the repo's snapshot (new machines start from it)
+  t3lizard snapshots                       list snapshots, and whether each needs a rebuild
   t3lizard close <machineId>               close one machine now
   t3lizard connect [machineId]            pairing links to open a machine's threads in your T3 app
   t3lizard doctor                          check config, secrets and the daemon
@@ -189,6 +191,15 @@ export async function main(argv: string[]): Promise<number> {
       if (!r.links?.length) console.log(r.note ?? "no linked machines");
       for (const l of r.links ?? []) console.log(`${l.label}\n  ${l.url}\n`);
       if (r.links?.length) console.log("Open a link, or paste it into T3: Settings → Connections → Add environment.");
+      return 0;
+    }
+    case "bake":
+      need(1);
+      print(await call(socket, "POST", "/bake", { repo: args[0], ...(args[1] ? { size: args[1] } : {}) }));
+      return 0;
+    case "snapshots": {
+      const s = await call(socket, "GET", "/status");
+      print({ snapshots: s.snapshots, ...(s.baking ? { baking: s.baking } : {}), ...(s.lastBake ? { lastBake: s.lastBake } : {}) });
       return 0;
     }
     case "close":
