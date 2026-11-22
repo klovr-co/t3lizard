@@ -183,3 +183,28 @@ test("an admin-disabled account is a limit notice that is marked disabled", () =
   assert.equal(isDisabledNotice(text), true);
   assert.equal(isDisabledNotice(NOTICE), false);
 });
+
+test("configure-antigravity writes the hashed OAuth profile, enables Antigravity, sets defaultModelSelection, and preserves Claude instances", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t3lizard-ag-"));
+  const accountsFile = join(dir, "accounts.json");
+  writeFileSync(accountsFile, JSON.stringify([{ id: "claudeAgent_acct1", token: "tok-1" }]));
+  main(["configure", accountsFile], { T3LIZARD_T3_BASE_DIR: join(dir, ".t3") });
+
+  const agFile = join(dir, "antigravity.json");
+  const tokenJson = JSON.stringify({ token: { access_token: "a", refresh_token: "r", token_type: "Bearer" }, auth_method: "consumer" });
+  writeFileSync(agFile, JSON.stringify({ instanceId: "antigravity", token: tokenJson, defaultModel: "gemini-4-neon", makeDefault: true }));
+  main(["configure-antigravity", agFile], { T3LIZARD_T3_BASE_DIR: join(dir, ".t3") });
+
+  assert.throws(() => readFileSync(agFile), "the input config file is removed");
+  const hash = createHash("sha256").update("antigravity").digest("hex");
+  const appDir = join(dir, ".t3", "userdata", "providers", "antigravity", hash, "antigravity-acp");
+  assert.equal(readFileSync(join(appDir, "antigravity-oauth-token"), "utf8"), tokenJson);
+  assert.equal(statSync(join(appDir, "antigravity-oauth-token")).mode & 0o777, 0o600);
+  assert.deepEqual(JSON.parse(readFileSync(join(appDir, "settings.json"), "utf8")), { auth: { type: "oauth-personal" } });
+  assert.deepEqual(JSON.parse(readFileSync(join(appDir, "cache", "acp-auth-state.json"), "utf8")), { methodId: "oauth-personal" });
+
+  const s = JSON.parse(readFileSync(join(dir, ".t3", "userdata", "settings.json"), "utf8"));
+  assert.deepEqual(s.providerInstances.antigravity, { driver: "antigravity", displayName: "Antigravity", enabled: true });
+  assert.deepEqual(s.defaultModelSelection, { instanceId: "antigravity", model: "gemini-4-neon" });
+  assert.equal(s.providerInstances.claudeAgent_acct1.enabled, true, "Claude instances are preserved");
+});

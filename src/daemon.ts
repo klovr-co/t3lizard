@@ -29,15 +29,19 @@ const UNRESPONSIVE_CLOSE_MS = 10 * MINUTE;
 const LIMIT_SCAN_EVERY_MS = MINUTE;
 /** Allowed difference between the machine's clock and the devbox's. */
 const CLOCK_SKEW_MS = MINUTE;
+const ANTIGRAVITY_INSTANCE = "antigravity";
+const DEFAULT_ANTIGRAVITY_MODEL = "gemini-4-neon";
 
 export interface DaemonDeps {
   lizard: Lizard;
   t3: LocalT3;
   config: Config;
-  /** Values written to the machine's env file (config.forwardEnv). Never a Claude account token. */
+  /** Values written to the machine's env file (config.forwardEnv). Never a Claude/Antigravity token. */
   machineEnv: Record<string, string>;
   /** Token of each account in config.accounts. Goes only into that account's T3 provider instance. */
   accountTokens: Record<AccountId, string>;
+  /** Antigravity OAuth token JSON. Written only to Antigravity's profile directory on each machine. */
+  antigravityToken?: string;
   home: string;
   resolveRepo(input: string): Promise<RepoKey>;
   now(): number;
@@ -62,8 +66,12 @@ export type LeaseView = {
   projectId: string;
   workspacePath: string;
   expiresAt: string;
-  /** The Claude account to delegate to: the first one not limited, else the one that frees first. */
+  /** The provider instance to delegate to (Antigravity by default when configured, else a Claude account). */
   providerInstanceId?: AccountId;
+  /** Default model to pass with providerInstanceId (e.g. "gemini-4-neon" for Antigravity). */
+  model?: string;
+  /** Free Claude account to use when explicitly delegating to Claude instead of Antigravity. */
+  claudeProviderInstanceId?: AccountId;
 };
 
 export type TicketView =
@@ -440,6 +448,7 @@ export class Daemon {
         deadlineInMinutes: minutes(m.deadline - now),
         environmentId: m.environmentId,
         label: machineLabel(m.repo, m.id, m.size),
+        ...(m.antigravity ? { antigravity: true } : {}),
         ...(m.unresponsiveSince ? { notAnswering: `no answer since ${minutes(now - m.unresponsiveSince)} min ago (likely out of memory)` } : {}),
         ...(m.limitedThreads?.length ? { limitedThreads: m.limitedThreads } : {}),
         ...this.waitView(m, now),
@@ -474,6 +483,11 @@ export class Daemon {
       perRepoCap: config.perRepoCap,
       createsBlocked: createBlock(this.state, now, config),
       lastLizardError: this.state.lastLizardError,
+      antigravityConfigured: Boolean(this.deps.antigravityToken),
+      defaultProvider: this.deps.antigravityToken ? (config.defaultProvider ?? "antigravity") : "claude",
+      ...(this.deps.antigravityToken && (config.defaultProvider ?? "antigravity") === "antigravity"
+        ? { defaultModel: config.defaultModel ?? DEFAULT_ANTIGRAVITY_MODEL }
+        : {}),
       accounts: config.accounts.map((id) => {
         const until = this.state.accounts?.[id]?.limitedUntil;
         return { id, free: !accountLimited(this.state, id, now), ...(until && until > now ? { limitedUntil: new Date(until).toISOString() } : {}), ...(until && until > now && this.state.accounts?.[id]?.disabled ? { disabled: true } : {}) };
@@ -489,6 +503,7 @@ export class Daemon {
       const m = lease && this.state.machines[lease.machineId];
       const account = m && this.accountFor(m);
       if (!lease || !m?.environmentId || !m.projectId || !m.workspacePath) return { ticketId, status: "released" };
+      const useAntigravity = Boolean(m.antigravity) && (this.deps.config.defaultProvider ?? "antigravity") === "antigravity";
       return {
         ticketId,
         status: "granted",
@@ -500,7 +515,15 @@ export class Daemon {
           projectId: m.projectId,
           workspacePath: m.workspacePath,
           expiresAt: new Date(lease.expiresAt).toISOString(),
-          ...(account ? { providerInstanceId: account } : {}),
+          ...(useAntigravity
+            ? {
+                providerInstanceId: ANTIGRAVITY_INSTANCE,
+                model: this.deps.config.defaultModel ?? DEFAULT_ANTIGRAVITY_MODEL,
+                ...(account ? { claudeProviderInstanceId: account } : {}),
+              }
+            : account
+              ? { providerInstanceId: account }
+              : {}),
         },
       };
     }
@@ -606,9 +629,26 @@ export class Daemon {
       if (m?.phase.kind === "installing") {
         this.t3Version ??= await this.deps.t3.version();
         const accounts = this.accounts();
-        await install(this.remote, id, this.deps.machineEnv, this.t3Version, accounts, { label: machineLabel(m.repo, id, m.size), size: m.size });
-        at("installing").accounts = accounts.map((a) => a.id);
-        this.setPhase(at("installing"), { kind: "linking" });
+        const antigravity = this.deps.antigravityToken
+          ? {
+              token: this.deps.antigravityToken,
+              defaultModel: this.deps.config.defaultModel ?? DEFAULT_ANTIGRAVITY_MODEL,
+              makeDefault: (this.deps.config.defaultProvider ?? "antigravity") === "antigravity",
+            }
+          : undefined;
+        await install(
+          this.remote,
+          id,
+          this.deps.machineEnv,
+          this.t3Version,
+          accounts,
+          { label: machineLabel(m.repo, id, m.size), size: m.size },
+          antigravity,
+        );
+        const installed = at("installing");
+        installed.accounts = accounts.map((a) => a.id);
+        if (antigravity) installed.antigravity = true;
+        this.setPhase(installed, { kind: "linking" });
       }
       m = at("linking");
       if (!m.workspacePath || !m.projectId) {

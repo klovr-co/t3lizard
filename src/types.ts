@@ -58,6 +58,9 @@ export type MachinePhase =
   | { kind: "closing" }
   | { kind: "failed"; error: string };
 
+/** Default provider handed out on leases and set as T3's default on new machines. */
+export type DefaultProvider = "antigravity" | "claude";
+
 /**
  * A Claude account. Each one is a T3 provider instance on every machine (`claudeAgent_acct<N>`)
  * that holds only that account's token, so the id is the provider instance id.
@@ -103,6 +106,8 @@ export interface Machine {
    * the secrets later is not on it. Missing on machines from before this field: all accounts.
    */
   accounts?: AccountId[];
+  /** True when Antigravity (agy binary + OAuth token) was installed and configured on this machine. */
+  antigravity?: boolean;
   /** Threads that hit a usage limit and wait to continue on another account. From the last scan. */
   limitedThreads?: LimitedThread[];
   /** Runs already continued on another account, so a scan that raced the continue never repeats it. */
@@ -216,6 +221,10 @@ export interface Config {
   dashboardPort: number;
   publicBind?: string[];
   publicHost?: string;
+  /** Which provider new leases default to when Antigravity is configured. */
+  defaultProvider?: DefaultProvider;
+  /** Model handed out on leases and set as T3's default when defaultProvider is antigravity. */
+  defaultModel?: string;
   /** Claude accounts in order. Not a config file key: one per CLAUDE_CODE_OAUTH_TOKEN[_N] secret. */
   accounts: AccountId[];
 }

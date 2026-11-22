@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_CONFIG, loadConfig, loadSecrets, parseConfig } from "../src/config.ts";
+import { antigravityTokenFromSecrets, DEFAULT_CONFIG, isAccountTokenKey, loadConfig, loadSecrets, parseConfig } from "../src/config.ts";
 
 test("the default ladder is the trial's 1 small and 2 mini; nano is left out", () => {
   assert.deepEqual(DEFAULT_CONFIG.sizes, [{ size: "small", max: 1 }, { size: "mini", max: 2 }]);
@@ -43,4 +43,18 @@ test("loadSecrets reads the environment, and the environment wins over secrets.e
   assert.deepEqual(loadSecrets(home, { LIZARD_API_KEY: "env" }), { LIZARD_API_KEY: "env" });
   writeFileSync(join(home, "secrets.env"), "LIZARD_API_KEY=file\nGH_TOKEN=file\n");
   assert.deepEqual(loadSecrets(home, { LIZARD_API_KEY: "env" }), { LIZARD_API_KEY: "env", GH_TOKEN: "file" });
+});
+
+test("antigravityTokenFromSecrets accepts raw JSON and base64, rejects malformed values, and is never forwarded as env", () => {
+  const raw = JSON.stringify({ token: { access_token: "a", refresh_token: "r" }, auth_method: "consumer" });
+  const b64 = Buffer.from(raw).toString("base64");
+  assert.equal(antigravityTokenFromSecrets({}), undefined);
+  assert.equal(antigravityTokenFromSecrets({ ANTIGRAVITY_OAUTH_TOKEN: raw }), raw);
+  assert.equal(antigravityTokenFromSecrets({ ANTIGRAVITY_OAUTH_TOKEN: b64 }), raw);
+  assert.throws(() => antigravityTokenFromSecrets({ ANTIGRAVITY_OAUTH_TOKEN: "not-json" }), /valid JSON/);
+  assert.throws(() => antigravityTokenFromSecrets({ ANTIGRAVITY_OAUTH_TOKEN: "{}" }), /missing its "token" field/);
+  assert.equal(isAccountTokenKey("ANTIGRAVITY_OAUTH_TOKEN"), true);
+  const cfg = parseConfig({ project: "p", defaultProvider: "antigravity", defaultModel: "gemini-4-neon" });
+  assert.equal(cfg.defaultProvider, "antigravity");
+  assert.equal(cfg.defaultModel, "gemini-4-neon");
 });

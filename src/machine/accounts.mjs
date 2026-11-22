@@ -1,6 +1,7 @@
 // t3lizard account helper. Runs on the machine; plain JS with node: modules only.
 //
 //   node accounts.mjs configure <accounts.json>   one claudeAgent_acct<N> provider instance per account
+//   node accounts.mjs configure-antigravity <file> enable Antigravity with OAuth token and optional default
 //   node accounts.mjs scan                         JSON: threads whose latest run failed on a usage limit
 //   node accounts.mjs busy                         JSON: threads still working, sub-agents included
 //   node accounts.mjs export <sinceIso> <outDir>   threads updated since then, with messages, as JSON files
@@ -21,6 +22,8 @@ import { promisify } from "node:util";
 const run = promisify(execFile);
 
 export const CONTINUE_MESSAGE = "Continue where you left off.";
+export const ANTIGRAVITY_INSTANCE = "antigravity";
+export const DEFAULT_ANTIGRAVITY_MODEL = "gemini-4-neon";
 const ACCOUNT_INSTANCE = /^claudeAgent_acct\d+$/;
 /**
  * T3's limit notice ("Claude usage limit reached. This turn is paused until ...") or Claude's own
@@ -51,6 +54,22 @@ export function applyAccounts(settings, accounts) {
   return { ...settings, providerInstances: instances, autoResumeLimitedThreads: false };
 }
 
+/** Settings with the Antigravity provider instance enabled, and optionally set as T3's default model. */
+export function applyAntigravity(settings, { instanceId = ANTIGRAVITY_INSTANCE, defaultModel = DEFAULT_ANTIGRAVITY_MODEL, makeDefault = true } = {}) {
+  const instances = { ...settings.providerInstances };
+  instances[instanceId] = {
+    ...instances[instanceId],
+    driver: "antigravity",
+    displayName: "Antigravity",
+    enabled: true,
+  };
+  return {
+    ...settings,
+    providerInstances: instances,
+    ...(makeDefault ? { defaultModelSelection: { instanceId, model: defaultModel } } : {}),
+  };
+}
+
 /** The limit message among a run's timeline items, if the run failed on a usage limit. */
 export function limitNotice(runId, items) {
   const hit = items.find((i) => i.runId === runId && LIMIT_TEXT.test(`${i.title ?? ""}\n${i.text ?? ""}`));
@@ -72,6 +91,28 @@ export function configure(baseDir, accountsFile) {
   } catch {}
   writePrivate(settingsFile, JSON.stringify(applyAccounts(settings, JSON.parse(readFileSync(accountsFile, "utf8"))), null, 2));
   rmSync(accountsFile, { force: true });
+}
+
+export function configureAntigravity(baseDir, configFile) {
+  const cfg = JSON.parse(readFileSync(configFile, "utf8"));
+  const instanceId = cfg.instanceId || ANTIGRAVITY_INSTANCE;
+  const defaultModel = cfg.defaultModel || DEFAULT_ANTIGRAVITY_MODEL;
+  const makeDefault = cfg.makeDefault !== false;
+  const key = createHash("sha256").update(instanceId).digest("hex");
+  const appDir = join(baseDir, "userdata", "providers", "antigravity", key, "antigravity-acp");
+  mkdirSync(join(appDir, "cache"), { recursive: true, mode: 0o700 });
+  const tokenText = typeof cfg.token === "string" ? cfg.token : JSON.stringify(cfg.token);
+  writePrivate(join(appDir, "antigravity-oauth-token"), tokenText);
+  writePrivate(join(appDir, "settings.json"), JSON.stringify({ auth: { type: "oauth-personal" } }));
+  writePrivate(join(appDir, "cache", "acp-auth-state.json"), JSON.stringify({ methodId: "oauth-personal" }));
+
+  const settingsFile = join(baseDir, "userdata", "settings.json");
+  let settings = {};
+  try {
+    settings = JSON.parse(readFileSync(settingsFile, "utf8"));
+  } catch {}
+  writePrivate(settingsFile, JSON.stringify(applyAntigravity(settings, { instanceId, defaultModel, makeDefault }), null, 2));
+  rmSync(configFile, { force: true });
 }
 
 async function postJson(url, body, headers = {}) {
@@ -262,11 +303,12 @@ export async function main(argv, env = process.env) {
   };
   const [cmd, ...args] = argv;
   if (cmd === "configure") return configure(baseDir, args[0]);
+  if (cmd === "configure-antigravity") return configureAntigravity(baseDir, args[0]);
   if (cmd === "scan") return { limited: await scan(await connect(opts)) };
   if (cmd === "continue") return continueThread(await connect(opts), args[0], args[1], args[2]);
   if (cmd === "busy") return { busy: await busy(await connect(opts)) };
   if (cmd === "export") return { written: await exportThreads(await connect(opts), args[0], args[1]) };
-  throw new Error(`usage: accounts.mjs configure <file> | scan | continue <thread> <run> <account>`);
+  throw new Error(`usage: accounts.mjs configure <file> | configure-antigravity <file> | scan | continue <thread> <run> <account>`);
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {

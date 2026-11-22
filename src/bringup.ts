@@ -64,6 +64,28 @@ if [ -z "$cur_claude" ] || [ "$(printf '%s\n%s\n' "$min_claude" "$cur_claude" | 
 fi
 command -v codex >/dev/null || npm_g @openai/codex || echo "codex install failed, continuing"
 
+if [ "\${2:-0}" = "1" ] && ! command -v agy >/dev/null 2>&1; then
+  echo "installing antigravity"
+  ag_arch=amd64
+  if [ "$(uname -m)" = aarch64 ]; then ag_arch=arm64; fi
+  ag_manifest="$(curl -fsSL "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_\${ag_arch}.json")"
+  ag_url="$(node -e 'console.log(JSON.parse(process.argv[1]).url)' "$ag_manifest")"
+  ag_sha="$(node -e 'console.log(JSON.parse(process.argv[1]).sha512.toLowerCase())' "$ag_manifest")"
+  mkdir -p "$HOME/.local/bin"
+  curl -fsSL "$ag_url" -o "$D/antigravity.tar.gz"
+  got_sha="$(node -e 'const c=require("crypto"),fs=require("fs");const h=c.createHash("sha512");fs.createReadStream(process.argv[1]).on("data",d=>h.update(d)).on("end",()=>console.log(h.digest("hex")))' "$D/antigravity.tar.gz")"
+  if [ "$got_sha" != "$ag_sha" ]; then
+    rm -f "$D/antigravity.tar.gz"
+    echo "antigravity sha512 mismatch: got $got_sha expected $ag_sha" >&2
+    exit 1
+  fi
+  tar -xOzf "$D/antigravity.tar.gz" antigravity > "$HOME/.local/bin/antigravity.tmp"
+  chmod 755 "$HOME/.local/bin/antigravity.tmp"
+  mv "$HOME/.local/bin/antigravity.tmp" "$HOME/.local/bin/antigravity"
+  ln -sf antigravity "$HOME/.local/bin/agy"
+  rm -f "$D/antigravity.tar.gz"
+fi
+
 mkdir -p "$HOME/.t3/userdata"
 node -e '
 const fs = require("fs"); const f = process.argv[1];
@@ -75,7 +97,7 @@ fs.writeFileSync(f + ".tmp", JSON.stringify(s, null, 2)); fs.renameSync(f + ".tm
 git config --global credential.helper '!f() { test "$1" = get && echo username=x-access-token && echo "password=$GH_TOKEN"; }; f'
 
 rm -f "$D/install.failed"
-echo "$V" > "$D/install.done"
+echo "$V\${2:+:ag=$2}" > "$D/install.done"
 echo "install done"
 `;
 
@@ -241,9 +263,15 @@ export interface Account {
   token: string;
 }
 
+export interface AntigravityConfig {
+  token: string;
+  defaultModel?: string;
+  makeDefault?: boolean;
+}
+
 /**
- * Steps 1-3: secrets, install, Claude accounts, `t3 serve` supervisor. Each step converges when re-run.
- * Account tokens never go to the env file: each lives only in its own T3 provider instance.
+ * Steps 1-3: secrets, install, Claude/Antigravity accounts, `t3 serve` supervisor. Each step converges when re-run.
+ * Account tokens never go to the env file: each lives only in its own T3 provider instance or profile.
  */
 export async function install(
   r: Remote,
@@ -252,6 +280,7 @@ export async function install(
   t3Version: string,
   accounts: Account[],
   machine: { label: string; size: string } = { label: id, size: "small" },
+  antigravity?: AntigravityConfig,
 ): Promise<void> {
   await run(r, id, script("preflight", PREFLIGHT_SH));
   await writeFile(r, id, "env", envFile(secrets), "600");
@@ -261,19 +290,23 @@ export async function install(
   await writeFile(r, id, "accounts.mjs", ACCOUNTS_JS, "600");
   await writeFile(r, id, "guard.sh", GUARD_SH, "755");
 
+  const agFlag = antigravity ? "1" : "";
+  const doneKey = antigravity ? `${t3Version}:ag=1` : t3Version;
   await run(
     r,
     id,
     script(
       "install-start",
-      'rm -f "$D/install.failed"\nif ! grep -qxF "$1" "$D/install.done" 2>/dev/null; then setsid nohup bash "$D/install.sh" "$1" > "$D/install.log" 2>&1 < /dev/null & fi',
+      'rm -f "$D/install.failed"\nif ! grep -qxF "$3" "$D/install.done" 2>/dev/null; then setsid nohup bash "$D/install.sh" "$1" "$2" > "$D/install.log" 2>&1 < /dev/null & fi',
       t3Version,
+      agFlag,
+      doneKey,
     ),
   );
   const poll = script(
     "install-poll",
     'if grep -qxF "$1" "$D/install.done" 2>/dev/null; then echo done\nelif [ -f "$D/install.failed" ]; then echo failed; tail -n 30 "$D/install.log"\nelse echo running; fi',
-    t3Version,
+    doneKey,
   );
   await pollUntil(r, INSTALL_TIMEOUT_MS, 10_000, async () => {
     const out = (await run(r, id, poll)).stdout;
@@ -284,6 +317,21 @@ export async function install(
   if (accounts.length) {
     await writeFile(r, id, "accounts.json", JSON.stringify(accounts), "600");
     await run(r, id, script("accounts", 'node "$D/accounts.mjs" configure "$D/accounts.json"'));
+  }
+  if (antigravity) {
+    await writeFile(
+      r,
+      id,
+      "antigravity.json",
+      JSON.stringify({
+        instanceId: "antigravity",
+        token: antigravity.token,
+        ...(antigravity.defaultModel ? { defaultModel: antigravity.defaultModel } : {}),
+        makeDefault: antigravity.makeDefault !== false,
+      }),
+      "600",
+    );
+    await run(r, id, script("antigravity", 'node "$D/accounts.mjs" configure-antigravity "$D/antigravity.json"'));
   }
   // Before serve-start: T3 reads its label once, when it starts.
   const prep = await r.lizard.exec(id, script("prep", PREP_SH, machine.label, String(SWAP_MB[machine.size] ?? 2048)), 300_000);

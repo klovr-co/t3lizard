@@ -3,7 +3,7 @@ import { hostname, userInfo } from "node:os";
 import { parseArgs } from "node:util";
 import { call, serveApi } from "./api.ts";
 import { startDashboard } from "./dashboard.ts";
-import { accountsFromSecrets, isAccountTokenKey, loadConfig, loadSecrets, paths, t3lizardHome } from "./config.ts";
+import { accountsFromSecrets, antigravityTokenFromSecrets, isAccountTokenKey, loadConfig, loadSecrets, paths, t3lizardHome } from "./config.ts";
 import { Daemon } from "./daemon.ts";
 import type { DaemonDeps } from "./daemon.ts";
 import { realLizard } from "./lizard.ts";
@@ -63,10 +63,11 @@ async function realDaemon(home: string): Promise<void> {
   mkdirSync(home, { recursive: true, mode: 0o700 });
   const secrets = loadSecrets(home);
   const accounts = accountsFromSecrets(secrets);
+  const antigravityToken = antigravityTokenFromSecrets(secrets);
   const config = { ...loadConfig(home), accounts: accounts.map((a) => a.id) };
   if (!secrets.LIZARD_API_KEY) throw new Error(`LIZARD_API_KEY missing from the environment and ${paths(home).secrets}`);
   if (!config.project) throw new Error(`"project" (the Lizard project id) missing from ${paths(home).config}`);
-  // Claude tokens never go machine-wide: each lives only in its own account's T3 provider instance.
+  // Provider tokens never go machine-wide: each lives only in its own T3 provider instance or profile.
   const machineEnv = Object.fromEntries(config.forwardEnv.flatMap((k) => (secrets[k] && !isAccountTokenKey(k) ? [[k, secrets[k]]] : [])));
   await runDaemon({
     lizard: realLizard({ apiKey: secrets.LIZARD_API_KEY, projectId: config.project, user: config.sandboxUser, template: config.template }),
@@ -74,6 +75,7 @@ async function realDaemon(home: string): Promise<void> {
     config,
     machineEnv,
     accountTokens: Object.fromEntries(accounts.map((a) => [a.id, a.token])),
+    ...(antigravityToken ? { antigravityToken } : {}),
     home,
     resolveRepo,
     now: Date.now,
@@ -109,6 +111,13 @@ async function doctor(home: string): Promise<string[]> {
     const accounts = accountsFromSecrets(loadSecrets(home));
     if (!accounts.length) throw new Error(`no CLAUDE_CODE_OAUTH_TOKEN or CLAUDE_CODE_OAUTH_TOKEN_<N> in the environment or ${p.secrets}`);
     return accounts.map((a) => a.id).join(", ");
+  });
+  await check("antigravity", () => {
+    const tok = antigravityTokenFromSecrets(loadSecrets(home));
+    if (!tok) return "not configured (set ANTIGRAVITY_OAUTH_TOKEN to enable)";
+    const c = loadConfig(home);
+    const isDefault = (c.defaultProvider ?? "antigravity") === "antigravity";
+    return isDefault ? `enabled, default (${c.defaultModel ?? "gemini-4-neon"})` : "enabled (default provider is claude)";
   });
   await check("local t3", () => realLocalT3().version());
   await check("daemon", async () => {

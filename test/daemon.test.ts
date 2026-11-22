@@ -18,7 +18,12 @@ import { FakeLizard, FakeT3, noSleep } from "./fakes.ts";
 const MIN = 60_000;
 const REPO = "git@github.com:Acme/app.git";
 
-async function harness(t: { after(fn: () => unknown): void }, overrides: Partial<Config> = {}, shared?: { home: string; lizard: FakeLizard; t3: FakeT3; clock: { now: number } }) {
+async function harness(
+  t: { after(fn: () => unknown): void },
+  overrides: Partial<Config> = {},
+  shared?: { home: string; lizard: FakeLizard; t3: FakeT3; clock: { now: number } },
+  extra?: { antigravityToken?: string },
+) {
   const home = shared?.home ?? mkdtempSync(join(tmpdir(), "t3lizard-daemon-"));
   const clock = shared?.clock ?? { now: Date.parse("2026-11-19T12:00:00Z") };
   const lizard = shared?.lizard ?? new FakeLizard(() => clock.now);
@@ -31,6 +36,7 @@ async function harness(t: { after(fn: () => unknown): void }, overrides: Partial
     config,
     machineEnv: { GH_TOKEN: "gh-secret" },
     accountTokens: Object.fromEntries(config.accounts.map((a) => [a, `token-of-${a}`])),
+    ...(extra?.antigravityToken ? { antigravityToken: extra.antigravityToken } : {}),
     home,
     resolveRepo: async (r) => normalizeOrigin(r),
     now: () => clock.now,
@@ -491,4 +497,26 @@ test("a released lease saves its machine's chats on the devbox and the pool page
   assert.match(page, /Run the gate/);
   assert.match(page, /brief &lt;b&gt;/);
   assert.equal((await fetch("http://127.0.0.1:47398/chat?f=../secrets.env")).status, 400);
+});
+
+test("when Antigravity is configured, new machines install it and leases default to Antigravity while exposing a Claude fallback", async (t) => {
+  const agToken = JSON.stringify({ token: { access_token: "a", refresh_token: "r" }, auth_method: "consumer" });
+  const h = await harness(t, { accounts: ["claudeAgent_acct1"], defaultProvider: "antigravity", defaultModel: "gemini-4-neon" }, undefined, { antigravityToken: agToken });
+  const t0 = await h.api("/acquire", { repo: REPO, ref: "main", holder: "ag-test" });
+  await h.daemon.settled();
+  const granted = await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 1 });
+  assert.equal(granted.status, "granted");
+  assert.equal(granted.lease.providerInstanceId, "antigravity");
+  assert.equal(granted.lease.model, "gemini-4-neon");
+  assert.equal(granted.lease.claudeProviderInstanceId, "claudeAgent_acct1");
+
+  const m = h.lizard.machines.get("sb-1")!;
+  assert.ok(m.steps.includes("antigravity"));
+  assert.equal(JSON.parse(m.files.get("antigravity.json")!.content).token, agToken);
+
+  const status = await h.api("/status");
+  assert.equal(status.antigravityConfigured, true);
+  assert.equal(status.defaultProvider, "antigravity");
+  assert.equal(status.defaultModel, "gemini-4-neon");
+  assert.equal(status.pools["github.com/Acme/app"].machines[0].antigravity, true);
 });

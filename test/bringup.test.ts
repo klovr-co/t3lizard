@@ -33,6 +33,28 @@ test("install writes the secrets file with mode 600, waits for the install, then
   assert.deepEqual(m.steps.slice(-3), ["serve-start", "health", "health"]);
 });
 
+test("install configures Antigravity before serve-start when provided", async () => {
+  const { r, id, m } = await machine();
+  const tok = JSON.stringify({ token: { access_token: "a", refresh_token: "r" }, auth_method: "consumer" });
+  await install(
+    r,
+    id,
+    { GH_TOKEN: "x" },
+    "0.1.12",
+    [{ id: "claudeAgent_acct1", token: "tok-1" }],
+    { label: id, size: "small" },
+    { token: tok, defaultModel: "gemini-4-neon", makeDefault: true },
+  );
+  assert.deepEqual(
+    JSON.parse(m.files.get("antigravity.json")!.content),
+    { instanceId: "antigravity", token: tok, defaultModel: "gemini-4-neon", makeDefault: true },
+  );
+  assert.equal(m.files.get("antigravity.json")!.mode, "600");
+  assert.ok(m.steps.indexOf("antigravity") > 0);
+  assert.ok(m.steps.indexOf("antigravity") < m.steps.indexOf("serve-start"), "Antigravity is configured before T3 starts");
+  assert.match(m.files.get("install.sh")!.content, /antigravity-cli-auto-updater/);
+});
+
 test("install reports the log when the install script failed", async () => {
   const { r, id } = await machine();
   r.lizard.on["install-poll"] = () => ({ stdout: "failed\ncurl: (6) Could not resolve host\n", stderr: "", exitCode: 0 });

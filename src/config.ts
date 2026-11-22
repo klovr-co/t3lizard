@@ -90,6 +90,8 @@ const ConfigFile = z
     publicBind: z.array(z.string().min(1)),
     /** The name a browser uses for those addresses, e.g. devbox.tailnet.ts.net. Used in `t3lizard connect` links. */
     publicHost: z.string().min(1),
+    defaultProvider: z.enum(["antigravity", "claude"]),
+    defaultModel: z.string().min(1),
   })
   .partial()
   .strict();
@@ -159,9 +161,30 @@ export function loadSecrets(home: string, env: NodeJS.ProcessEnv = process.env):
 }
 
 const ACCOUNT_TOKEN = /^CLAUDE_CODE_OAUTH_TOKEN(?:_([1-9]\d*))?$/;
+const ANTIGRAVITY_TOKEN = /^ANTIGRAVITY_OAUTH_TOKEN$/;
 
-/** True for CLAUDE_CODE_OAUTH_TOKEN and CLAUDE_CODE_OAUTH_TOKEN_<N>: these never go to a machine's env file. */
-export const isAccountTokenKey = (key: string) => ACCOUNT_TOKEN.test(key);
+/** True for provider auth tokens (Claude / Antigravity): these never go to a machine's env file. */
+export const isAccountTokenKey = (key: string) => ACCOUNT_TOKEN.test(key) || ANTIGRAVITY_TOKEN.test(key);
+
+/**
+ * Antigravity OAuth token JSON from ANTIGRAVITY_OAUTH_TOKEN (either raw JSON or base64-encoded JSON).
+ * Returns the canonical JSON string, or undefined when not set.
+ */
+export function antigravityTokenFromSecrets(secrets: Record<string, string>): string | undefined {
+  const raw = secrets.ANTIGRAVITY_OAUTH_TOKEN?.trim();
+  if (!raw) return undefined;
+  const text = raw.startsWith("{") ? raw : Buffer.from(raw, "base64").toString("utf8").trim();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error("ANTIGRAVITY_OAUTH_TOKEN must be valid JSON (or base64-encoded JSON) from antigravity-oauth-token");
+  }
+  if (!parsed || typeof parsed !== "object" || !("token" in parsed)) {
+    throw new Error("ANTIGRAVITY_OAUTH_TOKEN JSON is missing its \"token\" field");
+  }
+  return text;
+}
 
 /**
  * One Claude account per CLAUDE_CODE_OAUTH_TOKEN[_N] secret, in N order (no suffix is account 1).
