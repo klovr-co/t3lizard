@@ -884,3 +884,33 @@ test("a snapshot that cannot be used is dropped and the machine is not lost: the
   assert.equal(granted.status, "granted");
   assert.match(h.logs.join("\n"), /snapshot snap-1 of github.com\/Acme\/app could not be used and is dropped/);
 });
+
+test("snapshots follow the size a repo gets: a missing one is built by itself, and extra sizes are deleted", async (t) => {
+  const h = await harness(t, { sizes: [{ size: "large", max: 4 }, { size: "medium", max: 4 }, { size: "small", max: 4 }], defaultSize: "medium" });
+  await h.api("/bake", { repo: REPO, size: "medium" });
+  await h.daemon.settled();
+  await h.api("/bake", { repo: REPO, size: "large" }).catch(() => undefined);
+  h.clock.now += 31 * MIN;
+  await h.api("/bake", { repo: REPO, size: "large" });
+  await h.daemon.settled();
+  assert.deepEqual(Object.keys(h.daemon.state.snapshots!).sort(), [`${SNAP_REPO}|large`, `${SNAP_REPO}|medium`]);
+
+  // The repo's jobs fit a small: the pool now hands out small machines, so a small snapshot is built.
+  h.daemon.state.repoSize = { [SNAP_REPO]: { size: "small", why: "light jobs", at: h.clock.now } };
+  h.clock.now += 31 * MIN;
+  await h.advance(1);
+  await h.daemon.settled();
+  assert.ok(h.daemon.state.snapshots![`${SNAP_REPO}|small`], "the small snapshot exists");
+  // It keeps the size above (medium) for a job that runs out of memory; the large one is deleted.
+  assert.deepEqual(Object.keys(h.daemon.state.snapshots!).sort(), [`${SNAP_REPO}|medium`, `${SNAP_REPO}|small`]);
+  const largeId = h.lizard.snapshots.find((s) => s.name.includes("-large-"))!.id;
+  assert.ok(h.lizard.deletedSnapshots.includes(largeId));
+  assert.match(h.logs.join("\n"), /building the small snapshot of github.com\/Acme\/app: the repo gets this size now/);
+
+  // A machine for the repo now starts from the small snapshot.
+  const t0 = await h.api("/acquire", { repo: REPO, ref: "main", holder: "a" });
+  await h.daemon.settled();
+  await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 1 });
+  const small = h.daemon.state.snapshots![`${SNAP_REPO}|small`].id;
+  assert.ok([...h.lizard.createdFrom.values()].includes(small));
+});

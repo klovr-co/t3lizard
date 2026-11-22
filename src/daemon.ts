@@ -9,7 +9,7 @@ import type { Account, ExecView, Remote } from "./bringup.ts";
 import { paths } from "./config.ts";
 import { LizardLimitError, LizardPaymentError } from "./lizard.ts";
 import type { Lizard } from "./lizard.ts";
-import { learnSize, nextSizeUp, repoGaps, repoIdleMs, vcpuFree } from "./plan.ts";
+import { learnSize, nextSizeUp, repoGaps, repoIdleMs, repoLadder, vcpuFree } from "./plan.ts";
 import { accountLimited, accountWait, BRINGING_UP, BUDGET_UNIT, createBackoff, createBlock, machineAccounts, nextFreeAccount, plan, queueInfo, repoCreateBlock, sizesInUse, usedSmallHours, utcDay } from "./plan.ts";
 import { startProxy } from "./proxy.ts";
 import type { ProbeResult } from "./probe.ts";
@@ -826,6 +826,7 @@ export class Daemon {
       if (old && old.id !== snapshotId) {
         await this.deps.lizard.deleteSnapshot(old.id).catch((e) => this.deps.log(`old snapshot ${old.id} was not deleted: ${(e as Error).message}`));
       }
+      await this.pruneSnapshots(repo);
     } catch (e) {
       const message = (e as Error).message.slice(0, 600);
       this.state.lastBake = { at: this.deps.now(), repo, size, ok: false, message };
@@ -837,19 +838,55 @@ export class Daemon {
     }
   }
 
-  /** Rebuilds a stale snapshot when nobody is waiting for a machine of its repo and there is room. */
+  /** The size the pool will hand this repo next: its learned size, else the default, on its ladder. */
+  private wantedSize(repo: RepoKey): Size | undefined {
+    return repoLadder(this.state, this.deps.config, repo)[0]?.size;
+  }
+
+  /**
+   * Keeps what storage is paid for useful: a repo's snapshot of the size it gets now, and one size up
+   * (where a job that ran out of memory goes next). Others are deleted, as Lizard bills them by the day.
+   */
+  private async pruneSnapshots(repo: RepoKey): Promise<void> {
+    const want = this.wantedSize(repo);
+    if (!want || !this.state.snapshots?.[snapKey(repo, want)]) return;
+    const up = nextSizeUp(this.deps.config, want);
+    for (const [key, s] of Object.entries(this.state.snapshots)) {
+      if (s.repo !== repo || s.size === want || s.size === up) continue;
+      delete this.state.snapshots[key];
+      this.save();
+      await this.deps.lizard.deleteSnapshot(s.id).then(
+        () => this.deps.log(`snapshot ${s.id} of ${repo} (${s.size}) deleted: the repo gets ${want} now`),
+        (e) => this.deps.log(`snapshot ${s.id} was not deleted: ${(e as Error).message}`),
+      );
+    }
+  }
+
+  /**
+   * For each repo that has a snapshot: builds the one for the size it gets now when that is missing
+   * (its learned size changed), and rebuilds a stale one. Only when nobody waits for a machine of the
+   * repo and there is room, one build at a time, and not more often than every BAKE_RETRY_MS.
+   */
   private maintainSnapshots(): void {
     if (this.baking || !this.state.snapshots) return;
     const now = this.deps.now();
     const { config } = this.deps;
     if (createBlock(this.state, now, config)) return;
-    for (const [key, s] of Object.entries(this.state.snapshots)) {
-      if (!this.snapshotStale(s, now).stale) continue;
+    const wanted: { repo: RepoKey; size: Size; why: "missing" | "stale" }[] = [];
+    for (const repo of new Set(Object.values(this.state.snapshots).map((s) => s.repo))) {
+      const size = this.wantedSize(repo);
+      const have = size && this.state.snapshots[snapKey(repo, size)];
+      if (size && !have) wanted.push({ repo, size, why: "missing" });
+      else if (size && have && this.snapshotStale(have, now).stale) wanted.push({ repo, size, why: "stale" });
+    }
+    for (const w of wanted.sort((a, b) => (a.why === "missing" ? -1 : 1) - (b.why === "missing" ? -1 : 1))) {
+      const key = snapKey(w.repo, w.size);
       if (now - (this.lastBakeTry.get(key) ?? 0) < BAKE_RETRY_MS) continue;
-      if (this.state.tickets.some((t) => t.status === "queued" && t.repo === s.repo)) continue;
-      if (vcpuFree(config, sizesInUse(Object.values(this.state.machines))) < SIZE_VCPU[s.size]) continue;
+      if (this.state.tickets.some((t) => t.status === "queued" && t.repo === w.repo)) continue;
+      if (vcpuFree(config, sizesInUse(Object.values(this.state.machines))) < SIZE_VCPU[w.size]) continue;
       this.lastBakeTry.set(key, now);
-      this.bake({ repo: s.repo, size: s.size }).catch((e) => this.deps.log(`snapshot rebuild of ${s.repo} did not start: ${(e as Error).message}`));
+      this.deps.log(`building the ${w.size} snapshot of ${w.repo}: ${w.why === "missing" ? "the repo gets this size now" : "the old one is stale"}`);
+      this.bake({ repo: w.repo, size: w.size }).catch((e) => this.deps.log(`snapshot build of ${w.repo} did not start: ${(e as Error).message}`));
       return;
     }
   }
