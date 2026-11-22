@@ -18,6 +18,9 @@ const USAGE = `t3lizard: a pool of Lizard cloud machines running T3 Code, per re
   t3lizard wait <ticketId> [--max <seconds>]
                                            long-poll a queued ticket (at most 300 s)
   t3lizard release <leaseId|ticketId>      give a machine back, or stop waiting
+  t3lizard put <leaseId> <path> [--mode 600] < file
+                                           write stdin to a file under the machine's home (a login, an .env);
+                                           the content is never logged or echoed
   t3lizard renew <leaseId>                 push the lease expiry out by leaseMinutes
   t3lizard status                          pools, queues, leases, budget
   t3lizard close <machineId>               close one machine now
@@ -134,7 +137,7 @@ export async function main(argv: string[]): Promise<number> {
   const { positionals, values } = parseArgs({
     args: dashes >= 0 ? argv.slice(0, dashes) : argv,
     allowPositionals: true,
-    options: { holder: { type: "string" }, max: { type: "string" }, reason: { type: "string" }, help: { type: "boolean", short: "h" } },
+    options: { holder: { type: "string" }, max: { type: "string" }, mode: { type: "string" }, reason: { type: "string" }, help: { type: "boolean", short: "h" } },
   });
   const [cmd, ...args] = positionals;
   const home = t3lizardHome();
@@ -160,6 +163,14 @@ export async function main(argv: string[]): Promise<number> {
       need(1);
       const byLease = await call(socket, "POST", "/release", { leaseId: args[0] });
       print(byLease.released ? byLease : await call(socket, "POST", "/release", { ticketId: args[0] }).catch(() => byLease));
+      return 0;
+    }
+    case "put": {
+      need(2);
+      if (process.stdin.isTTY) throw new Error("pipe the file's content on stdin: t3lizard put <leaseId> <path> < file");
+      const chunks: Buffer[] = [];
+      for await (const c of process.stdin) chunks.push(c as Buffer);
+      print(await call(socket, "POST", "/put", { leaseId: args[0], path: args[1], contentBase64: Buffer.concat(chunks).toString("base64"), ...(values.mode ? { mode: values.mode } : {}) }));
       return 0;
     }
     case "renew":

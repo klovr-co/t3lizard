@@ -1,9 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ACCOUNTS_JS, busyThreads, configureFront, execPoll, execStart, FRONT_JS, install, pairAndLink, PREFLIGHT_SH, resetCheckout, runRepoSetup, setupProject } from "../src/bringup.ts";
+import { ACCOUNTS_JS, busyThreads, configureFront, execPoll, execStart, FRONT_JS, install, pairAndLink, PREFLIGHT_SH, putFile, resetCheckout, runRepoSetup, setupProject } from "../src/bringup.ts";
 import { realLocalT3 } from "../src/t3local.ts";
 import { FakeLizard, FakeT3, noSleep } from "./fakes.ts";
 
@@ -269,4 +270,39 @@ test("a running exec counts as work, so the lease cannot expire under it", async
   assert.equal(await busyThreads(r, id, "/home/user/app"), 1);
   r.lizard.execRunsFor = 0;
   assert.equal(await busyThreads(r, id, "/home/user/app"), 0);
+});
+
+test("putFile writes under the home folder in a real shell, with the mode, and never follows a link out", async () => {
+  const home = mkdtempSync(join(tmpdir(), "t3lizard-put-"));
+  const outside = mkdtempSync(join(tmpdir(), "t3lizard-out-"));
+  symlinkSync(outside, join(home, "escape"));
+  mkdirSync(join(home, "afolder"));
+  // Runs each machine script in bash on this machine, with HOME at the temp folder.
+  const lizard = new FakeLizard();
+  lizard.exec = async (_id, cmd) => {
+    try {
+      const stdout = execFileSync(cmd[0], cmd.slice(1), { env: { HOME: home, PATH: process.env.PATH }, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+      return { stdout, stderr: "", exitCode: 0 };
+    } catch (e) {
+      const x = e as { status: number; stdout: string; stderr: string };
+      return { stdout: x.stdout, stderr: x.stderr, exitCode: x.status };
+    }
+  };
+  const r = { lizard, sleep: noSleep };
+  const secret = "S3CRET-value\nline two\n";
+  const b64 = Buffer.from(secret).toString("base64");
+
+  const path = await putFile(r, "sb-1", ".config/test-org/secrets.env", b64, "600");
+  assert.equal(path, join(home, ".config/test-org/secrets.env"));
+  assert.equal(readFileSync(path, "utf8"), secret);
+  assert.equal(statSync(path).mode & 0o777, 0o600);
+  assert.equal(statSync(join(home, ".config/test-org")).mode & 0o777, 0o700, "new folders are private");
+
+  await putFile(r, "sb-1", ".config/test-org/secrets.env", Buffer.from("v2").toString("base64"), "640");
+  assert.equal(readFileSync(path, "utf8"), "v2");
+  assert.equal(statSync(path).mode & 0o777, 0o640);
+
+  await assert.rejects(putFile(r, "sb-1", "escape/x.env", b64, "600"), (e: Error) => /leaves the home folder/.test(e.message) && !e.message.includes(b64));
+  assert.throws(() => readFileSync(join(outside, "x.env")));
+  await assert.rejects(putFile(r, "sb-1", "afolder", b64, "600"), /is a folder/);
 });

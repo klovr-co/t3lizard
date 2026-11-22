@@ -97,6 +97,9 @@ export class FakeLizard implements Lizard, SandboxDirectory {
       case "write":
         m.files.set(args[0], { content: Buffer.from(args[1], "base64").toString(), mode: args[2] });
         return ok();
+      case "put":
+        m.files.set(`~/${args[0]}`, { content: Buffer.from(args[1], "base64").toString(), mode: args[2] });
+        return ok(`PATH=/home/user/${args[0]}\n`);
       case "install-poll":
         return ok("done\n");
       case "project":

@@ -150,6 +150,37 @@ function writeFile(r: Remote, id: MachineId, name: string, content: string, mode
   return run(r, id, script("write", body, name, Buffer.from(content).toString("base64"), mode));
 }
 
+/** Largest file `put` writes. The content travels base64 in one argument, and Linux caps one argument at 128 KB. */
+export const PUT_MAX_BYTES = 64 * 1024;
+
+/**
+ * Writes one file under the sandbox user's home, for a lease holder (`t3lizard put`). `rel` is relative
+ * to $HOME and already checked by the daemon; the script checks again after resolving symlinks, so a
+ * link cannot lead the write out of the home folder. The file is written to a temp file with umask
+ * 077, then given `mode` and moved into place. The content is never echoed. Prints the absolute path.
+ */
+export async function putFile(r: Remote, id: MachineId, rel: string, contentBase64: string, mode: string): Promise<string> {
+  const body = `umask 077
+home="$(realpath "$HOME")"
+dest="$home/$1"
+dir="$(realpath -m "$(dirname "$dest")")"
+case "$dir/" in "$home"/*) ;; *) echo "the path leaves the home folder" >&2; exit 3;; esac
+name="$(basename "$dest")"
+[ -d "$dir/$name" ] && { echo "the path is a folder" >&2; exit 3; }
+mkdir -p "$dir"
+tmp="$(mktemp "$dir/.t3lizard-put.XXXXXX")"
+trap 'rm -f "$tmp"' EXIT
+printf %s "$2" | base64 -d > "$tmp"
+chmod "$3" "$tmp"
+mv -f "$tmp" "$dir/$name"
+trap - EXIT
+echo "PATH=$dir/$name"`;
+  const res = await run(r, id, script("put", body, rel, contentBase64, mode));
+  const path = res.stdout.match(/^PATH=(.+)$/m)?.[1];
+  if (!path) throw new Error("put gave no path");
+  return path;
+}
+
 export function envFile(env: Record<string, string>): string {
   return Object.entries(env)
     .map(([k, v]) => `${k}='${v.replace(/'/g, `'\\''`)}'\n`)

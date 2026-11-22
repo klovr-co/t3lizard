@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { busyThreads, configureFront, pushAccounts, continueOnAccount, execPoll, execStart, exportThreads, FRONT_PORT, install, machineLabel, pairAndLink, resetCheckout, runRepoSetup, scanLimits, setupProject } from "./bringup.ts";
+import { busyThreads, configureFront, pushAccounts, continueOnAccount, execPoll, execStart, exportThreads, FRONT_PORT, install, machineLabel, pairAndLink, PUT_MAX_BYTES, putFile, resetCheckout, runRepoSetup, scanLimits, setupProject } from "./bringup.ts";
 import type { Account, ExecView, Remote } from "./bringup.ts";
 import { paths } from "./config.ts";
 import { LizardLimitError, LizardPaymentError } from "./lizard.ts";
@@ -216,6 +216,31 @@ export class Daemon {
       // The lease may have ended while waiting: stop then, the machine is gone or reassigned.
       this.leased(req.leaseId);
     }
+  }
+
+  /**
+   * Writes one file under the sandbox user's home on a leased machine: a login or an .env for this
+   * job only, so it never goes to every repo's machines the way forwardEnv does. The content is never
+   * logged, saved in state, or put in an answer or an error.
+   */
+  async put(req: { leaseId: string; path: string; contentBase64: string; mode?: string }): Promise<{ path: string; bytes: number; mode: string }> {
+    const { lease, machine } = this.leased(req.leaseId);
+    const rel = homeRelative(req.path, this.deps.config.sandboxUser);
+    const mode = req.mode ?? "600";
+    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(req.contentBase64) || req.contentBase64.length % 4 !== 0) throw new ApiError(400, "contentBase64 is not base64");
+    const content = Buffer.from(req.contentBase64, "base64");
+    if (content.length > PUT_MAX_BYTES) throw new ApiError(400, `the file is over ${PUT_MAX_BYTES / 1024} KB`);
+    let path: string;
+    try {
+      path = await putFile(this.remote, machine.id, rel, req.contentBase64, mode);
+    } catch (e) {
+      // Only fixed words go back: the machine's output or a Lizard error could quote the content.
+      const msg = (e as Error).message;
+      const why = msg.match(/the path leaves the home folder|the path is a folder/)?.[0] ?? msg.match(/\(exit \d+\)/)?.[0] ?? "the machine did not answer";
+      throw new ApiError(502, `writing ~/${rel} on ${machine.id} failed: ${why}`);
+    }
+    this.deps.log(`put ~/${rel} (${content.length} bytes, mode ${mode}) on ${machine.id} for ${lease.holder}`);
+    return { path, bytes: content.length, mode };
   }
 
   private leased(leaseId: string): { lease: Lease; machine: Machine } {
@@ -1231,4 +1256,19 @@ export class Daemon {
     renameSync(tmp, this.files.state);
     this.changes.emit("change");
   }
+}
+
+/**
+ * A path under the sandbox user's home, as a path relative to it: "~/a/b", "/home/<user>/a/b" and
+ * "a/b" all give "a/b". Anything else, or a "." or ".." part, is refused.
+ */
+export function homeRelative(path: string, user: string): string {
+  if (/[\0\n\r]/.test(path)) throw new ApiError(400, "the path has a control character");
+  let rel = path;
+  if (rel.startsWith("~/")) rel = rel.slice(2);
+  else if (rel.startsWith(`/home/${user}/`)) rel = rel.slice(`/home/${user}/`.length);
+  else if (rel.startsWith("/") || rel.startsWith("~")) throw new ApiError(400, `the path must be under the home folder (~/ or /home/${user}/)`);
+  const parts = rel.split("/").filter((p) => p !== "");
+  if (!parts.length || parts.some((p) => p === "." || p === "..")) throw new ApiError(400, "the path must name a file under the home folder, with no . or .. parts");
+  return parts.join("/");
 }

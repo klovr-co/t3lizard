@@ -112,6 +112,24 @@ The daemon never logs secret values.
 
 The daemon keeps each machine's Lizard access token in `state.json`, which is mode 600.
 
+### A secret for one job: `t3lizard put`
+
+Some jobs need a login or an `.env` file that other repos' machines must never get, for example a staging sign-in.
+Do not add those to `forwardEnv`: that sends them to every machine.
+Instead, the lease holder writes the file onto its own leased machine:
+
+```sh
+infisical export --format=dotenv ... | t3lizard put <leaseId> ~/.config/app/secrets.env
+t3lizard put <leaseId> .env.local --mode 640 < .env.local
+```
+
+- It reads the content from stdin, so the value never shows in a command line, a tool argument or a transcript.
+- Only a live lease's id works. The file goes away with the machine.
+- The path must be under the sandbox user's home: `~/x`, `/home/user/x` or `x`. A `..` part, or a symlink that leads out, is refused.
+- The file is written to a temp file with umask 077, given the mode (default `600`), then moved into place. At most 64 KB.
+- The daemon logs the path, the size and the holder, never the content. The content is not saved in `state.json`, and no answer or error quotes it.
+- There is no MCP tool for this on purpose: a tool argument is saved in the agent's transcript.
+
 ## How agents use it
 
 Register the MCP server with each agent:

@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import http from "node:http";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -550,4 +551,59 @@ test("exec runs a command on the leased machine with no agent, waits for it, and
   await assert.rejects(h.api("/exec", { leaseId: "nope", command: "ls" }), /no lease nope/);
   await h.api("/release", { leaseId });
   await assert.rejects(h.api("/exec", { leaseId, command: "ls" }), /no lease/);
+});
+
+test("put writes a file under the home of a leased machine, keeps the content out of logs, state and answers, and refuses others", async (t) => {
+  const h = await harness(t);
+  const a0 = await h.api("/acquire", { repo: REPO, ref: "main", holder: "thread-a" });
+  await h.daemon.settled();
+  const a = await h.api("/wait", { ticketId: a0.ticketId, maxSeconds: 1 });
+  const leaseId = a.lease.leaseId;
+  const secret = "TEST_ORG_PASSWORD=hunter2-very-secret\n";
+  const contentBase64 = Buffer.from(secret).toString("base64");
+
+  const r = await h.api("/put", { leaseId, path: "~/.config/test-org/secrets.env", contentBase64 });
+  assert.deepEqual(r, { path: "/home/user/.config/test-org/secrets.env", bytes: secret.length, mode: "600" });
+  const m = h.lizard.machines.get(a.lease.machineId)!;
+  assert.deepEqual(m.files.get("~/.config/test-org/secrets.env"), { content: secret, mode: "600" });
+  await h.api("/put", { leaseId, path: "/home/user/.env", contentBase64, mode: "640" });
+  assert.equal(m.files.get("~/.env")!.mode, "640");
+
+  // Refused: a path out of the home folder, a bad mode, a lease that does not exist or has ended.
+  for (const path of ["/etc/passwd", "~/../x", "../x", "~/a/./b", "~root/x", "~/", "a\nb"]) {
+    await assert.rejects(h.api("/put", { leaseId, path, contentBase64 }), /home folder|control character/, path);
+  }
+  await assert.rejects(h.api("/put", { leaseId, path: "x", contentBase64, mode: "u+rw" }), (e: Error) => !e.message.includes(contentBase64));
+  await assert.rejects(h.api("/put", { leaseId, path: "x", contentBase64: "not base64!" }), /not base64/);
+  await assert.rejects(h.api("/put", { leaseId, path: "x", contentBase64: Buffer.alloc(70 * 1024).toString("base64") }), /over 64 KB/);
+  await assert.rejects(h.api("/put", { leaseId: "nope", path: "x", contentBase64 }), /no lease nope/);
+
+  // A failure on the machine never quotes the content back.
+  h.lizard.on.put = () => ({ stdout: "", stderr: `boom ${contentBase64} ${secret}`, exitCode: 1 });
+  await assert.rejects(h.api("/put", { leaseId, path: "x", contentBase64 }), (e: Error) => /failed/.test(e.message) && !e.message.includes(contentBase64) && !e.message.includes("hunter2"));
+  delete h.lizard.on.put;
+
+  await h.api("/release", { leaseId });
+  await assert.rejects(h.api("/put", { leaseId, path: "x", contentBase64 }), /no lease/);
+
+  assert.ok(h.logs.some((l) => l.includes("put ~/.config/test-org/secrets.env (") && l.includes("thread-a")));
+  assert.ok(!h.logs.some((l) => l.includes("hunter2") || l.includes(contentBase64)), "the content is never logged");
+  await h.daemon.settled();
+  const state = readFileSync(paths(h.home).state, "utf8");
+  assert.ok(!state.includes("hunter2") && !state.includes(contentBase64), "the content is never saved in state");
+});
+
+test("a body that is not JSON is refused without quoting it back", async (t) => {
+  const h = await harness(t);
+  const raw = await new Promise<string>((resolve, reject) => {
+    const req = http.request({ socketPath: paths(h.home).socket, method: "POST", path: "/put" }, (res) => {
+      let b = "";
+      res.on("data", (c) => (b += c));
+      res.on("end", () => resolve(b));
+    });
+    req.on("error", reject);
+    req.end('{"contentBase64": "c2VjcmV0LXNlY3JldA==" oops');
+  });
+  assert.match(raw, /not valid JSON/);
+  assert.ok(!raw.includes("c2VjcmV0"));
 });
