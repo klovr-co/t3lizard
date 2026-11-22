@@ -52,6 +52,8 @@ export interface DaemonDeps {
   home: string;
   /** Asks one account's login what it can do (src/probe.ts). Unset: no probing (tests). */
   probe?: (token: string) => Promise<ProbeResult>;
+  /** Names for accounts (claudeAgent_acct3 -> claude-xianjun-klovr), from CLAUDE_ACCOUNT_LABEL_<n>. For humans only. */
+  accountLabels?: Record<string, string>;
   resolveRepo(input: string): Promise<RepoKey>;
   now(): number;
   sleep(ms: number): Promise<void>;
@@ -544,7 +546,7 @@ export class Daemon {
         : {}),
       accounts: config.accounts.map((id) => {
         const until = this.state.accounts?.[id]?.limitedUntil;
-        return { id, free: !accountLimited(this.state, id, now), ...(until && until > now ? { limitedUntil: new Date(until).toISOString() } : {}), ...(until && until > now && this.state.accounts?.[id]?.disabled ? { disabled: true } : {}),
+        return { id, ...(this.deps.accountLabels?.[id] ? { label: this.deps.accountLabels[id] } : {}), free: !accountLimited(this.state, id, now), ...(until && until > now ? { limitedUntil: new Date(until).toISOString() } : {}), ...(until && until > now && this.state.accounts?.[id]?.disabled ? { disabled: true } : {}),
           ...(until && until > now && this.state.accounts?.[id]?.auth ? { authFailed: true } : {}),
           ...this.probeView(id, now) };
       }),
@@ -950,6 +952,12 @@ export class Daemon {
     return "until" in wait ? { waitingForAccountUntil: new Date(wait.until).toISOString() } : { cannotWaitForAccount: wait.blocked };
   }
 
+  /** An account for a log line: its id, and its label when it has one. */
+  private acct(id: AccountId): string {
+    const label = this.deps.accountLabels?.[id];
+    return label ? `${id} (${label})` : id;
+  }
+
   /** What the last probe found, for status: verified is true only for a probe that said ok. */
   private probeView(id: AccountId, now: number) {
     const p = this.state.accounts?.[id]?.probe;
@@ -1022,7 +1030,7 @@ export class Daemon {
     if (r.kind === "ok") {
       if (account.probeBlocked) {
         for (const k of ["limitedUntil", "disabled", "auth", "probeBlocked"] as const) delete account[k];
-        this.deps.log(`${id} works again (a probe answered)`);
+        this.deps.log(`${this.acct(id)} works again (a probe answered)`);
       }
     } else if (r.kind === "limit") {
       block(r.resetsAt ?? Math.max(account.limitedUntil ?? 0, now + accountRetryMinutes * MINUTE), {});
@@ -1031,7 +1039,7 @@ export class Daemon {
     } else if (r.kind === "auth") {
       block(Math.max(account.limitedUntil ?? 0, now + AUTH_BLOCK_MINUTES * MINUTE), { auth: true });
     }
-    if (before !== r.kind) this.deps.log(`${id}: ${before ?? "unknown"} -> ${r.kind}${r.note ? ` (${r.note})` : ""}`);
+    if (before !== r.kind) this.deps.log(`${this.acct(id)}: ${before ?? "unknown"} -> ${r.kind}${r.note ? ` (${r.note})` : ""}`);
     this.save();
   }
 
@@ -1132,7 +1140,7 @@ export class Daemon {
           delete m.accountsKey;
         }
       }
-      this.deps.log(`thread ${t.threadId} on ${id} stopped on ${t.auth ? "a login failure" : t.disabled ? "disabled access" : "the usage limit"} of ${t.account} ("${t.notice}"); ${t.account} skipped until ${new Date(account.limitedUntil).toISOString()}`);
+      this.deps.log(`thread ${t.threadId} on ${id} stopped on ${t.auth ? "a login failure" : t.disabled ? "disabled access" : "the usage limit"} of ${this.acct(t.account)} ("${t.notice}"); ${t.account} skipped until ${new Date(account.limitedUntil).toISOString()}`);
     }
     m.limitedThreads = limited.map(({ threadId, runId, account }) => ({ threadId, runId, account }));
     if (!m.limitedThreads.length) delete m.limitedThreads;

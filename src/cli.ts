@@ -4,7 +4,7 @@ import { parseArgs } from "node:util";
 import { call, serveApi } from "./api.ts";
 import { startDashboard } from "./dashboard.ts";
 import { probeAccount } from "./probe.ts";
-import { accountsFromSecrets, antigravityTokenFromSecrets, isAccountTokenKey, loadConfig, loadSecrets, paths, t3lizardHome } from "./config.ts";
+import { accountLabelsFromSecrets, accountsFromSecrets, antigravityTokenFromSecrets, isAccountTokenKey, loadConfig, loadSecrets, paths, t3lizardHome } from "./config.ts";
 import { Daemon } from "./daemon.ts";
 import type { DaemonDeps } from "./daemon.ts";
 import { realLizard } from "./lizard.ts";
@@ -77,6 +77,7 @@ async function realDaemon(home: string): Promise<void> {
     machineEnv,
     accountTokens: Object.fromEntries(accounts.map((a) => [a.id, a.token])),
     probe: (token: string) => probeAccount(token),
+    accountLabels: accountLabelsFromSecrets(secrets),
     ...(antigravityToken ? { antigravityToken } : {}),
     home,
     resolveRepo,

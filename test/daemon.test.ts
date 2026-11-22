@@ -610,6 +610,7 @@ test("accounts are probed one per tick; broken ones are skipped, a probe that sa
   };
   const asked: string[] = [];
   const h = await harness(t, { accounts: [A1, A2, A3, A4] }, undefined, { probe: async (token) => (asked.push(token), verdict[token]) });
+  (h.daemon as unknown as { deps: { accountLabels: Record<string, string> } }).deps.accountLabels = { [A1]: "claude-dev-klovr", [A3]: "claude-xianjun-klovr" };
   const queued = await h.api("/acquire", { repo: REPO, ref: "main", holder: "thread-a" });
   await h.daemon.settled();
   await h.api("/wait", { ticketId: queued.ticketId, maxSeconds: 1 });
@@ -618,6 +619,8 @@ test("accounts are probed one per tick; broken ones are skipped, a probe that sa
   assert.equal(new Set(asked).size, 4, "each account asked once, one per tick");
   const acct = async (id: string) => (await h.api("/status")).accounts.find((a: { id: string }) => a.id === id);
   assert.equal((await acct(A1)).verified, true);
+  assert.deepEqual([(await acct(A1)).label, (await acct(A2)).label, (await acct(A3)).label], ["claude-dev-klovr", undefined, "claude-xianjun-klovr"], "status names an account when it has a label");
+  assert.match(h.logs.join("\n"), /claudeAgent_acct3 \(claude-xianjun-klovr\): unknown -> limit/);
   assert.equal((await acct(A1)).free, true);
   assert.deepEqual([(await acct(A2)).free, (await acct(A2)).disabled], [false, true]);
   const a3 = await acct(A3);

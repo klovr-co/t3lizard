@@ -190,6 +190,17 @@ export function antigravityTokenFromSecrets(secrets: Record<string, string>): st
  * One Claude account per CLAUDE_CODE_OAUTH_TOKEN[_N] secret, in N order (no suffix is account 1).
  * The id is the provider instance each machine gets for it: claudeAgent_acct<N>.
  */
+/** CLAUDE_ACCOUNT_LABEL_<n> = a name for account <n> (e.g. claude-dev-klovr), shown next to claudeAgent_acct<n>. */
+export function accountLabelsFromSecrets(secrets: Record<string, string>): Record<AccountId, string> {
+  const labels: Record<AccountId, string> = {};
+  for (const [key, value] of Object.entries(secrets)) {
+    const m = key.match(/^CLAUDE_ACCOUNT_LABEL_([1-9]\d*)$/);
+    const label = value?.trim().replace(/^['"]|['"]$/g, "");
+    if (m && label) labels[`claudeAgent_acct${m[1]}`] = label.slice(0, 60);
+  }
+  return labels;
+}
+
 export function accountsFromSecrets(secrets: Record<string, string>): { id: AccountId; token: string }[] {
   const byN = new Map<number, string>();
   for (const [key, token] of Object.entries(secrets)) {

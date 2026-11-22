@@ -58,3 +58,11 @@ test("antigravityTokenFromSecrets accepts raw JSON and base64, rejects malformed
   assert.equal(cfg.defaultProvider, "antigravity");
   assert.equal(cfg.defaultModel, "gemini-4-neon");
 });
+
+test("account labels come from CLAUDE_ACCOUNT_LABEL_<n>, unquoted, and only for numbered accounts", async () => {
+  const { accountLabelsFromSecrets } = await import("../src/config.ts");
+  assert.deepEqual(
+    accountLabelsFromSecrets({ CLAUDE_ACCOUNT_LABEL_1: "'claude-dev-klovr'", CLAUDE_ACCOUNT_LABEL_3: " claude-xianjun-klovr ", CLAUDE_ACCOUNT_LABEL_4: '"claude-maxine-klovr"', CLAUDE_ACCOUNT_LABEL_: "x", CLAUDE_ACCOUNT_LABEL_0: "x", CLAUDE_ACCOUNT_LABEL_2: "", OTHER: "y" }),
+    { claudeAgent_acct1: "claude-dev-klovr", claudeAgent_acct3: "claude-xianjun-klovr", claudeAgent_acct4: "claude-maxine-klovr" },
+  );
+});
