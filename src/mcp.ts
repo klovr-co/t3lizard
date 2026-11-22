@@ -32,10 +32,10 @@ export async function serveMcp(socket = paths(t3lizardHome()).socket): Promise<M
   server.registerTool(
     "pool_wait",
     {
-      description: "Wait for a queued ticket. Returns early when granted; otherwise after maxSeconds with the queue position.",
+      description: "Wait for a queued ticket. Returns early when granted; otherwise after maxSeconds (default 30) with the queue position. Call it again to keep waiting. Messages sent to you while a call runs only arrive when it returns, which is why it is short.",
       inputSchema: {
         ticketId: z.string(),
-        maxSeconds: z.number().int().min(1).max(300).default(300).describe("At most 300"),
+        maxSeconds: z.number().int().min(1).max(300).default(30).describe("Default 30, at most 300. Messages to you wait until the call returns."),
       },
     },
     (args) => reply(() => call(socket, "POST", "/wait", args)),

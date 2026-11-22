@@ -145,7 +145,7 @@ The MCP server gives agents these instructions:
 1. Push the commit you want to test. The machine checks out the ref, so it must exist on origin.
 2. Call `pool_acquire` with `repo` (origin URL or a local checkout path), `ref` and `holder`.
    You get a lease, or a queue ticket with a position and a reason.
-3. While queued, call `pool_wait` with the ticket id. Each call waits up to 300 seconds.
+3. While queued, call `pool_wait` with the ticket id. Each call waits 30 seconds by default (at most 300). Keep it short: messages to the agent only arrive between tool calls.
 4. When granted, call `delegate_task` with `target: { environmentId, projectId, providerInstanceId }` from the lease, and a Claude model.
    `providerInstanceId` is the Claude account to use: the first one not limited.
    Do not ask for a worktree. The lease is a whole machine, already checked out at your ref.
