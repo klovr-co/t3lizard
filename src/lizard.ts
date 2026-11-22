@@ -9,7 +9,11 @@ export interface ExecResult {
 
 /** Everything t3lizard needs from Lizard. The daemon depends on this, so tests use a fake. */
 export interface Lizard {
-  create(repo: RepoKey, size: Size, lifetimeMs: number): Promise<{ id: MachineId; deadline: number }>;
+  /** With snapshotId the machine starts from that saved snapshot, at the snapshot's own size (`size` is then ignored by Lizard). */
+  create(repo: RepoKey, size: Size, lifetimeMs: number, snapshotId?: string): Promise<{ id: MachineId; deadline: number }>;
+  /** Saves the machine's files as a private snapshot (about 2 s) and waits until it is ready. Returns its id. Storage is billed until it is deleted. */
+  snapshot(id: MachineId, name: string): Promise<string>;
+  deleteSnapshot(snapshotId: string): Promise<void>;
   /** Live sandboxes in the project that t3lizard created (metadata t3lizard=1). Never anyone else's. */
   list(): Promise<MachineId[]>;
   /** False when Lizard no longer knows the sandbox or reports it stopped or crashed. Throws when it cannot tell. */
@@ -108,7 +112,7 @@ export function realLizard(opts: { apiKey: string; projectId: string; user: stri
   const listOwn = ownSandboxLister(dir);
 
   return {
-    create: (repo, size, lifetimeMs) =>
+    create: (repo, size, lifetimeMs, snapshotId) =>
       mapErrors(async () => {
         const sb = await Sandbox.create(opts.template, {
           ...conn,
@@ -116,11 +120,20 @@ export function realLizard(opts: { apiKey: string; projectId: string; user: stri
           size,
           timeoutMs: lifetimeMs,
           metadata: { t3lizard: "1", repo },
+          ...(snapshotId ? { snapshotId } : {}),
         });
         const info = await sb.getInfo().catch(() => undefined);
         const end = info?.endAt ? Date.parse(info.endAt) : NaN;
         return { id: sb.sandboxId, deadline: Number.isFinite(end) ? end : Date.now() + lifetimeMs };
       }),
+    snapshot: (id, name) =>
+      mapErrors(async () => {
+        const snap = await sandbox(id).snapshot(name);
+        const ready = await Sandbox.waitForSnapshot(snap.id, { ...conn, waitTimeoutMs: 5 * 60_000 });
+        if (ready.status !== "ready") throw new Error(`snapshot ${snap.id} is ${ready.status}${ready.error ? `: ${ready.error}` : ""}`);
+        return ready.id;
+      }),
+    deleteSnapshot: (snapshotId) => mapErrors(() => Sandbox.deleteSnapshot(snapshotId, conn)),
     list: () => mapErrors(listOwn),
     alive: (id) => mapErrors(() => sandboxAlive(dir, id)),
     exec: (id, cmd, timeoutMs = 120_000) =>

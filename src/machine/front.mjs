@@ -7,7 +7,9 @@
 // t3lizard proxy, and T3's MCP OAuth (resource) and DPoP (htu) checks need both sides to agree on one
 // origin. This proxy makes T3 see the devbox URL: it sets Host to the contents of <hostFile>
 // (127.0.0.1:<devbox port>) and drops every header that could move the origin, plus the Lizard token.
-// The host file is read per connection, so changing it needs no restart.
+// The host file is read per connection, so changing it needs no restart. When the devbox proxy says
+// which Host its client used (x-t3lizard-host: a browser on the tailnet), T3 gets that one instead,
+// so the browser's own origin checks pass too. Only callers holding the Lizard token reach this.
 import { readFileSync } from "node:fs";
 import http from "node:http";
 import net from "node:net";
@@ -23,7 +25,19 @@ const DROP = new Set([
   "x-forwarded-for",
   "x-real-ip",
   "x-lizard-access-token",
+  "x-t3lizard-host",
 ]);
+
+/** The Host the devbox proxy's client used (x-t3lizard-host), when it looks like host:port. */
+export function clientHost(rawHeaders) {
+  for (let i = 0; i < rawHeaders.length; i += 2) {
+    if (rawHeaders[i].toLowerCase() === "x-t3lizard-host") {
+      const v = rawHeaders[i + 1].trim();
+      return /^[A-Za-z0-9.-]+:\d{1,5}$/.test(v) ? v : undefined;
+    }
+  }
+  return undefined;
+}
 
 /** Raw header pairs with the origin-moving headers removed and Host set to `host`. */
 export function rewriteHeaders(rawHeaders, host) {
@@ -45,7 +59,7 @@ export function startFront({ listenPort, t3Port, hostFile, listenHost = "0.0.0.0
   const sockets = new Set();
 
   const server = http.createServer((req, res) => {
-    const host = target();
+    const host = target() && (clientHost(req.rawHeaders) ?? target());
     if (!host) {
       res.writeHead(503, { "content-type": "text/plain" });
       res.end("t3lizard front: not configured yet");
@@ -71,7 +85,7 @@ export function startFront({ listenPort, t3Port, hostFile, listenHost = "0.0.0.0
   server.timeout = 0;
 
   server.on("upgrade", (req, client, head) => {
-    const host = target();
+    const host = target() && (clientHost(req.rawHeaders) ?? target());
     if (!host) {
       client.end("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
       return;
