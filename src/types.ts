@@ -225,6 +225,12 @@ export interface Config {
   dailySmallMachineHours: number;
   /** At most this many creates per repo in any rolling hour. */
   createsPerRepoPerHour: number;
+  /**
+   * false: machines are not linked to this computer's T3 (no proxy, no `t3 environment link`), so
+   * the "Linked environments" Labs setting is not needed. pool_exec and pool_exec_wait work; agent
+   * threads on the machine (delegate_task) do not. Default true.
+   */
+  linkEnvironment?: boolean;
   /** Each create counts at least this long (times its size weight) against the budget, however short the machine lived. */
   createChargeMinutes: number;
   proxyPortRange: [number, number];

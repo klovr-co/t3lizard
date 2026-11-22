@@ -36,6 +36,7 @@ export const DEFAULT_CONFIG: Config = {
   ticketMaxWaitMinutes: 60,
   dailySmallMachineHours: 20,
   createsPerRepoPerHour: 20,
+  linkEnvironment: true,
   createChargeMinutes: 10,
   proxyPortRange: [47300, 47399],
   forwardEnv: ["GH_TOKEN"],
@@ -73,6 +74,7 @@ const ConfigFile = z
     /** Older name of dailySmallMachineHours. */
     dailyMachineHours: z.number().positive(),
     createsPerRepoPerHour: positive,
+    linkEnvironment: z.boolean(),
     createChargeMinutes: z.number().int().min(0),
     proxyPortRange: z.tuple([positive, positive]),
     forwardEnv: z.array(z.string()),
