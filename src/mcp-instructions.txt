@@ -20,6 +20,10 @@ Use it for heavy work: builds, full typechecks, pre-push gates, long test runs.
    A repo whose jobs froze a smaller machine is never given that size again.
    If the delegated thread stops on a Claude usage limit, keep the lease and do not start over: t3lizard continues that
    thread on the next free account, or when the first account frees, and keeps the machine until then.
+4c. A job that needs a login or an .env file (a staging sign-in, an API key for tests): from a shell on the devbox, run
+   t3lizard put <leaseId> <path under ~> [--mode 600] < file
+   It writes stdin to that file on the leased machine only, mode 600 by default, and never logs or echoes it.
+   Never put a secret in a pool_exec command, a delegate_task prompt or any tool argument: those are saved in transcripts.
 5. Call pool_release with the leaseId as soon as the delegated work is done. Machines are shared and cost money.
    A lease expires after about 90 minutes unless you call pool_renew; a busy thread on the machine keeps it alive.
 6. When a job on the machine fails because a tool or system package is missing, add the install step with

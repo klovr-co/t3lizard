@@ -25,7 +25,15 @@ test("the CLI and the MCP server drive a daemon running on fakes", async (t) => 
   assert.equal(granted.status, "granted");
   assert.equal(granted.lease.providerInstanceId, "claudeAgent_acct1");
   assert.equal((await cli("status")).pools["github.com/acme/app"].leases[0].holder, "e2e");
+  const put = (stdin: string, ...args: string[]) =>
+    new Promise<any>((resolve, reject) => {
+      const c = execFile(join(root, "bin/t3lizard"), ["put", ...args], { env }, (e, out) => (e ? reject(e) : resolve(JSON.parse(out))));
+      c.stdin!.end(stdin);
+    });
+  const putOut = await put("A_SECRET=value\n", granted.lease.leaseId, "~/.config/app/secrets.env", "--mode", "600");
+  assert.deepEqual(putOut, { path: "/home/user/.config/app/secrets.env", bytes: 15, mode: "600" });
   assert.deepEqual(await cli("release", granted.lease.leaseId), { released: true });
+  await assert.rejects(put("x", granted.lease.leaseId, "~/x"), /no lease/);
 
   const raw = async (...args: string[]) => (await run(join(root, "bin/t3lizard"), args, { env })).stdout;
   const added = await cli("setup", "add", "https://github.com/acme/app.git", "--reason", "needs bun", "--", "command", "-v", "bun", ">/dev/null", "||", "curl -fsSL https://bun.sh/install | bash");
@@ -38,7 +46,7 @@ test("the CLI and the MCP server drive a daemon running on fakes", async (t) => 
   await client.connect(new StdioClientTransport({ command: join(root, "bin/t3lizard-mcp"), env: env as Record<string, string> }));
   t.after(() => client.close());
   const { tools } = await client.listTools();
-  assert.deepEqual(tools.map((x) => x.name).sort(), ["pool_acquire", "pool_release", "pool_renew", "pool_setup_add", "pool_status", "pool_wait"]);
+  assert.deepEqual(tools.map((x) => x.name).sort(), ["pool_acquire", "pool_exec", "pool_exec_wait", "pool_release", "pool_renew", "pool_setup_add", "pool_status", "pool_wait"]);
   assert.match(client.getInstructions() ?? "", /fails because a tool or system package is missing, add the install step with\s+pool_setup_add/);
   const viaSetup = await client.callTool({ name: "pool_setup_add", arguments: { repo: "https://github.com/acme/app.git", line: "command -v jq >/dev/null || sudo -n apt-get install -y jq", reason: "jq missing in e2e", holder: "mcp" } });
   const setupOut = JSON.parse((viaSetup.content as { text: string }[])[0].text);

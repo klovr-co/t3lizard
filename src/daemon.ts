@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { busyThreads, configureFront, pushAccounts, continueOnAccount, execPoll, execStart, exportThreads, FRONT_PORT, install, machineLabel, pairAndLink, resetCheckout, runRepoSetup, scanLimits, setupProject } from "./bringup.ts";
+import { busyThreads, configureFront, pushAccounts, continueOnAccount, execPoll, execStart, exportThreads, FRONT_PORT, install, machineLabel, pairAndLink, PUT_MAX_BYTES, putFile, removePutFiles, resetCheckout, runRepoSetup, scanLimits, setupProject } from "./bringup.ts";
 import type { Account, ExecView, Remote } from "./bringup.ts";
 import { paths } from "./config.ts";
 import { LizardLimitError, LizardPaymentError } from "./lizard.ts";
@@ -98,6 +98,8 @@ export class Daemon {
   private deps: DaemonDeps;
   private files: ReturnType<typeof paths>;
   private proxies = new Map<MachineId, Proxy>();
+  /** put and its cleanup run one at a time per machine, so a cleanup never races a write. */
+  private putChains = new Map<MachineId, Promise<unknown>>();
   private running = new Map<string, Promise<void>>();
   private createsInFlight = 0;
   private createsDone = 0;
@@ -231,6 +233,66 @@ export class Daemon {
       // The lease may have ended while waiting: stop then, the machine is gone or reassigned.
       this.leased(req.leaseId);
     }
+  }
+
+  /**
+   * Writes one file under the sandbox user's home on a leased machine: a login or an .env for this
+   * job only, so it never goes to every repo's machines the way forwardEnv does. The content is never
+   * logged, saved in state, or put in an answer or an error.
+   */
+  async put(req: { leaseId: string; path: string; contentBase64: string; mode?: string }): Promise<{ path: string; bytes: number; mode: string }> {
+    const { lease, machine } = this.leased(req.leaseId);
+    const rel = homeRelative(req.path, this.deps.config.sandboxUser);
+    const mode = req.mode ?? "600";
+    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(req.contentBase64) || req.contentBase64.length % 4 !== 0) throw new ApiError(400, "contentBase64 is not base64");
+    const content = Buffer.from(req.contentBase64, "base64");
+    if (content.length > PUT_MAX_BYTES) throw new ApiError(400, `the file is over ${PUT_MAX_BYTES / 1024} KB`);
+    const path = await this.onMachine(machine.id, async () => {
+      // The lease may have ended while this waited for the machine.
+      this.leased(req.leaseId);
+      // Recorded before the write, so a write that half-worked is still cleaned up.
+      this.trackPut(machine.id, rel);
+      let out: { path: string; rel: string };
+      try {
+        out = await putFile(this.remote, machine.id, rel, req.contentBase64, mode);
+      } catch (e) {
+        // Only fixed words go back: the machine's output or a Lizard error could quote the content.
+        const msg = (e as Error).message;
+        const why = msg.match(/the path leaves the home folder|the path is a folder/)?.[0] ?? msg.match(/\(exit \d+\)/)?.[0] ?? "the machine did not answer";
+        throw new ApiError(502, `writing ~/${rel} on ${machine.id} failed: ${why}`);
+      }
+      // Where it really landed, after links: cleanup removes that, whatever the links point to later.
+      this.trackPut(machine.id, out.rel);
+      return out.path;
+    });
+    this.deps.log(`put ~/${rel} (${content.length} bytes, mode ${mode}) on ${machine.id} for ${lease.holder}`);
+    return { path, bytes: content.length, mode };
+  }
+
+  private trackPut(machineId: MachineId, rel: string): void {
+    const m = this.state.machines[machineId];
+    if (!m || m.putFiles?.includes(rel)) return;
+    m.putFiles = [...(m.putFiles ?? []), rel];
+    this.save();
+  }
+
+  private onMachine<T>(id: MachineId, fn: () => Promise<T>): Promise<T> {
+    const run = (this.putChains.get(id) ?? Promise.resolve()).catch(() => {}).then(fn);
+    this.putChains.set(id, run);
+    return run;
+  }
+
+  /** Removes the files put wrote on a machine. Throws when the machine cannot confirm it. */
+  private cleanPuts(machineId: MachineId): Promise<void> {
+    return this.onMachine(machineId, async () => {
+      const files = this.state.machines[machineId]?.putFiles;
+      if (!files?.length) return;
+      await removePutFiles(this.remote, machineId, files);
+      const m = this.state.machines[machineId];
+      if (m) delete m.putFiles;
+      this.save();
+      this.deps.log(`removed ${files.length} put file(s) on ${machineId}`);
+    });
   }
 
   private leased(leaseId: string): { lease: Lease; machine: Machine } {
@@ -775,6 +837,17 @@ export class Daemon {
       return m?.phase.kind === "resetting" && m.phase.ticketId === ticketId ? m : undefined;
     };
     const t = this.ticket(ticketId);
+    // A file the last holder put there must never reach the next one: no clean, no grant.
+    // The machine fails and closes; the ticket stays queued for another machine.
+    try {
+      await this.cleanPuts(machineId);
+    } catch (e) {
+      const m = reserved();
+      if (!m) return;
+      this.setPhase(m, { kind: "failed", error: `removing put files failed: ${(e as Error).message}` });
+      this.step();
+      return;
+    }
     let result: Awaited<ReturnType<typeof resetCheckout>>;
     try {
       result = await resetCheckout(this.remote, machineId, this.state.machines[machineId].workspacePath!, t.ref);
@@ -1274,6 +1347,9 @@ export class Daemon {
     if (m) {
       delete m.limitedThreads;
       delete m.continuedRuns;
+      if (m.putFiles?.length) {
+        this.launch(`put-clean:${m.id}`, () => this.cleanPuts(m.id).catch((e) => this.deps.log(`removing put files on ${m.id} failed; the next grant tries again: ${(e as Error).message}`)));
+      }
     }
     if (m?.phase.kind === "leased" && m.phase.leaseId === leaseId) this.setPhase(m, { kind: "idle", since: this.deps.now() });
     this.deps.log(`lease ${leaseId} ${how}`);
@@ -1362,4 +1438,19 @@ export class Daemon {
     renameSync(tmp, this.files.state);
     this.changes.emit("change");
   }
+}
+
+/**
+ * A path under the sandbox user's home, as a path relative to it: "~/a/b", "/home/<user>/a/b" and
+ * "a/b" all give "a/b". Anything else, or a "." or ".." part, is refused.
+ */
+export function homeRelative(path: string, user: string): string {
+  if (/[\0\n\r]/.test(path)) throw new ApiError(400, "the path has a control character");
+  let rel = path;
+  if (rel.startsWith("~/")) rel = rel.slice(2);
+  else if (rel.startsWith(`/home/${user}/`)) rel = rel.slice(`/home/${user}/`.length);
+  else if (rel.startsWith("/") || rel.startsWith("~")) throw new ApiError(400, `the path must be under the home folder (~/ or /home/${user}/)`);
+  const parts = rel.split("/").filter((p) => p !== "");
+  if (!parts.length || parts.some((p) => p === "." || p === "..")) throw new ApiError(400, "the path must name a file under the home folder, with no . or .. parts");
+  return parts.join("/");
 }
