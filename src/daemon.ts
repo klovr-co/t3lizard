@@ -12,6 +12,7 @@ import type { Lizard } from "./lizard.ts";
 import { learnSize, nextSizeUp, repoGaps, repoIdleMs, vcpuFree } from "./plan.ts";
 import { accountLimited, accountWait, BRINGING_UP, BUDGET_UNIT, createBackoff, createBlock, machineAccounts, nextFreeAccount, plan, queueInfo, repoCreateBlock, sizesInUse, usedSmallHours, utcDay } from "./plan.ts";
 import { startProxy } from "./proxy.ts";
+import type { ProbeResult } from "./probe.ts";
 import { addStep, readHistory, readSetup, removeStep } from "./setup.ts";
 import type { RepoSetup } from "./setup.ts";
 import type { Proxy } from "./proxy.ts";
@@ -25,6 +26,12 @@ const PENDING = "pending:";
 const BUSY_LEASE_GRACE_MS = 10 * MINUTE;
 /** A leased machine that has not answered this long is closed (see noAnswer). */
 const UNRESPONSIVE_CLOSE_MS = 10 * MINUTE;
+/** An account whose thread failed to authenticate is skipped this long, unless a probe says it works. */
+const AUTH_BLOCK_MINUTES = 10;
+/** How often a working account is asked again (only while a machine is leased), and a broken one. */
+const PROBE_OK_EVERY_MS = 60 * MINUTE;
+const PROBE_AUTH_EVERY_MS = 30 * MINUTE;
+const PROBE_ERROR_EVERY_MS = 10 * MINUTE;
 /** How often a leased machine is checked for threads stopped on a usage limit. */
 const LIMIT_SCAN_EVERY_MS = MINUTE;
 /** Allowed difference between the machine's clock and the devbox's. */
@@ -43,6 +50,8 @@ export interface DaemonDeps {
   /** Antigravity OAuth token JSON. Written only to Antigravity's profile directory on each machine. */
   antigravityToken?: string;
   home: string;
+  /** Asks one account's login what it can do (src/probe.ts). Unset: no probing (tests). */
+  probe?: (token: string) => Promise<ProbeResult>;
   resolveRepo(input: string): Promise<RepoKey>;
   now(): number;
   sleep(ms: number): Promise<void>;
@@ -97,6 +106,9 @@ export class Daemon {
   private t3Version?: string;
   private lastLimitScan = new Map<MachineId, number>();
   private lastAccountPush = new Map<MachineId, number>();
+  private probing = false;
+  /** Accounts to probe at the next chance: a thread just failed on them. */
+  private probeNow = new Set<AccountId>();
   /** A continue that failed is retried after this time, not every tick. */
   private continueRetryAt = new Map<string, number>();
   private remote: Remote;
@@ -156,6 +168,7 @@ export class Daemon {
       this.step();
       this.scanForLimits();
       this.syncAccounts();
+      this.probeAccounts();
     } finally {
       this.ticking = false;
     }
@@ -531,7 +544,9 @@ export class Daemon {
         : {}),
       accounts: config.accounts.map((id) => {
         const until = this.state.accounts?.[id]?.limitedUntil;
-        return { id, free: !accountLimited(this.state, id, now), ...(until && until > now ? { limitedUntil: new Date(until).toISOString() } : {}), ...(until && until > now && this.state.accounts?.[id]?.disabled ? { disabled: true } : {}) };
+        return { id, free: !accountLimited(this.state, id, now), ...(until && until > now ? { limitedUntil: new Date(until).toISOString() } : {}), ...(until && until > now && this.state.accounts?.[id]?.disabled ? { disabled: true } : {}),
+          ...(until && until > now && this.state.accounts?.[id]?.auth ? { authFailed: true } : {}),
+          ...this.probeView(id, now) };
       }),
     };
   }
@@ -935,6 +950,91 @@ export class Daemon {
     return "until" in wait ? { waitingForAccountUntil: new Date(wait.until).toISOString() } : { cannotWaitForAccount: wait.blocked };
   }
 
+  /** What the last probe found, for status: verified is true only for a probe that said ok. */
+  private probeView(id: AccountId, now: number) {
+    const p = this.state.accounts?.[id]?.probe;
+    if (!p) return { verified: false, probe: "not checked yet" };
+    const ago = Math.round((now - p.at) / MINUTE);
+    return { verified: p.kind === "ok", probe: `${p.kind}, ${ago} min ago${p.note && p.kind !== "ok" ? `: ${p.note}` : ""}` };
+  }
+
+  private probeDue(id: AccountId, now: number, poolBusy: boolean): boolean {
+    if (this.probeNow.has(id)) return true;
+    const a = this.state.accounts?.[id];
+    const p = a?.probe;
+    if (!p) return true;
+    const since = now - p.at;
+    const { accountDisabledMinutes } = this.deps.config;
+    switch (p.kind) {
+      case "ok":
+        return poolBusy && since >= PROBE_OK_EVERY_MS;
+      case "limit":
+        // Once the block is over, confirm before handing the account out again; not before.
+        return poolBusy && now >= (a?.limitedUntil ?? p.at) && since >= 5 * MINUTE;
+      case "disabled":
+        return since >= accountDisabledMinutes * MINUTE;
+      case "auth":
+        return since >= PROBE_AUTH_EVERY_MS;
+      default:
+        return since >= PROBE_ERROR_EVERY_MS;
+    }
+  }
+
+  /**
+   * Asks one due account, one at a time, what it can do, and keeps the answer in state: threads then
+   * get only an account known to work, instead of finding out by failing. A probe costs about 0.01 cent.
+   */
+  private probeAccounts(): void {
+    const probe = this.deps.probe;
+    if (!probe || this.probing || !this.deps.config.accounts.length) return;
+    const now = this.deps.now();
+    const poolBusy = Object.values(this.state.machines).some((m) => m.phase.kind === "leased");
+    const id = this.deps.config.accounts.find((a) => this.deps.accountTokens[a] && this.probeDue(a, now, poolBusy));
+    if (!id) return;
+    this.probing = true;
+    this.launch(`probe:${id}`, async () => {
+      try {
+        const result = await probe(this.deps.accountTokens[id]);
+        this.probeNow.delete(id);
+        this.applyProbe(id, result);
+      } catch (e) {
+        this.deps.log(`probe of ${id} failed: ${(e as Error).message}`);
+      } finally {
+        this.probing = false;
+      }
+    });
+  }
+
+  private applyProbe(id: AccountId, r: ProbeResult): void {
+    const now = this.deps.now();
+    const { accountRetryMinutes, accountDisabledMinutes } = this.deps.config;
+    const account = ((this.state.accounts ??= {})[id] ??= {});
+    const before = account.probe?.kind;
+    account.probe = { at: now, kind: r.kind, note: r.note };
+    const block = (until: number, flags: { disabled?: boolean; auth?: boolean }) => {
+      account.limitedUntil = until;
+      if (flags.disabled) account.disabled = true;
+      else delete account.disabled;
+      if (flags.auth) account.auth = true;
+      else delete account.auth;
+      account.probeBlocked = true;
+    };
+    if (r.kind === "ok") {
+      if (account.probeBlocked) {
+        for (const k of ["limitedUntil", "disabled", "auth", "probeBlocked"] as const) delete account[k];
+        this.deps.log(`${id} works again (a probe answered)`);
+      }
+    } else if (r.kind === "limit") {
+      block(r.resetsAt ?? Math.max(account.limitedUntil ?? 0, now + accountRetryMinutes * MINUTE), {});
+    } else if (r.kind === "disabled") {
+      block(Math.max(account.limitedUntil ?? 0, now + accountDisabledMinutes * MINUTE), { disabled: true });
+    } else if (r.kind === "auth") {
+      block(Math.max(account.limitedUntil ?? 0, now + AUTH_BLOCK_MINUTES * MINUTE), { auth: true });
+    }
+    if (before !== r.kind) this.deps.log(`${id}: ${before ?? "unknown"} -> ${r.kind}${r.note ? ` (${r.note})` : ""}`);
+    this.save();
+  }
+
   /**
    * A running machine whose accounts differ from the secrets (an account was added or removed
    * after it came up) gets the current list, at most once a minute per machine.
@@ -1014,7 +1114,7 @@ export class Daemon {
     for (const t of limited) {
       if (known.has(t.runId)) continue;
       const account = ((this.state.accounts ??= {})[t.account] ??= {});
-      const minutes = t.disabled ? accountDisabledMinutes : accountRetryMinutes;
+      const minutes = t.auth ? AUTH_BLOCK_MINUTES : t.disabled ? accountDisabledMinutes : accountRetryMinutes;
       const until = now + minutes * MINUTE;
       // The longer block decides what the account is shown as: a plain usage limit after an old
       // "disabled" must not keep the flag, but a disabled notice inside a usage-limit window sets it.
@@ -1022,8 +1122,17 @@ export class Daemon {
         account.limitedUntil = until;
         if (t.disabled) account.disabled = true;
         else delete account.disabled;
+        if (t.auth) account.auth = true;
+        else delete account.auth;
+        // An auth failure is often just this machine's stale copy of the login: ask the account
+        // now (a probe that says ok lifts the block), and give the machine the current logins.
+        if (t.auth) {
+          account.probeBlocked = true;
+          this.probeNow.add(t.account);
+          delete m.accountsKey;
+        }
       }
-      this.deps.log(`thread ${t.threadId} on ${id} stopped on ${t.disabled ? "disabled access" : "the usage limit"} of ${t.account} ("${t.notice}"); ${t.account} skipped until ${new Date(account.limitedUntil).toISOString()}`);
+      this.deps.log(`thread ${t.threadId} on ${id} stopped on ${t.auth ? "a login failure" : t.disabled ? "disabled access" : "the usage limit"} of ${t.account} ("${t.notice}"); ${t.account} skipped until ${new Date(account.limitedUntil).toISOString()}`);
     }
     m.limitedThreads = limited.map(({ threadId, runId, account }) => ({ threadId, runId, account }));
     if (!m.limitedThreads.length) delete m.limitedThreads;

@@ -557,7 +557,7 @@ export async function busyThreads(r: Remote, id: MachineId, workspacePath: strin
 }
 
 /** Threads on the machine whose latest run failed on a usage limit, with the account it ran on. */
-export async function scanLimits(r: Remote, id: MachineId): Promise<(LimitedThread & { notice: string; requestedAt: string; disabled?: boolean })[]> {
+export async function scanLimits(r: Remote, id: MachineId): Promise<(LimitedThread & { notice: string; requestedAt: string; disabled?: boolean; auth?: boolean })[]> {
   const out = (await run(r, id, script("scan", 'node "$D/accounts.mjs" scan'), 120_000)).stdout;
   return JSON.parse(out.trim()).limited;
 }

@@ -72,6 +72,12 @@ export interface AccountState {
   limitedUntil?: number;
   /** An admin disabled this account's Claude access ("organization has disabled ..."); skipped for accountDisabledMinutes. */
   disabled?: boolean;
+  /** The account's login is revoked or expired ("could not authenticate"); skipped briefly, until a probe says it works. */
+  auth?: boolean;
+  /** The block above came from a probe or an auth failure, so a probe that says "ok" lifts it. */
+  probeBlocked?: boolean;
+  /** The last probe: what the account could do, when, and the CLI's own words. */
+  probe?: { at: number; kind: "ok" | "limit" | "disabled" | "auth" | "error"; note: string };
 }
 
 /** A thread on a leased machine whose latest run failed on an account's usage limit. */

@@ -7,7 +7,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 // @ts-ignore: plain JS module that runs on the machine
-import { applyAccounts, CONTINUE_MESSAGE, isDisabledNotice, limitNotice, main } from "../src/machine/accounts.mjs";
+import { applyAccounts, CONTINUE_MESSAGE, isDisabledNotice, limitNotice, main, isAuthNotice } from "../src/machine/accounts.mjs";
 
 const NOTICE = "Claude usage limit reached. This turn is paused until the 5-hour limit resets in 2h 2m.";
 
@@ -145,7 +145,7 @@ test("scan signs in once through MCP OAuth, caches the token and finds the limit
   const { env } = machineEnv(t3.origin);
 
   const out = await main(["scan"], env);
-  assert.deepEqual(out, { limited: [{ threadId: "t-1", runId: "run-1", account: "claudeAgent_acct1", requestedAt: "2026-11-19T12:00:00.000Z", notice: NOTICE, disabled: false }] });
+  assert.deepEqual(out, { limited: [{ threadId: "t-1", runId: "run-1", account: "claudeAgent_acct1", requestedAt: "2026-11-19T12:00:00.000Z", notice: NOTICE, disabled: false, auth: false }] });
   assert.equal(readFileSync(env.T3LIZARD_MCP_TOKEN_FILE, "utf8"), [...t3.issued][0]);
   assert.equal(statSync(env.T3LIZARD_MCP_TOKEN_FILE).mode & 0o777, 0o600);
 
@@ -207,4 +207,16 @@ test("configure-antigravity writes the hashed OAuth profile, enables Antigravity
   assert.deepEqual(s.providerInstances.antigravity, { driver: "antigravity", displayName: "Antigravity", enabled: true });
   assert.deepEqual(s.defaultModelSelection, { instanceId: "antigravity", model: "gemini-4-neon" });
   assert.equal(s.providerInstances.claudeAgent_acct1.enabled, true, "Claude instances are preserved");
+});
+
+test("a revoked or expired login is a notice marked auth, not disabled", () => {
+  const t3 = "Claude could not authenticate. For subscription login, run `claude auth login` on this environment's machine, then start a new thread.";
+  const claude = "Failed to authenticate: OAuth token revoked. Please log in again or contact your administrator.";
+  for (const text of [t3, claude]) {
+    assert.equal(isAuthNotice(text), true);
+    assert.equal(isDisabledNotice(text), false);
+    assert.equal(limitNotice("r1", [{ runId: "r1", title: "Provider error", text }]), text, "the scan treats it as a notice");
+  }
+  assert.equal(isAuthNotice("Claude usage limit reached."), false);
+  assert.equal(isAuthNotice("Your organization has disabled Claude subscription access"), false);
 });

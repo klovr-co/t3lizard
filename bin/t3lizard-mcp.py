@@ -98,7 +98,7 @@ TOOLS = [
     },
     {
         "name": "pool_status",
-        "description": "Machines (with size), queues and leases per repo, vCPU in use, spend, learned sizes, why creates are blocked, and which Claude accounts are limited until when.",
+        "description": "Machines (with size), queues and leases per repo, vCPU in use, spend, learned sizes, why creates are blocked, and for each Claude account whether it was checked and works (verified), or what is wrong with it and until when.",
         "inputSchema": {"type": "object", "properties": {}},
     },
 ]

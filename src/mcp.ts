@@ -91,7 +91,7 @@ export async function serveMcp(socket = paths(t3lizardHome()).socket): Promise<M
   );
   server.registerTool(
     "pool_status",
-    { description: "Machines (with size), queues and leases per repo, the size ladder in use, today's small-machine-hours against the daily budget, why creates are blocked, and which Claude accounts are limited until when." },
+    { description: "Machines (with size), queues and leases per repo, the size ladder in use, today's small-machine-hours against the daily budget, why creates are blocked, and for each Claude account whether it was checked and works (verified), or what is wrong with it and until when." },
     () => reply(() => call(socket, "GET", "/status")),
   );
 

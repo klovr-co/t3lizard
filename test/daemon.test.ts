@@ -22,7 +22,7 @@ async function harness(
   t: { after(fn: () => unknown): void },
   overrides: Partial<Config> = {},
   shared?: { home: string; lizard: FakeLizard; t3: FakeT3; clock: { now: number } },
-  extra?: { antigravityToken?: string },
+  extra?: { antigravityToken?: string; probe?: (token: string) => Promise<import("../src/probe.ts").ProbeResult> },
 ) {
   const home = shared?.home ?? mkdtempSync(join(tmpdir(), "t3lizard-daemon-"));
   const clock = shared?.clock ?? { now: Date.parse("2026-11-19T12:00:00Z") };
@@ -37,6 +37,7 @@ async function harness(
     machineEnv: { GH_TOKEN: "gh-secret" },
     accountTokens: Object.fromEntries(config.accounts.map((a) => [a, `token-of-${a}`])),
     ...(extra?.antigravityToken ? { antigravityToken: extra.antigravityToken } : {}),
+    ...(extra?.probe ? { probe: extra.probe } : {}),
     home,
     resolveRepo: async (r) => normalizeOrigin(r),
     now: () => clock.now,
@@ -597,4 +598,67 @@ test("a replaced account token reaches machines that are already running, not on
   assert.match(m.files.get("accounts.json")!.content, /replacement-token/);
   assert.equal(pushes(), before + 1);
   assert.doesNotMatch(readFileSync(paths(h.home).state, "utf8"), /replacement-token/, "the state file keeps only a fingerprint");
+});
+
+test("accounts are probed one per tick; broken ones are skipped, a probe that says ok lifts its own block", async (t) => {
+  const [A1, A2, A3, A4] = ["claudeAgent_acct1", "claudeAgent_acct2", "claudeAgent_acct3", "claudeAgent_acct4"];
+  const verdict: Record<string, import("../src/probe.ts").ProbeResult> = {
+    [`token-of-${A1}`]: { kind: "ok", note: "OK" },
+    [`token-of-${A2}`]: { kind: "disabled", note: "Your organization has disabled Claude subscription access" },
+    [`token-of-${A3}`]: { kind: "limit", note: "You've hit your 5-hour limit", resetsAt: Date.parse("2026-11-19T14:20:00Z") },
+    [`token-of-${A4}`]: { kind: "auth", note: "OAuth token revoked" },
+  };
+  const asked: string[] = [];
+  const h = await harness(t, { accounts: [A1, A2, A3, A4] }, undefined, { probe: async (token) => (asked.push(token), verdict[token]) });
+  const queued = await h.api("/acquire", { repo: REPO, ref: "main", holder: "thread-a" });
+  await h.daemon.settled();
+  await h.api("/wait", { ticketId: queued.ticketId, maxSeconds: 1 });
+
+  for (let i = 0; i < 4; i++) await h.advance(1);
+  assert.equal(new Set(asked).size, 4, "each account asked once, one per tick");
+  const acct = async (id: string) => (await h.api("/status")).accounts.find((a: { id: string }) => a.id === id);
+  assert.equal((await acct(A1)).verified, true);
+  assert.equal((await acct(A1)).free, true);
+  assert.deepEqual([(await acct(A2)).free, (await acct(A2)).disabled], [false, true]);
+  const a3 = await acct(A3);
+  assert.deepEqual([a3.free, a3.limitedUntil], [false, "2026-11-19T14:20:00.000Z"], "the limit lasts until the CLI's reset time");
+  assert.deepEqual([(await acct(A4)).free, (await acct(A4)).authFailed], [false, true]);
+  assert.match((await acct(A4)).probe, /^auth, \d+ min ago: OAuth token revoked/);
+  assert.equal((await h.api("/wait", { ticketId: queued.ticketId, maxSeconds: 1 })).lease.providerInstanceId, A1, "the lease names the verified account");
+
+  // acct4 gets a new login. After the auth recheck interval a probe says ok and the block lifts.
+  verdict[`token-of-${A4}`] = { kind: "ok", note: "OK" };
+  await h.advance(31); // acct2's recheck is due in the same tick, and only one probe runs per tick
+  await h.advance(1);
+  const a4 = await acct(A4);
+  assert.deepEqual([a4.free, a4.authFailed, a4.verified], [true, undefined, true]);
+  assert.match(h.logs.join("\n"), /claudeAgent_acct4 works again/);
+});
+
+test("a thread that fails to authenticate continues on another account, and a probe that says ok lifts the block", async (t) => {
+  const [A1, A2] = ["claudeAgent_acct1", "claudeAgent_acct2"];
+  const h = await harness(t, { accounts: [A1, A2], leaseMinutes: 120, lifetimeMinutes: 120, maxLifetimeMinutes: 240 }, undefined, {
+    probe: async () => ({ kind: "ok", note: "OK" }),
+  });
+  const queued = await h.api("/acquire", { repo: REPO, ref: "main", holder: "thread-a" });
+  await h.daemon.settled();
+  await h.api("/wait", { ticketId: queued.ticketId, maxSeconds: 1 });
+  await h.advance(1);
+  await h.advance(1);
+  const m = h.lizard.machines.get("sb-1")!;
+  const pushes = () => m.steps.filter((s) => s === "accounts").length;
+  const before = pushes();
+
+  h.lizard.limited.set("sb-1", [
+    { threadId: "t1", runId: "r1", account: A1, requestedAt: new Date(h.clock.now).toISOString(), notice: "Claude could not authenticate.", auth: true } as never,
+  ]);
+  await h.advance(1);
+  assert.deepEqual(h.lizard.continued, [["sb-1", "t1", "r1", A2]], "moved to the other account straight away");
+  const mid = (await h.api("/status")).accounts.find((a: { id: string }) => a.id === A1);
+  assert.deepEqual([mid.free, mid.authFailed], [false, true]);
+
+  await h.advance(1); // the probe of acct1 runs: ok, so the block lifts; the machine gets the current logins
+  const after = (await h.api("/status")).accounts.find((a: { id: string }) => a.id === A1);
+  assert.deepEqual([after.free, after.authFailed], [true, undefined]);
+  assert.ok(pushes() > before, "the machine was given the current logins again");
 });
