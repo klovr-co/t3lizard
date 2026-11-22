@@ -87,6 +87,8 @@ export class Daemon {
   private deps: DaemonDeps;
   private files: ReturnType<typeof paths>;
   private proxies = new Map<MachineId, Proxy>();
+  /** put and its cleanup run one at a time per machine, so a cleanup never races a write. */
+  private putChains = new Map<MachineId, Promise<unknown>>();
   private running = new Map<string, Promise<void>>();
   private createsInFlight = 0;
   private createsDone = 0;
@@ -230,34 +232,52 @@ export class Daemon {
     if (!/^[A-Za-z0-9+/]*={0,2}$/.test(req.contentBase64) || req.contentBase64.length % 4 !== 0) throw new ApiError(400, "contentBase64 is not base64");
     const content = Buffer.from(req.contentBase64, "base64");
     if (content.length > PUT_MAX_BYTES) throw new ApiError(400, `the file is over ${PUT_MAX_BYTES / 1024} KB`);
-    // Recorded before the write, so a write that half-worked is still cleaned up.
-    machine.putFiles = [...new Set([...(machine.putFiles ?? []), rel])];
-    this.save();
-    let path: string;
-    try {
-      path = await putFile(this.remote, machine.id, rel, req.contentBase64, mode);
-    } catch (e) {
-      // Only fixed words go back: the machine's output or a Lizard error could quote the content.
-      const msg = (e as Error).message;
-      const why = msg.match(/the path leaves the home folder|the path is a folder/)?.[0] ?? msg.match(/\(exit \d+\)/)?.[0] ?? "the machine did not answer";
-      throw new ApiError(502, `writing ~/${rel} on ${machine.id} failed: ${why}`);
-    }
+    const path = await this.onMachine(machine.id, async () => {
+      // The lease may have ended while this waited for the machine.
+      this.leased(req.leaseId);
+      // Recorded before the write, so a write that half-worked is still cleaned up.
+      this.trackPut(machine.id, rel);
+      let out: { path: string; rel: string };
+      try {
+        out = await putFile(this.remote, machine.id, rel, req.contentBase64, mode);
+      } catch (e) {
+        // Only fixed words go back: the machine's output or a Lizard error could quote the content.
+        const msg = (e as Error).message;
+        const why = msg.match(/the path leaves the home folder|the path is a folder/)?.[0] ?? msg.match(/\(exit \d+\)/)?.[0] ?? "the machine did not answer";
+        throw new ApiError(502, `writing ~/${rel} on ${machine.id} failed: ${why}`);
+      }
+      // Where it really landed, after links: cleanup removes that, whatever the links point to later.
+      this.trackPut(machine.id, out.rel);
+      return out.path;
+    });
     this.deps.log(`put ~/${rel} (${content.length} bytes, mode ${mode}) on ${machine.id} for ${lease.holder}`);
     return { path, bytes: content.length, mode };
   }
 
-  /** Removes the files put wrote on a machine. Throws when the machine cannot confirm it. */
-  private async cleanPuts(machineId: MachineId): Promise<void> {
-    const files = this.state.machines[machineId]?.putFiles;
-    if (!files?.length) return;
-    await removePutFiles(this.remote, machineId, files);
+  private trackPut(machineId: MachineId, rel: string): void {
     const m = this.state.machines[machineId];
-    if (m?.putFiles) {
-      m.putFiles = m.putFiles.filter((f) => !files.includes(f));
-      if (!m.putFiles.length) delete m.putFiles;
+    if (!m || m.putFiles?.includes(rel)) return;
+    m.putFiles = [...(m.putFiles ?? []), rel];
+    this.save();
+  }
+
+  private onMachine<T>(id: MachineId, fn: () => Promise<T>): Promise<T> {
+    const run = (this.putChains.get(id) ?? Promise.resolve()).catch(() => {}).then(fn);
+    this.putChains.set(id, run);
+    return run;
+  }
+
+  /** Removes the files put wrote on a machine. Throws when the machine cannot confirm it. */
+  private cleanPuts(machineId: MachineId): Promise<void> {
+    return this.onMachine(machineId, async () => {
+      const files = this.state.machines[machineId]?.putFiles;
+      if (!files?.length) return;
+      await removePutFiles(this.remote, machineId, files);
+      const m = this.state.machines[machineId];
+      if (m) delete m.putFiles;
       this.save();
-    }
-    this.deps.log(`removed ${files.length} put file(s) on ${machineId}`);
+      this.deps.log(`removed ${files.length} put file(s) on ${machineId}`);
+    });
   }
 
   private leased(leaseId: string): { lease: Lease; machine: Machine } {
@@ -799,10 +819,19 @@ export class Daemon {
       return m?.phase.kind === "resetting" && m.phase.ticketId === ticketId ? m : undefined;
     };
     const t = this.ticket(ticketId);
+    // A file the last holder put there must never reach the next one: no clean, no grant.
+    // The machine fails and closes; the ticket stays queued for another machine.
+    try {
+      await this.cleanPuts(machineId);
+    } catch (e) {
+      const m = reserved();
+      if (!m) return;
+      this.setPhase(m, { kind: "failed", error: `removing put files failed: ${(e as Error).message}` });
+      this.step();
+      return;
+    }
     let result: Awaited<ReturnType<typeof resetCheckout>>;
     try {
-      // A file the last holder put there must never reach the next one: no clean, no grant.
-      await this.cleanPuts(machineId);
       result = await resetCheckout(this.remote, machineId, this.state.machines[machineId].workspacePath!, t.ref);
     } catch (e) {
       const m = reserved();

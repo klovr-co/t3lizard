@@ -21,7 +21,7 @@ const routes: Record<string, (d: Daemon, body: unknown) => unknown> = {
     d.exec(z.object({ leaseId: id, command: id, timeoutMinutes: z.number().min(1).max(180).optional(), maxSeconds: z.number().min(0).max(300).optional() }).parse(b)),
   "POST /exec/wait": (d, b) => d.execWait(z.object({ leaseId: id, execId: id, maxSeconds: z.number().min(0).max(300).optional() }).parse(b)),
   "POST /put": (d, b) =>
-    d.put(z.object({ leaseId: id, path: id, contentBase64: z.string().max(100_000), mode: z.string().regex(/^[0-7]{3,4}$/).optional() }).parse(b)),
+    d.put(z.object({ leaseId: id, path: id, contentBase64: z.string().max(100_000), mode: z.string().regex(/^0?[0-7][0-7]0$/, "mode must give others no access, e.g. 600 or 640").optional() }).parse(b)),
   "POST /renew": (d, b) => d.renew(z.object({ leaseId: id }).parse(b)),
   "POST /connect": (d, b) => d.connect(z.object({ machineId: id.optional() }).parse(b)),
   "POST /close": (d, b) => d.close(z.object({ machineId: id }).parse(b)),

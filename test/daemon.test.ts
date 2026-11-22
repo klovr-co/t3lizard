@@ -574,6 +574,7 @@ test("put writes a file under the home of a leased machine, keeps the content ou
     await assert.rejects(h.api("/put", { leaseId, path, contentBase64 }), /home folder|control character/, path);
   }
   await assert.rejects(h.api("/put", { leaseId, path: "x", contentBase64, mode: "u+rw" }), (e: Error) => !e.message.includes(contentBase64));
+  for (const mode of ["644", "666", "4700", "0604"]) await assert.rejects(h.api("/put", { leaseId, path: "x", contentBase64, mode }), /others no access/, mode);
   await assert.rejects(h.api("/put", { leaseId, path: "x", contentBase64: "not base64!" }), /not base64/);
   await assert.rejects(h.api("/put", { leaseId, path: "x", contentBase64: Buffer.alloc(70 * 1024).toString("base64") }), /over 64 KB/);
   await assert.rejects(h.api("/put", { leaseId: "nope", path: "x", contentBase64 }), /no lease nope/);
@@ -638,4 +639,30 @@ test("files put on a machine are removed when the lease ends, and a machine that
   await h.daemon.settled();
   const third = await h.api("/wait", { ticketId: a3.ticketId, maxSeconds: 1 });
   assert.notEqual(third.lease?.machineId, first.machineId, "never handed out with the last holder's file on it");
+  assert.notEqual(third.status, "cancelled", "the new holder's ticket is not cancelled for it");
+  const status = await h.api("/status");
+  const old = status.pools["github.com/acme/app"]?.machines?.find((x: { id: string }) => x.id === first.machineId);
+  assert.ok(!old || /failed|closing|closed/.test(JSON.stringify(old)), `the machine is failed or closed: ${JSON.stringify(old)}`);
+});
+
+test("a lease that ends during a put leaves nothing behind: the cleanup waits for the write", async (t) => {
+  const h = await harness(t);
+  const a0 = await h.api("/acquire", { repo: REPO, ref: "main", holder: "thread-a" });
+  await h.daemon.settled();
+  const lease = (await h.api("/wait", { ticketId: a0.ticketId, maxSeconds: 1 })).lease;
+  const m = h.lizard.machines.get(lease.machineId)!;
+  let finishWrite!: () => void;
+  const writing = new Promise<void>((r) => (finishWrite = r));
+  const realExec = h.lizard.exec.bind(h.lizard);
+  h.lizard.exec = async (id, cmd, timeoutMs) => {
+    if (cmd[2].includes("# t3lizard:put\n")) await writing;
+    return realExec(id, cmd, timeoutMs);
+  };
+  const put = h.api("/put", { leaseId: lease.leaseId, path: "~/.env", contentBase64: Buffer.from("A=1").toString("base64") });
+  await new Promise((r) => setTimeout(r, 50));
+  await h.api("/release", { leaseId: lease.leaseId });
+  finishWrite();
+  await put.catch(() => {});
+  await h.daemon.settled();
+  assert.ok(!m.files.has("~/.env"), "the file written after release is removed");
 });

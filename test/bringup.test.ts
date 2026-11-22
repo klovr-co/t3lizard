@@ -292,8 +292,13 @@ test("putFile writes under the home folder in a real shell, with the mode, and n
   const secret = "S3CRET-value\nline two\n";
   const b64 = Buffer.from(secret).toString("base64");
 
-  const path = await putFile(r, "sb-1", ".config/test-org/secrets.env", b64, "600");
-  assert.equal(path, join(home, ".config/test-org/secrets.env"));
+  const { path, rel } = await putFile(r, "sb-1", ".config/test-org/secrets.env", b64, "600");
+  assert.ok(path.endsWith("/.config/test-org/secrets.env"));
+  assert.equal(rel, ".config/test-org/secrets.env");
+  assert.equal((await putFile(r, "sb-1", "top.env", b64, "600")).rel, "top.env", "a file right in home");
+  // Through a link inside home, the resolved place is reported, so cleanup removes that one.
+  symlinkSync(join(home, ".config"), join(home, "cfg"));
+  assert.equal((await putFile(r, "sb-1", "cfg/via-link.env", b64, "600")).rel, ".config/via-link.env");
   assert.equal(readFileSync(path, "utf8"), secret);
   assert.equal(statSync(path).mode & 0o777, 0o600);
   assert.equal(statSync(join(home, ".config/test-org")).mode & 0o777, 0o700, "new folders are private");
@@ -308,7 +313,10 @@ test("putFile writes under the home folder in a real shell, with the mode, and n
 
   // Cleanup removes the file, and never a file a link leads to outside home.
   writeFileSync(join(outside, "keep.txt"), "keep");
-  await removePutFiles(r, "sb-1", [".config/test-org/secrets.env", "escape/keep.txt", "never-written"]);
+  writeFileSync(join(home, ".config/test-org/.t3lizard-put.AbC123"), "left by a killed write");
+  await removePutFiles(r, "sb-1", [".config/test-org/secrets.env", "top.env", "escape/keep.txt", "never-written"]);
   assert.throws(() => readFileSync(path));
+  assert.throws(() => readFileSync(join(home, "top.env")));
+  assert.throws(() => readFileSync(join(home, ".config/test-org/.t3lizard-put.AbC123")), "temp files go too");
   assert.equal(readFileSync(join(outside, "keep.txt"), "utf8"), "keep");
 });

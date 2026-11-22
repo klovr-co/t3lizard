@@ -126,7 +126,7 @@ t3lizard put <leaseId> .env.local --mode 640 < .env.local
 - It reads the content from stdin, so the value never shows in a command line, a tool argument or a transcript.
 - Only a live lease's id works. The file goes away with the machine.
 - The path must be under the sandbox user's home: `~/x`, `/home/user/x` or `x`. A `..` part, or a symlink that leads out, is refused.
-- The file is written to a temp file with umask 077, given the mode (default `600`), then moved into place. At most 64 KB.
+- The file is written to a temp file with umask 077, given the mode (default `600`; a mode that gives others any access, or a setuid bit, is refused), then moved into place. At most 64 KB.
 - The daemon logs the path, the size and the holder, never the content. The content is not saved in `state.json`, and no answer or error quotes it.
 - There is no MCP tool for this on purpose: a tool argument is saved in the agent's transcript.
 
