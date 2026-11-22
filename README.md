@@ -120,12 +120,14 @@ Instead, the lease holder writes the file onto its own leased machine:
 
 ```sh
 infisical export --format=dotenv ... | t3lizard put <leaseId> ~/.config/app/secrets.env
-t3lizard put <leaseId> .env.local --mode 640 < .env.local
+t3lizard put <leaseId> /home/user/<repo>/apps/app/.env.local --mode 640 < apps/app/.env.local
 ```
 
 - It reads the content from stdin, so the value never shows in a command line, a tool argument or a transcript.
-- Only a live lease's id works. The file goes away with the machine.
-- The path must be under the sandbox user's home: `~/x`, `/home/user/x` or `x`. A `..` part, or a symlink that leads out, is refused.
+- Only a live lease's id works.
+- The daemon removes every file `put` wrote when the lease ends, and hands the machine to the next job only after that works. If the removal fails, the machine is closed.
+- Files the job makes from them (a browser state with session cookies, say) are not removed. The job deletes them before the lease ends.
+- The path must be under the sandbox user's home: `~/x`, `/home/user/x` or `x`. A relative path is under home, not the checkout: for a file in the checkout, give `lease.workspacePath` plus the file. A `..` part, or a symlink that leads out, is refused.
 - The file is written to a temp file with umask 077, given the mode (default `600`; a mode that gives others any access, or a setuid bit, is refused), then moved into place. At most 64 KB.
 - The daemon logs the path, the size and the holder, never the content. The content is not saved in `state.json`, and no answer or error quotes it.
 - There is no MCP tool for this on purpose: a tool argument is saved in the agent's transcript.
