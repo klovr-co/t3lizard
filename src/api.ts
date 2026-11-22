@@ -20,6 +20,8 @@ const routes: Record<string, (d: Daemon, body: unknown) => unknown> = {
   "POST /exec": (d, b) =>
     d.exec(z.object({ leaseId: id, command: id, timeoutMinutes: z.number().min(1).max(180).optional(), maxSeconds: z.number().min(0).max(300).optional() }).parse(b)),
   "POST /exec/wait": (d, b) => d.execWait(z.object({ leaseId: id, execId: id, maxSeconds: z.number().min(0).max(300).optional() }).parse(b)),
+  "POST /put": (d, b) =>
+    d.put(z.object({ leaseId: id, path: id, contentBase64: z.string().max(100_000), mode: z.string().regex(/^0?[0-7][0-7]0$/, "mode must give others no access, e.g. 600 or 640").optional() }).parse(b)),
   "POST /renew": (d, b) => d.renew(z.object({ leaseId: id }).parse(b)),
   "POST /connect": (d, b) => d.connect(z.object({ machineId: id.optional() }).parse(b)),
   "POST /close": (d, b) => d.close(z.object({ machineId: id }).parse(b)),
@@ -44,10 +46,17 @@ export async function serveApi(daemon: Daemon, socketPath: string): Promise<http
       if (!route) return send(404, { error: `no route ${req.method} ${req.url}` });
       let raw = "";
       for await (const chunk of req) raw += chunk;
-      send(200, await route(daemon, raw ? JSON.parse(raw) : {}));
+      let body: unknown = {};
+      try {
+        body = raw ? JSON.parse(raw) : {};
+      } catch {
+        // JSON.parse quotes part of the body in its message, and a body can hold a secret (POST /put).
+        return send(400, { error: "the request body is not valid JSON" });
+      }
+      send(200, await route(daemon, body));
     } catch (e) {
       if (e instanceof ApiError) return send(e.status, { error: e.message });
-      if (e instanceof z.ZodError || e instanceof SyntaxError) return send(400, { error: e.message });
+      if (e instanceof z.ZodError) return send(400, { error: e.message });
       send(500, { error: (e as Error).message });
     }
   });
