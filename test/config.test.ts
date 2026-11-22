@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_CONFIG, loadConfig, parseConfig } from "../src/config.ts";
+import { DEFAULT_CONFIG, loadConfig, loadSecrets, parseConfig } from "../src/config.ts";
 
 test("the default ladder is the trial's 1 small and 2 mini; nano is left out", () => {
   assert.deepEqual(DEFAULT_CONFIG.sizes, [{ size: "small", max: 1 }, { size: "mini", max: 2 }]);
@@ -36,4 +36,11 @@ test("loadConfig names the file in its error", () => {
   const home = mkdtempSync(join(tmpdir(), "t3lizard-config-"));
   writeFileSync(join(home, "config.json"), JSON.stringify({ size: "small", sizes: [{ size: "mini", max: 1 }] }));
   assert.throws(() => loadConfig(home), new RegExp(`bad ${home}/config\\.json: give "sizes"`));
+});
+
+test("loadSecrets reads the environment, and the environment wins over secrets.env", () => {
+  const home = mkdtempSync(join(tmpdir(), "t3lizard-secrets-"));
+  assert.deepEqual(loadSecrets(home, { LIZARD_API_KEY: "env" }), { LIZARD_API_KEY: "env" });
+  writeFileSync(join(home, "secrets.env"), "LIZARD_API_KEY=file\nGH_TOKEN=file\n");
+  assert.deepEqual(loadSecrets(home, { LIZARD_API_KEY: "env" }), { LIZARD_API_KEY: "env", GH_TOKEN: "file" });
 });

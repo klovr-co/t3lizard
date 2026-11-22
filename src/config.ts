@@ -145,9 +145,15 @@ export function parseEnvFile(text: string): Record<string, string> {
   return out;
 }
 
-export function loadSecrets(home: string): Record<string, string> {
+/**
+ * Secrets come from the process environment (`infisical run -- t3lizard daemon`), with secrets.env as an
+ * optional fallback. The environment wins, so Infisical is the source of truth when both exist.
+ */
+export function loadSecrets(home: string, env: NodeJS.ProcessEnv = process.env): Record<string, string> {
   const file = paths(home).secrets;
-  return existsSync(file) ? parseEnvFile(readFileSync(file, "utf8")) : {};
+  const fromFile = existsSync(file) ? parseEnvFile(readFileSync(file, "utf8")) : {};
+  const fromEnv = Object.fromEntries(Object.entries(env).filter((e): e is [string, string] => !!e[1]));
+  return { ...fromFile, ...fromEnv };
 }
 
 const ACCOUNT_TOKEN = /^CLAUDE_CODE_OAUTH_TOKEN(?:_([1-9]\d*))?$/;

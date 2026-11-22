@@ -64,7 +64,7 @@ async function realDaemon(home: string): Promise<void> {
   const secrets = loadSecrets(home);
   const accounts = accountsFromSecrets(secrets);
   const config = { ...loadConfig(home), accounts: accounts.map((a) => a.id) };
-  if (!secrets.LIZARD_API_KEY) throw new Error(`LIZARD_API_KEY missing from ${paths(home).secrets}`);
+  if (!secrets.LIZARD_API_KEY) throw new Error(`LIZARD_API_KEY missing from the environment and ${paths(home).secrets}`);
   if (!config.project) throw new Error(`"project" (the Lizard project id) missing from ${paths(home).config}`);
   // Claude tokens never go machine-wide: each lives only in its own account's T3 provider instance.
   const machineEnv = Object.fromEntries(config.forwardEnv.flatMap((k) => (secrets[k] && !isAccountTokenKey(k) ? [[k, secrets[k]]] : [])));
@@ -100,15 +100,14 @@ async function doctor(home: string): Promise<string[]> {
     return `project ${c.project}, template ${c.template}, sizes ${ladder}, perRepoCap ${c.perRepoCap}, budget ${c.dailySmallMachineHours} small-machine-hours a day`;
   });
   await check("secrets", () => {
-    if (!existsSync(p.secrets)) throw new Error(`${p.secrets} does not exist`);
-    if (statSync(p.secrets).mode & 0o077) throw new Error(`${p.secrets} must be mode 600`);
+    if (existsSync(p.secrets) && statSync(p.secrets).mode & 0o077) throw new Error(`${p.secrets} must be mode 600`);
     const s = loadSecrets(home);
     const missing = ["LIZARD_API_KEY", ...loadConfig(home).forwardEnv.filter((k) => !isAccountTokenKey(k))].filter((k) => !s[k]);
     if (missing.length) throw new Error(`missing ${missing.join(", ")}`);
   });
   await check("claude accounts", () => {
     const accounts = accountsFromSecrets(loadSecrets(home));
-    if (!accounts.length) throw new Error(`no CLAUDE_CODE_OAUTH_TOKEN or CLAUDE_CODE_OAUTH_TOKEN_<N> in ${p.secrets}`);
+    if (!accounts.length) throw new Error(`no CLAUDE_CODE_OAUTH_TOKEN or CLAUDE_CODE_OAUTH_TOKEN_<N> in the environment or ${p.secrets}`);
     return accounts.map((a) => a.id).join(", ");
   });
   await check("local t3", () => realLocalT3().version());
