@@ -195,7 +195,7 @@ Release: the client calls `release(leaseId)`. A crashed client: the lease expire
 - A failed bring-up marks the machine `failed` and closes it at once.
 - Create circuit breaker (live test, 2026-11-20: a machine dropped right after create made the daemon create 7 sandboxes in 90 s). Every create that Lizard answers is kept in `state.creates` (24 h) as `pending`, then `ready` (reached idle) or `lost` (bring-up failed, vanished at Lizard, or closed before ready). `plan()` reads it:
   - Backoff: after N machines in a row (any repo) that never became ready, no creates for 2, 5, then 15 minutes (`CREATE_BACKOFF_MINUTES`) after the last loss. One ready machine resets the count.
-  - Hourly cap: at most `createsPerRepoPerHour` (default 3) creates per repo in any rolling hour, short-lived ones included. One tick never plans past it.
+  - Hourly cap: at most `createsPerRepoPerHour` (default 20) creates per repo in any rolling hour, short-lived ones included. One tick never plans past it.
   - Both show as the queued ticket's `reason` and in `status`.
   - A Lizard create error is not a create (no machine was made); it pauses creates as before.
 - Usage, in weighted seconds (`SIZE_WEIGHT` of the machine's size): each create adds `createChargeMinutes` (default 10) to the UTC day's bucket at once, so a loop of short-lived machines still runs into `dailySmallMachineHours`. Each tick (and each close) then adds every machine's time since `usageAccruedAt`, skipping its first `createChargeMinutes`. Machines bill while the daemon is down, so that time counts too.
@@ -216,7 +216,7 @@ Release: the client calls `release(leaseId)`. A crashed client: the lease expire
   "leaseMinutes": 90,
   "ticketMaxWaitMinutes": 60,
   "dailySmallMachineHours": 20,
-  "createsPerRepoPerHour": 3,
+  "createsPerRepoPerHour": 20,
   "createChargeMinutes": 10,
   "proxyPortRange": [47300, 47399],
   "forwardEnv": ["GH_TOKEN"],

@@ -66,7 +66,7 @@ The config file is `~/.t3lizard/config.json`. Every key is optional except `proj
   "leaseMinutes": 90,
   "ticketMaxWaitMinutes": 60,
   "dailySmallMachineHours": 20,
-  "createsPerRepoPerHour": 3,
+  "createsPerRepoPerHour": 20,
   "createChargeMinutes": 10,
   "proxyPortRange": [47300, 47399],
   "forwardEnv": ["GH_TOKEN"],
