@@ -411,7 +411,8 @@ export async function pushAccounts(r: Remote, id: MachineId, accounts: Account[]
 export async function cloneRepo(r: Remote, id: MachineId, repo: RepoKey): Promise<string> {
   const name = repo.split("/").pop() ?? "repo";
   const body = `dir="$HOME/$2"
-if [ ! -d "$dir/.git" ]; then git clone "$1" "$dir"; fi
+# A clone cut short (the daemon restarted mid-clone) leaves a .git with no commit and no files: clone again.
+if ! git -C "$dir" rev-parse --verify -q HEAD > /dev/null 2>&1; then rm -rf "$dir"; git clone "$1" "$dir"; fi
 echo "WORKSPACE=$dir"`;
   const out = (await run(r, id, script("clone", body, cloneUrl(repo), name), 600_000)).stdout;
   const path = out.match(/^WORKSPACE=(.+)$/m)?.[1];
