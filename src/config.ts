@@ -31,7 +31,7 @@ export const DEFAULT_CONFIG: Config = {
   idleCloseMinutes: 10,
   recycleMinutes: 240,
   lifetimeMinutes: 60,
-  maxLifetimeMinutes: 60,
+  maxLifetimeMinutes: 180,
   leaseMinutes: 90,
   ticketMaxWaitMinutes: 60,
   dailySmallMachineHours: 20,
