@@ -212,6 +212,11 @@ export interface Config {
   project: string;
   /** Lizard template. Must be a glibc image: the T3 binary does not run on musl (Alpine). */
   template: string;
+  /**
+   * Metadata key marking this daemon's sandboxes (default "t3lizard"). Two daemons on one Lizard API key must use
+   * different tags, or each kills the other's machines as orphans. Lizard's "Sandbox already deleted" is how it shows.
+   */
+  sandboxTag?: string;
   /** The size ladder, largest first. A ticket that needs a new machine gets the largest size with room. */
   sizes: SizeSlot[];
   perRepoCap: number;

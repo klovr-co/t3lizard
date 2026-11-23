@@ -58,6 +58,7 @@ const ConfigFile = z
   .object({
     project: z.string(),
     template: z.string().min(1),
+    sandboxTag: z.string().regex(/^[A-Za-z][\w-]{0,63}$/),
     /** max is optional with vcpuLimit: then the vCPU limit decides how many of each fit. */
     sizes: z.array(z.object({ size: SizeName, max: positive.optional() }).strict()).min(1),
     /** Older configs: one size, at most totalCap machines. Read as sizes [{ size, max: totalCap }]. */

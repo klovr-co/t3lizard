@@ -58,6 +58,12 @@ export interface SandboxDirectory {
   getInfo(id: MachineId): Promise<{ status?: string; metadata?: Record<string, string> } | undefined>;
 }
 
+/**
+ * The metadata key that marks a sandbox as made by this daemon. Two daemons on one Lizard key that share a tag
+ * kill each other's machines as orphans (each sees the other's as unknown), so each daemon needs its own.
+ */
+export const DEFAULT_TAG = "t3lizard";
+
 const ENDED = new Set(["stopped", "crashed"]);
 
 /**
@@ -65,7 +71,7 @@ const ENDED = new Set(["stopped", "crashed"]);
  * Metadata is fixed at create, so each sandbox costs one getInfo call, cached by id.
  * A sandbox whose getInfo fails is left out this round: when in doubt it is not ours.
  */
-export function ownSandboxLister(dir: SandboxDirectory): () => Promise<MachineId[]> {
+export function ownSandboxLister(dir: SandboxDirectory, tag = DEFAULT_TAG): () => Promise<MachineId[]> {
   const mine = new Map<MachineId, boolean>();
   return async () => {
     const listed = await dir.listSandboxes();
@@ -80,7 +86,7 @@ export function ownSandboxLister(dir: SandboxDirectory): () => Promise<MachineId
       if (ours === undefined) {
         const info = await dir.getInfo(id).catch(() => undefined);
         if (!info) continue;
-        ours = info.metadata?.t3lizard === "1";
+        ours = info.metadata?.[tag] === "1";
         mine.set(id, ours);
       }
       if (ours) own.push(id);
@@ -95,7 +101,8 @@ export async function sandboxAlive(dir: SandboxDirectory, id: MachineId): Promis
   return !!info && !ENDED.has(String(info.status));
 }
 
-export function realLizard(opts: { apiKey: string; projectId: string; user: string; template: string }): Lizard {
+export function realLizard(opts: { apiKey: string; projectId: string; user: string; template: string; tag?: string }): Lizard {
+  const tag = opts.tag ?? DEFAULT_TAG;
   const conn = { apiKey: opts.apiKey };
   const sandbox = (id: MachineId) => new Sandbox({ sandboxId: id, ...conn });
   const dir: SandboxDirectory = {
@@ -109,7 +116,7 @@ export function realLizard(opts: { apiKey: string; projectId: string; user: stri
       }
     },
   };
-  const listOwn = ownSandboxLister(dir);
+  const listOwn = ownSandboxLister(dir, tag);
 
   return {
     create: (repo, size, lifetimeMs, snapshotId) =>
@@ -119,9 +126,12 @@ export function realLizard(opts: { apiKey: string; projectId: string; user: stri
           projectId: opts.projectId,
           size,
           timeoutMs: lifetimeMs,
-          metadata: { t3lizard: "1", repo },
+          metadata: { [tag]: "1", repo },
           ...(snapshotId ? { snapshotId } : {}),
         });
+        // Lizard answers "Sandbox already deleted" (NotFoundError) to calls made in the first moments after create.
+        // Hand the machine to bring-up only once it runs a command, or every bring-up loses this race.
+        await waitReady(sb, opts.user);
         const info = await sb.getInfo().catch(() => undefined);
         const end = info?.endAt ? Date.parse(info.endAt) : NaN;
         return { id: sb.sandboxId, deadline: Number.isFinite(end) ? end : Date.now() + lifetimeMs };
@@ -146,6 +156,23 @@ export function realLizard(opts: { apiKey: string; projectId: string; user: stri
     setTimeout: (id, msFromNow) => mapErrors(() => sandbox(id).setTimeout(msFromNow)),
     kill: (id) => mapErrors(async () => void (await sandbox(id).kill())),
   };
+}
+
+/** Runs `true` on a new sandbox until it answers. Only NotFoundError is retried: it is how Lizard says "not up yet". */
+export async function waitReady(sb: Pick<Sandbox, "process">, user: string, timeoutMs = 90_000, pauseMs = 1_000): Promise<void> {
+  const end = Date.now() + timeoutMs;
+  let last: unknown;
+  while (Date.now() < end) {
+    try {
+      await sb.process.exec(["true"], { timeoutMs: 15_000, user });
+      return;
+    } catch (e) {
+      if (!(e instanceof NotFoundError)) throw e;
+      last = e;
+    }
+    await new Promise((r) => setTimeout(r, pauseMs));
+  }
+  throw last ?? new Error(`sandbox did not answer within ${Math.round(timeoutMs / 1000)} s`);
 }
 
 async function mapErrors<T>(fn: () => Promise<T>): Promise<T> {
