@@ -86,6 +86,7 @@ const ConfigFile = z
     idleMaxMinutes: positive,
     vcpuReserve: z.number().min(0),
     vcpuPoolMax: z.number().positive(),
+    owner: z.string().min(1),
     defaultSize: SizeName,
     dashboardPort: z.number().int().min(0),
     publicBind: z.array(z.string().min(1)),

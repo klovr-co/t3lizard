@@ -300,8 +300,8 @@ done
 `;
 
 /** What T3 shows for the machine, e.g. "t3lizard aldrent · arrow-universe-1yxp (mini)". */
-export function machineLabel(repo: RepoKey, id: MachineId, size: string): string {
-  return `t3lizard ${repo.split("/").pop()} · ${id} (${size})`;
+export function machineLabel(repo: RepoKey, id: MachineId, size: string, owner?: string): string {
+  return `t3lizard${owner ? ` ${owner}` : ""} · ${repo.split("/").pop()} · ${id} (${size})`;
 }
 
 export interface Account {

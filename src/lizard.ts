@@ -10,7 +10,7 @@ export interface ExecResult {
 /** Everything t3lizard needs from Lizard. The daemon depends on this, so tests use a fake. */
 export interface Lizard {
   /** With snapshotId the machine starts from that saved snapshot, at the snapshot's own size (`size` is then ignored by Lizard). */
-  create(repo: RepoKey, size: Size, lifetimeMs: number, snapshotId?: string): Promise<{ id: MachineId; deadline: number }>;
+  create(repo: RepoKey, size: Size, lifetimeMs: number, snapshotId?: string, labels?: Record<string, string>): Promise<{ id: MachineId; deadline: number }>;
   /** Saves the machine's files as a private snapshot (about 2 s) and waits until it is ready. Returns its id. Storage is billed until it is deleted. */
   snapshot(id: MachineId, name: string): Promise<string>;
   deleteSnapshot(snapshotId: string): Promise<void>;
@@ -122,14 +122,14 @@ export function realLizard(opts: { apiKey: string; projectId: string; user: stri
           .map((s) => ({ id: (s.sandboxId ?? s.id) as MachineId, vcpu: SIZE_VCPU[s.size as Size] ?? SIZE_VCPU.medium }))
           .filter((s) => s.id);
       }),
-    create: (repo, size, lifetimeMs, snapshotId) =>
+    create: (repo, size, lifetimeMs, snapshotId, labels) =>
       mapErrors(async () => {
         const sb = await Sandbox.create(opts.template, {
           ...conn,
           projectId: opts.projectId,
           size,
           timeoutMs: lifetimeMs,
-          metadata: { t3lizard: "1", repo },
+          metadata: { ...labels, t3lizard: "1", repo },
           ...(snapshotId ? { snapshotId } : {}),
         });
         const info = await sb.getInfo().catch(() => undefined);
