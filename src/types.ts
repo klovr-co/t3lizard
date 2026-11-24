@@ -212,6 +212,11 @@ export interface Config {
   project: string;
   /** Lizard template. Must be a glibc image: the T3 binary does not run on musl (Alpine). */
   template: string;
+  /**
+   * Metadata key marking this daemon's sandboxes (default "t3lizard"). Two daemons on one Lizard API key must use
+   * different tags, or each kills the other's machines as orphans. Lizard's "Sandbox already deleted" is how it shows.
+   */
+  sandboxTag?: string;
   /** The size ladder, largest first. A ticket that needs a new machine gets the largest size with room. */
   sizes: SizeSlot[];
   perRepoCap: number;
@@ -225,6 +230,12 @@ export interface Config {
   dailySmallMachineHours: number;
   /** At most this many creates per repo in any rolling hour. */
   createsPerRepoPerHour: number;
+  /**
+   * false: machines are not linked to this computer's T3 (no proxy, no `t3 environment link`), so
+   * the "Linked environments" Labs setting is not needed. pool_exec and pool_exec_wait work; agent
+   * threads on the machine (delegate_task) do not. Default true.
+   */
+  linkEnvironment?: boolean;
   /** Each create counts at least this long (times its size weight) against the budget, however short the machine lived. */
   createChargeMinutes: number;
   proxyPortRange: [number, number];

@@ -31,11 +31,12 @@ export const DEFAULT_CONFIG: Config = {
   idleCloseMinutes: 10,
   recycleMinutes: 240,
   lifetimeMinutes: 60,
-  maxLifetimeMinutes: 60,
+  maxLifetimeMinutes: 180,
   leaseMinutes: 90,
   ticketMaxWaitMinutes: 60,
   dailySmallMachineHours: 20,
   createsPerRepoPerHour: 20,
+  linkEnvironment: true,
   createChargeMinutes: 10,
   proxyPortRange: [47300, 47399],
   forwardEnv: ["GH_TOKEN"],
@@ -57,6 +58,7 @@ const ConfigFile = z
   .object({
     project: z.string(),
     template: z.string().min(1),
+    sandboxTag: z.string().regex(/^[A-Za-z][\w-]{0,63}$/),
     /** max is optional with vcpuLimit: then the vCPU limit decides how many of each fit. */
     sizes: z.array(z.object({ size: SizeName, max: positive.optional() }).strict()).min(1),
     /** Older configs: one size, at most totalCap machines. Read as sizes [{ size, max: totalCap }]. */
@@ -73,6 +75,7 @@ const ConfigFile = z
     /** Older name of dailySmallMachineHours. */
     dailyMachineHours: z.number().positive(),
     createsPerRepoPerHour: positive,
+    linkEnvironment: z.boolean(),
     createChargeMinutes: z.number().int().min(0),
     proxyPortRange: z.tuple([positive, positive]),
     forwardEnv: z.array(z.string()),

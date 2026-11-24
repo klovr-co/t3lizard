@@ -23,6 +23,8 @@ import type { AccountId, Action, CloseReason, Config, CreateRecord, Lease, Machi
 
 const MINUTE = 60_000;
 const PENDING = "pending:";
+/** Stands in for an environment id on machines brought up with linkEnvironment: false. */
+const NO_LINK = "unlinked";
 const BUSY_LEASE_GRACE_MS = 10 * MINUTE;
 /** A leased machine that has not answered this long is closed (see noAnswer). */
 const UNRESPONSIVE_CLOSE_MS = 10 * MINUTE;
@@ -936,27 +938,32 @@ export class Daemon {
         this.deps.log(`machine ${id}: ${m.repo} setup done`);
         this.save();
       }
-      if (!m.hostname || !m.accessToken) {
-        // Lizard exposes the front proxy, never T3 itself: see src/machine/front.mjs.
-        const { hostname, accessToken } = await this.deps.lizard.exposePort(id, FRONT_PORT);
-        m = at("linking");
-        Object.assign(m, { hostname, accessToken });
-        this.save();
-      }
-      if (!this.proxies.has(id)) {
-        await this.openProxy(m);
-        m = at("linking");
-      }
-      if (m.frontHost !== `127.0.0.1:${m.proxyPort}`) {
-        const host = await configureFront(this.remote, id, m.proxyPort!);
-        m = at("linking");
-        m.frontHost = host;
-        this.save();
-      }
-      if (!m.environmentId) {
-        linkedNow = await pairAndLink(this.remote, this.deps.t3, id, m.proxyPort!);
-        m = at("linking");
-        m.environmentId = linkedNow;
+      if (this.deps.config.linkEnvironment === false) {
+        // exec-only: pool_exec goes through Lizard's exec API, so no proxy and no link are needed.
+        m.environmentId ??= NO_LINK;
+      } else {
+        if (!m.hostname || !m.accessToken) {
+          // Lizard exposes the front proxy, never T3 itself: see src/machine/front.mjs.
+          const { hostname, accessToken } = await this.deps.lizard.exposePort(id, FRONT_PORT);
+          m = at("linking");
+          Object.assign(m, { hostname, accessToken });
+          this.save();
+        }
+        if (!this.proxies.has(id)) {
+          await this.openProxy(m);
+          m = at("linking");
+        }
+        if (m.frontHost !== `127.0.0.1:${m.proxyPort}`) {
+          const host = await configureFront(this.remote, id, m.proxyPort!);
+          m = at("linking");
+          m.frontHost = host;
+          this.save();
+        }
+        if (!m.environmentId) {
+          linkedNow = await pairAndLink(this.remote, this.deps.t3, id, m.proxyPort!);
+          m = at("linking");
+          m.environmentId = linkedNow;
+        }
       }
       this.settleCreate(id, "ready");
       this.setPhase(m, { kind: "idle", since: this.deps.now() });
@@ -1077,6 +1084,7 @@ export class Daemon {
     await this.closeProxy(id);
     const m = this.state.machines[id];
     if (!m) return;
+    if (m.environmentId === NO_LINK) m.environmentId = undefined;
     if (m.environmentId) {
       try {
         await this.deps.t3.unlink(m.environmentId);

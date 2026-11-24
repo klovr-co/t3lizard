@@ -22,6 +22,11 @@ const USAGE = `t3lizard: a pool of Lizard cloud machines running T3 Code, per re
   t3lizard put <leaseId> <path> [--mode 600] < file
                                            write stdin to a file under the machine's home (a login, an .env);
                                            the content is never logged or echoed
+  t3lizard exec <leaseId> [--max <seconds>] -- <shell command>
+                                           run a command on the machine, in its checkout, with no agent; waits up to
+                                           --max (default 120, at most 300); a longer job returns an execId
+  t3lizard exec-wait <leaseId> <execId> [--max <seconds>]
+                                           wait for a still-running exec; prints its exit code and output tail
   t3lizard renew <leaseId>                 push the lease expiry out by leaseMinutes
   t3lizard status                          pools, queues, leases, budget
   t3lizard bake <repo> [size]              build the repo's snapshot (new machines start from it)
@@ -76,7 +81,7 @@ async function realDaemon(home: string): Promise<void> {
   // Provider tokens never go machine-wide: each lives only in its own T3 provider instance or profile.
   const machineEnv = Object.fromEntries(config.forwardEnv.flatMap((k) => (secrets[k] && !isAccountTokenKey(k) ? [[k, secrets[k]]] : [])));
   await runDaemon({
-    lizard: realLizard({ apiKey: secrets.LIZARD_API_KEY, projectId: config.project, user: config.sandboxUser, template: config.template }),
+    lizard: realLizard({ apiKey: secrets.LIZARD_API_KEY, projectId: config.project, user: config.sandboxUser, template: config.template, tag: config.sandboxTag }),
     t3: realLocalT3(),
     config,
     machineEnv,
@@ -178,6 +183,16 @@ export async function main(argv: string[]): Promise<number> {
       print(await call(socket, "POST", "/put", { leaseId: args[0], path: args[1], contentBase64: Buffer.concat(chunks).toString("base64"), ...(values.mode ? { mode: values.mode } : {}) }));
       return 0;
     }
+    case "exec": {
+      need(1);
+      if (!shellLine) throw new Error("exec needs a command after --: t3lizard exec <leaseId> -- <shell command>");
+      print(await call(socket, "POST", "/exec", { leaseId: args[0], command: shellLine, maxSeconds: Number(values.max ?? 120) }));
+      return 0;
+    }
+    case "exec-wait":
+      need(2);
+      print(await call(socket, "POST", "/exec/wait", { leaseId: args[0], execId: args[1], maxSeconds: Number(values.max ?? 120) }));
+      return 0;
     case "renew":
       need(1);
       print(await call(socket, "POST", "/renew", { leaseId: args[0] }));

@@ -190,6 +190,29 @@ test("bring-up exposes the front proxy and points its Host at the machine's fixe
   assert.equal(m.files.get("front-host")!.content, `127.0.0.1:${port}\n`);
 });
 
+test("linkEnvironment false: no proxy, no pairing and no unlink, yet the lease is granted and the machine closes", async (t) => {
+  const exposed: number[] = [];
+  const h = await harness(t, { linkEnvironment: false });
+  const expose = h.lizard.exposePort.bind(h.lizard);
+  h.lizard.exposePort = async (id, port) => (exposed.push(port), expose(id, port));
+  const a0 = await h.api("/acquire", { repo: REPO, ref: "main", holder: "a" });
+  await h.daemon.settled();
+  const a = await h.api("/wait", { ticketId: a0.ticketId, maxSeconds: 1 });
+  assert.equal(a.status, "granted");
+  assert.equal(a.lease.workspacePath, "/home/user/app");
+  assert.equal(h.t3.links.size, 0, "nothing linked to the devbox T3");
+  assert.deepEqual(exposed, [], "no front proxy exposed");
+  const m = h.lizard.machines.get("sb-1")!;
+  assert.ok(!m.steps.includes("pair") && !m.steps.includes("front-health"));
+  assert.ok(m.steps.includes("reset"), "checkout still reset before the lease");
+
+  await h.api("/release", { leaseId: a.lease.leaseId });
+  await h.daemon.settled();
+  await h.advance(10);
+  assert.deepEqual(h.lizard.killed, ["sb-1"]);
+  assert.deepEqual(h.t3.unlinked, [], "nothing to unlink");
+});
+
 test("never kills a sandbox someone else started in the project", async (t) => {
   const h = await harness(t);
   h.lizard.addForeign("theirs", { owner: "ci" });
