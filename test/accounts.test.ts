@@ -7,7 +7,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 // @ts-ignore: plain JS module that runs on the machine
-import { applyAccounts, CONTINUE_MESSAGE, isDisabledNotice, limitNotice, main, isAuthNotice } from "../src/machine/accounts.mjs";
+import { applyAccounts, busy, configureCodex, CONTINUE_MESSAGE, isDisabledNotice, limitNotice, main, isAuthNotice, STALL_MS } from "../src/machine/accounts.mjs";
 
 const NOTICE = "Claude usage limit reached. This turn is paused until the 5-hour limit resets in 2h 2m.";
 
@@ -18,7 +18,8 @@ type Thread = { threadId: string; status: string; latestRunId: string; instanceI
  * gives a csrf token; the token exchange checks PKCE) and an MCP endpoint that answers with
  * server-sent events and refuses any token it did not issue.
  */
-async function fakeT3(threads: Thread[]) {
+async function fakeT3(threads: Thread[], opts: { backgroundWork?: boolean } = {}) {
+  let backgroundWork = opts.backgroundWork ?? false;
   const calls: { name: string; args: any }[] = [];
   const issued = new Set<string>();
   const codes = new Map<string, string>();
@@ -72,8 +73,12 @@ async function fakeT3(threads: Thread[]) {
           recentRuns: [{ runId: thread!.latestRunId, status: thread!.status, providerInstanceId: thread!.instanceId, requestedAt: "2026-11-19T12:00:00.000Z" }],
           items: thread!.items,
         });
+      case "t3_thread_interrupt":
+        backgroundWork = false;
+        return tool({ threadId: thread!.threadId });
       case "t3_thread_configure":
         if (args.modelSelection) {
+          if (backgroundWork) return sse({ isError: true, content: [{ type: "text", text: "The session still has background agents or commands running; stop them first." }] });
           thread!.instanceId = args.modelSelection.instanceId;
           return tool({ sequence: 7 });
         }
@@ -176,6 +181,19 @@ test("continue switches the thread's account, keeps its model, sends continue on
   assert.equal(t3.calls.filter((c) => c.name === "t3_thread_send").length, 1);
 });
 
+test("continue stops background work that blocks the account switch, then switches", async (t) => {
+  const thread = limitedThread();
+  const t3 = await fakeT3([thread], { backgroundWork: true });
+  t.after(t3.close);
+  const { env } = machineEnv(t3.origin);
+
+  const out = await main(["continue", "t-1", "run-1", "claudeAgent_acct2"], env);
+  assert.equal(out.account, "claudeAgent_acct2");
+  const names = t3.calls.map((c) => c.name).filter((n) => n === "t3_thread_interrupt" || n === "t3_thread_configure" || n === "t3_thread_send");
+  assert.deepEqual(names, ["t3_thread_configure", "t3_thread_configure", "t3_thread_interrupt", "t3_thread_configure", "t3_thread_send"]);
+  assert.deepEqual(t3.calls.find((c) => c.name === "t3_thread_interrupt")?.args, { threadId: "t-1", stop: true });
+});
+
 test("an admin-disabled account is a limit notice that is marked disabled", () => {
   const text = "Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access";
   const items = [{ runId: "run-1", title: "error", text }];
@@ -219,4 +237,30 @@ test("a revoked or expired login is a notice marked auth, not disabled", () => {
   }
   assert.equal(isAuthNotice("Claude usage limit reached."), false);
   assert.equal(isAuthNotice("Your organization has disabled Claude subscription access"), false);
+});
+
+test("busy leaves out a thread that says it is running but has not changed for STALL_MS", async () => {
+  const now = Date.parse("2026-11-24T07:00:00Z");
+  const ago = (ms: number) => new Date(now - ms).toISOString();
+  const threads = [
+    { threadId: "fresh", status: "running", updatedAt: ago(60_000) },
+    { threadId: "dead", status: "running", updatedAt: ago(STALL_MS + 60_000) },
+    { threadId: "no-time", status: "running" },
+  ];
+  const tools = { call: async () => ({ threads, nextCursor: null }) };
+  assert.equal(await busy(tools, now), 2);
+});
+
+test("configure-codex writes the login to Codex's home (mode 600), turns the Codex provider on and deletes its input", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t3lizard-codex-"));
+  const base = join(dir, "t3");
+  const input = join(dir, "codex.json");
+  const auth = JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: "x" } });
+  writeFileSync(input, JSON.stringify({ auth }));
+  configureCodex(base, input, join(dir, "codex-home"));
+  assert.equal(readFileSync(join(dir, "codex-home", "auth.json"), "utf8"), auth);
+  assert.equal(statSync(join(dir, "codex-home", "auth.json")).mode & 0o777, 0o600);
+  const settings = JSON.parse(readFileSync(join(base, "userdata", "settings.json"), "utf8"));
+  assert.deepEqual(settings.providerInstances.codex, { driver: "codex", displayName: "Codex", enabled: true });
+  assert.throws(() => statSync(input));
 });

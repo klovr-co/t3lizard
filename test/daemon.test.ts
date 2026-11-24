@@ -23,7 +23,7 @@ async function harness(
   t: { after(fn: () => unknown): void },
   overrides: Partial<Config> = {},
   shared?: { home: string; lizard: FakeLizard; t3: FakeT3; clock: { now: number } },
-  extra?: { antigravityToken?: string; probe?: (token: string) => Promise<import("../src/probe.ts").ProbeResult> },
+  extra?: { antigravityToken?: string; codexAuth?: () => string | undefined; probe?: (token: string) => Promise<import("../src/probe.ts").ProbeResult> },
 ) {
   const home = shared?.home ?? mkdtempSync(join(tmpdir(), "t3lizard-daemon-"));
   const clock = shared?.clock ?? { now: Date.parse("2026-11-19T12:00:00Z") };
@@ -38,6 +38,7 @@ async function harness(
     machineEnv: { GH_TOKEN: "gh-secret" },
     accountTokens: Object.fromEntries(config.accounts.map((a) => [a, `token-of-${a}`])),
     ...(extra?.antigravityToken ? { antigravityToken: extra.antigravityToken } : {}),
+    ...(extra?.codexAuth ? { codexAuth: extra.codexAuth } : {}),
     ...(extra?.probe ? { probe: extra.probe } : {}),
     home,
     resolveRepo: async (r) => normalizeOrigin(r),
@@ -358,6 +359,7 @@ test("a sandbox that vanishes during bring-up is dropped by reconcile and counts
 test("a thread that hits a usage limit continues on the next account; with all limited the machine waits", async (t) => {
   const A1 = "claudeAgent_acct1";
   const A2 = "claudeAgent_acct2";
+  t.mock.method(Math, "random", () => 0); // new leases pick a random free account; 0 picks the first
   const h = await harness(t, { accounts: [A1, A2], accountRetryMinutes: 30, leaseMinutes: 20, lifetimeMinutes: 30, maxLifetimeMinutes: 240 });
   const queued = await h.api("/acquire", { repo: REPO, ref: "main", holder: "thread-a" });
   await h.daemon.settled();
@@ -580,6 +582,7 @@ test("exec runs a command on the leased machine with no agent, waits for it, and
 test("an account shows as disabled only while a disabled notice decides its block, not after a later plain usage limit", async (t) => {
   const A1 = "claudeAgent_acct1";
   const A2 = "claudeAgent_acct2";
+  t.mock.method(Math, "random", () => 0); // new leases pick a random free account; 0 picks the first
   const h = await harness(t, { accounts: [A1, A2], accountRetryMinutes: 30, accountDisabledMinutes: 5, leaseMinutes: 120, lifetimeMinutes: 120, maxLifetimeMinutes: 240 });
   const queued = await h.api("/acquire", { repo: REPO, ref: "main", holder: "thread-a" });
   await h.daemon.settled();
@@ -936,4 +939,56 @@ test("snapshots follow the size a repo gets: a missing one is built by itself, a
   await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 1 });
   const small = h.daemon.state.snapshots![`${SNAP_REPO}|small`].id;
   assert.ok([...h.lizard.createdFrom.values()].includes(small));
+});
+
+test("a new lease gets a random free account, not always the first", async (t) => {
+  const accounts = ["claudeAgent_acct1", "claudeAgent_acct2", "claudeAgent_acct3"];
+  const seen = new Set<string>();
+  for (const r of [0, 0.4, 0.9]) {
+    t.mock.method(Math, "random", () => r);
+    const h = await harness(t, { accounts });
+    const q = await h.api("/acquire", { repo: REPO, ref: "main", holder: "thread-a" });
+    await h.daemon.settled();
+    seen.add((await h.api("/wait", { ticketId: q.ticketId, maxSeconds: 1 })).lease.providerInstanceId);
+  }
+  assert.deepEqual([...seen].sort(), accounts);
+});
+
+test("sandboxes in other projects on the Lizard account count against the vCPU limit", async (t) => {
+  const h = await harness(t, { vcpuLimit: 4, vcpuReserve: 0, perRepoCap: 4, sizes: [{ size: "small", max: 4 }], defaultSize: "small" });
+  h.lizard.otherProjects = [{ id: "someone-else", vcpu: 2 }];
+  await h.advance(1);
+  for (const holder of ["a", "b"]) await h.api("/acquire", { repo: REPO, ref: "main", holder });
+  await h.daemon.settled();
+  await h.advance(1);
+  assert.equal(h.lizard.machines.size, 1, "4 vCPU less 2 elsewhere leaves room for one small");
+  assert.ok(h.logs.some((l) => l.includes("other sandboxes on the Lizard account use 2 vCPU (someone-else)")));
+  h.lizard.otherProjects = [];
+  await h.advance(1);
+  await h.advance(1);
+  assert.equal(h.lizard.machines.size, 2, "the second small once the other sandbox is gone");
+});
+
+test("a fresh Codex ChatGPT login goes to new and running machines; one near its refresh does not", async (t) => {
+  let auth: string | undefined;
+  const login = (daysAgo: number, tag: string) => JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: tag }, last_refresh: new Date(Date.parse("2026-11-20T00:00:00Z") - daysAgo * 86_400_000).toISOString() });
+  const h = await harness(t, { accounts: ["claudeAgent_acct1"] }, undefined, { codexAuth: () => auth });
+  h.clock.now = Date.parse("2026-11-20T00:00:00Z");
+  auth = login(7, "old");
+  const t0 = await h.api("/acquire", { repo: REPO, ref: "main", holder: "codex-test" });
+  await h.daemon.settled();
+  const g0 = await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 1 });
+  const m = h.lizard.machines.get("sb-1")!;
+  assert.ok(!m.steps.includes("codex"), "a login 7 days old is not handed out");
+  assert.equal(g0.lease.codexProviderInstanceId, undefined);
+  assert.ok(h.logs.some((l) => l.includes("Codex login is close to its refresh")));
+  assert.equal((await h.api("/status")).codexConfigured, false);
+
+  auth = login(1, "fresh");
+  await h.advance(6);
+  assert.ok(m.steps.includes("codex"), "the running machine gets the login once it is fresh");
+  assert.equal(JSON.parse(m.files.get("codex.json")!.content).auth, auth);
+  const g1 = await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 1 });
+  assert.equal(g1.lease.codexProviderInstanceId, "codex");
+  assert.equal((await h.api("/status")).codexConfigured, true);
 });

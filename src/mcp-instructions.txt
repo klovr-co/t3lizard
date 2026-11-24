@@ -14,6 +14,7 @@ Use it for heavy work: builds, full typechecks, pre-push gates, long test runs.
    b. An agent thread, when the job needs judgment (fixing a failing test, a screen check): delegate_task as below.
 4b. For an agent thread, call delegate_task with target { environmentId, projectId, providerInstanceId } from the lease (and target.model from lease.model when present), plus a self-contained prompt.
    Always pass target.providerInstanceId (and target.model when lease.model is set). New machines default to Antigravity (gemini-4-neon); if you explicitly need Claude instead, pass lease.claudeProviderInstanceId with a Claude model (the machine has no plain claudeAgent).
+   When lease.codexProviderInstanceId is set, the machine's Codex is signed in with the ChatGPT login: pass it as target.providerInstanceId (with a Codex model) to use Codex.
    Do not pass isolation "worktree": the lease is a whole machine with its checkout at lease.workspacePath, already at your ref.
    lease.size says how big it is: medium is 4 vCPU / 8 GB, small 2 vCPU / 4 GB. When the mediums are busy you get a
    small instead of waiting; give a heavy build less parallelism there (one test worker, one dev server or browser at a time).

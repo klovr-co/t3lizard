@@ -1,7 +1,7 @@
 import { ownSandboxLister, sandboxAlive } from "../src/lizard.ts";
 import type { ExecResult, Lizard, SandboxDirectory } from "../src/lizard.ts";
 import type { LocalT3 } from "../src/t3local.ts";
-import type { MachineId, RepoKey, Size } from "../src/types.ts";
+import { SIZE_VCPU, type MachineId, type RepoKey, type Size } from "../src/types.ts";
 
 export interface FakeMachine {
   metadata: Record<string, string>;
@@ -81,6 +81,14 @@ export class FakeLizard implements Lizard, SandboxDirectory {
 
   async deleteSnapshot(snapshotId: string) {
     this.deletedSnapshots.push(snapshotId);
+  }
+
+  /** Sandboxes on the same Lizard account in other projects. */
+  otherProjects: { id: MachineId; vcpu: number }[] = [];
+
+  async accountSandboxes() {
+    const here = [...this.machines].filter(([, m]) => m.status === "running").map(([id, m]) => ({ id, vcpu: SIZE_VCPU[m.size] }));
+    return [...here, ...this.otherProjects];
   }
 
   /** A sandbox someone else started in the same project. */

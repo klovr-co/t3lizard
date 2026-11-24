@@ -1,5 +1,5 @@
 import { LimitExceededError, NotFoundError, PaymentRequiredError, Sandbox } from "@lizard-build/sdk";
-import type { MachineId, RepoKey, Size } from "./types.ts";
+import { SIZE_VCPU, type MachineId, type RepoKey, type Size } from "./types.ts";
 
 export interface ExecResult {
   stdout: string;
@@ -16,6 +16,8 @@ export interface Lizard {
   deleteSnapshot(snapshotId: string): Promise<void>;
   /** Live sandboxes in the project that t3lizard created (metadata t3lizard=1). Never anyone else's. */
   list(): Promise<MachineId[]>;
+  /** Every running sandbox on the Lizard account, in any project, with its vCPUs: they all count against the account's vCPU limit. */
+  accountSandboxes?(): Promise<{ id: MachineId; vcpu: number }[]>;
   /** False when Lizard no longer knows the sandbox or reports it stopped or crashed. Throws when it cannot tell. */
   alive(id: MachineId): Promise<boolean>;
   exec(id: MachineId, cmd: string[], timeoutMs?: number): Promise<ExecResult>;
@@ -119,6 +121,14 @@ export function realLizard(opts: { apiKey: string; projectId: string; user: stri
   const listOwn = ownSandboxLister(dir, tag);
 
   return {
+    accountSandboxes: () =>
+      mapErrors(async () => {
+        const all = (await Sandbox.list({ ...conn } as Parameters<typeof Sandbox.list>[0])) as { sandboxId?: string; id?: string; status?: string; size?: string }[];
+        return all
+          .filter((s) => !ENDED.has(String(s.status)))
+          .map((s) => ({ id: (s.sandboxId ?? s.id) as MachineId, vcpu: SIZE_VCPU[s.size as Size] ?? SIZE_VCPU.medium }))
+          .filter((s) => s.id);
+      }),
     create: (repo, size, lifetimeMs, snapshotId) =>
       mapErrors(async () => {
         const sb = await Sandbox.create(opts.template, {

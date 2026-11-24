@@ -2,6 +2,7 @@
 //
 //   node accounts.mjs configure <accounts.json>   one claudeAgent_acct<N> provider instance per account
 //   node accounts.mjs configure-antigravity <file> enable Antigravity with OAuth token and optional default
+//   node accounts.mjs configure-codex <file>       sign Codex in with a ChatGPT login (auth.json text), enable it
 //   node accounts.mjs scan                         JSON: threads whose latest run failed on a usage limit
 //   node accounts.mjs busy                         JSON: threads still working, sub-agents included
 //   node accounts.mjs export <sinceIso> <outDir>   threads updated since then, with messages, as JSON files
@@ -115,6 +116,29 @@ export function configureAntigravity(baseDir, configFile) {
     settings = JSON.parse(readFileSync(settingsFile, "utf8"));
   } catch {}
   writePrivate(settingsFile, JSON.stringify(applyAntigravity(settings, { instanceId, defaultModel, makeDefault }), null, 2));
+  rmSync(configFile, { force: true });
+}
+
+export const CODEX_INSTANCE = "codex";
+
+/** T3's settings with the Codex provider turned on. It reads the login from ~/.codex/auth.json. */
+export function applyCodex(settings) {
+  const instances = { ...settings.providerInstances };
+  instances[CODEX_INSTANCE] = { ...instances[CODEX_INSTANCE], driver: "codex", displayName: "Codex", enabled: true };
+  return { ...settings, providerInstances: instances };
+}
+
+/** Writes the ChatGPT login to Codex's own home (mode 600) and turns the Codex provider on. */
+export function configureCodex(baseDir, configFile, codexHome = join(homedir(), ".codex")) {
+  const { auth } = JSON.parse(readFileSync(configFile, "utf8"));
+  JSON.parse(auth); // refuse to write anything but a JSON login
+  writePrivate(join(codexHome, "auth.json"), auth);
+  const settingsFile = join(baseDir, "userdata", "settings.json");
+  let settings = {};
+  try {
+    settings = JSON.parse(readFileSync(settingsFile, "utf8"));
+  } catch {}
+  writePrivate(settingsFile, JSON.stringify(applyCodex(settings), null, 2));
   rmSync(configFile, { force: true });
 }
 
@@ -249,18 +273,36 @@ export async function continueThread(tools, threadId, runId, account) {
   const { thread } = await tools.call("t3_thread_read", { threadId, limit: 1, runLimit: 1 });
   if (thread.latestRunId !== runId || thread.status !== "failed") return { threadId, skipped: `thread is ${thread.status} at run ${thread.latestRunId}` };
   const { modelSelection } = await tools.call("t3_thread_configure", { threadId });
-  if (modelSelection.instanceId !== account) await tools.call("t3_thread_configure", { threadId, modelSelection: { ...modelSelection, instanceId: account } });
+  if (modelSelection.instanceId !== account) {
+    const move = () => tools.call("t3_thread_configure", { threadId, modelSelection: { ...modelSelection, instanceId: account } });
+    try {
+      await move();
+    } catch (e) {
+      // T3 will not switch a session that still has background agents or commands. The thread is
+      // stopped on a limit and cannot use their output anyway, so stop them and switch.
+      if (!/background/i.test(String(e?.message))) throw e;
+      await tools.call("t3_thread_interrupt", { threadId, stop: true });
+      await move();
+    }
+  }
   const sent = await tools.call("t3_thread_send", { threadId, message: CONTINUE_MESSAGE, mode: "auto", clientRequestId: `t3lizard-continue-${runId}` });
   return { threadId, account, runId: sent.runId, delivery: sent.delivery };
 }
 
-/** Threads (sub-agents included) still working: the T3 CLI's list leaves sub-agent threads out. */
-export async function busy(tools) {
+/** A thread that says it is working but has not changed for this long has stalled: its agent died. */
+export const STALL_MS = 45 * 60_000;
+
+/**
+ * Threads (sub-agents included) still working: the T3 CLI's list leaves sub-agent threads out.
+ * A thread that reports running but has not changed for STALL_MS does not count: it would keep the
+ * lease, and the machine, alive for nothing.
+ */
+export async function busy(tools, now = Date.now()) {
   const statuses = ["waiting", "running", "starting", "queued", "preparing"];
   let n = 0;
   for (let cursor = 0; cursor !== null; ) {
     const page = await tools.call("t3_thread_list", { allProjects: true, statuses, includeSubagents: true, limit: 100, cursor });
-    n += page.threads.length;
+    n += page.threads.filter((t) => !t.updatedAt || now - Date.parse(t.updatedAt) < STALL_MS).length;
     cursor = page.nextCursor;
   }
   return n;
@@ -307,11 +349,12 @@ export async function main(argv, env = process.env) {
   const [cmd, ...args] = argv;
   if (cmd === "configure") return configure(baseDir, args[0]);
   if (cmd === "configure-antigravity") return configureAntigravity(baseDir, args[0]);
+  if (cmd === "configure-codex") return configureCodex(baseDir, args[0]);
   if (cmd === "scan") return { limited: await scan(await connect(opts)) };
   if (cmd === "continue") return continueThread(await connect(opts), args[0], args[1], args[2]);
   if (cmd === "busy") return { busy: await busy(await connect(opts)) };
   if (cmd === "export") return { written: await exportThreads(await connect(opts), args[0], args[1]) };
-  throw new Error(`usage: accounts.mjs configure <file> | configure-antigravity <file> | scan | continue <thread> <run> <account>`);
+  throw new Error(`usage: accounts.mjs configure <file> | configure-antigravity <file> | configure-codex <file> | scan | continue <thread> <run> <account>`);
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {

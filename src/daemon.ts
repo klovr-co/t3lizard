@@ -4,13 +4,13 @@ import { join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { busyThreads, cloneRepo, configureFront, pushAccounts, continueOnAccount, execPoll, execStart, exportThreads, FRONT_PORT, install, machineLabel, pairAndLink, PUT_MAX_BYTES, putFile, removePutFiles, resetCheckout, runRepoSetup, scanLimits, scrubForSnapshot, setupProject } from "./bringup.ts";
+import { busyThreads, cloneRepo, configureFront, pushAccounts, pushCodex, continueOnAccount, execPoll, execStart, exportThreads, FRONT_PORT, install, machineLabel, pairAndLink, PUT_MAX_BYTES, putFile, removePutFiles, resetCheckout, runRepoSetup, scanLimits, scrubForSnapshot, setupProject } from "./bringup.ts";
 import type { Account, ExecView, Remote } from "./bringup.ts";
 import { paths } from "./config.ts";
 import { LizardLimitError, LizardPaymentError } from "./lizard.ts";
 import type { Lizard } from "./lizard.ts";
 import { learnSize, nextSizeUp, repoGaps, repoIdleMs, repoLadder, vcpuFree } from "./plan.ts";
-import { accountLimited, accountWait, BRINGING_UP, BUDGET_UNIT, createBackoff, createBlock, machineAccounts, nextFreeAccount, plan, queueInfo, repoCreateBlock, sizesInUse, usedSmallHours, utcDay } from "./plan.ts";
+import { accountLimited, accountWait, BRINGING_UP, BUDGET_UNIT, createBackoff, createBlock, machineAccounts, plan, queueInfo, repoCreateBlock, sizesInUse, usedSmallHours, utcDay } from "./plan.ts";
 import { startProxy } from "./proxy.ts";
 import type { ProbeResult } from "./probe.ts";
 import { addStep, readHistory, readSetup, removeStep } from "./setup.ts";
@@ -45,6 +45,9 @@ const LIMIT_SCAN_EVERY_MS = MINUTE;
 /** Allowed difference between the machine's clock and the devbox's. */
 const CLOCK_SKEW_MS = MINUTE;
 const ANTIGRAVITY_INSTANCE = "antigravity";
+const CODEX_INSTANCE = "codex";
+/** A Codex login refreshed longer ago than this is not handed out (Codex itself refreshes at about 8 days). */
+const CODEX_MAX_AGE_MS = 6 * 24 * 3_600_000;
 const DEFAULT_ANTIGRAVITY_MODEL = "gemini-4-neon";
 
 export interface DaemonDeps {
@@ -57,6 +60,8 @@ export interface DaemonDeps {
   accountTokens: Record<AccountId, string>;
   /** Antigravity OAuth token JSON. Written only to Antigravity's profile directory on each machine. */
   antigravityToken?: string;
+  /** Reads the ChatGPT login for Codex (the text of the devbox's ~/.codex/auth.json), fresh each time. */
+  codexAuth?: () => string | undefined;
   home: string;
   /** Asks one account's login what it can do (src/probe.ts). Unset: no probing (tests). */
   probe?: (token: string) => Promise<ProbeResult>;
@@ -91,6 +96,8 @@ export type LeaseView = {
   model?: string;
   /** Free Claude account to use when explicitly delegating to Claude instead of Antigravity. */
   claudeProviderInstanceId?: AccountId;
+  /** Set when the machine's Codex is signed in with the ChatGPT login: pass it as target.providerInstanceId to delegate to Codex. */
+  codexProviderInstanceId?: string;
 };
 
 export type TicketView =
@@ -193,7 +200,7 @@ export class Daemon {
   /** Run the scheduler once and start what it decides. No Lizard listing. */
   step(): void {
     const now = this.deps.now();
-    for (const action of plan(this.state, now, this.deps.config)) this.apply(action);
+    for (const action of plan(this.state, now, this.vcpuConfig())) this.apply(action);
     this.pruneTickets(now);
     this.save();
   }
@@ -524,7 +531,7 @@ export class Daemon {
     });
     return {
       now,
-      vcpu: { limit: config.vcpuLimit, reserve: config.vcpuReserve, inUse: vcpuInUse, free: vcpuFree(config, used) },
+      vcpu: { limit: config.vcpuLimit, reserve: config.vcpuReserve, otherSandboxes: this.othersVcpu, inUse: vcpuInUse, free: vcpuFree(this.vcpuConfig(), used) },
       spend,
       learned,
       jobs: (this.state.jobs ?? []).slice(0, 100),
@@ -617,6 +624,7 @@ export class Daemon {
       createsBlocked: createBlock(this.state, now, config),
       lastLizardError: this.state.lastLizardError,
       antigravityConfigured: Boolean(this.deps.antigravityToken),
+      codexConfigured: Boolean(this.codexLogin()),
       defaultProvider: this.deps.antigravityToken ? (config.defaultProvider ?? "antigravity") : "claude",
       ...(this.deps.antigravityToken && (config.defaultProvider ?? "antigravity") === "antigravity"
         ? { defaultModel: config.defaultModel ?? DEFAULT_ANTIGRAVITY_MODEL }
@@ -659,6 +667,7 @@ export class Daemon {
             : account
               ? { providerInstanceId: account }
               : {}),
+          ...(m.codex ? { codexProviderInstanceId: CODEX_INSTANCE } : {}),
         },
       };
     }
@@ -792,7 +801,7 @@ export class Daemon {
     const block = createBlock(this.state, this.deps.now(), config);
     if (block) throw new ApiError(409, block);
     const used = sizesInUse(Object.values(this.state.machines));
-    if (vcpuFree(config, used) < SIZE_VCPU[size]) throw new ApiError(409, `no room for a ${size} machine right now`);
+    if (vcpuFree(this.vcpuConfig(), used) < SIZE_VCPU[size]) throw new ApiError(409, `no room for a ${size} machine right now`);
     const key = snapKey(repo, size);
     this.baking = key;
     this.lastBakeTry.set(key, this.deps.now());
@@ -885,7 +894,7 @@ export class Daemon {
       const key = snapKey(w.repo, w.size);
       if (now - (this.lastBakeTry.get(key) ?? 0) < BAKE_RETRY_MS) continue;
       if (this.state.tickets.some((t) => t.status === "queued" && t.repo === w.repo)) continue;
-      if (vcpuFree(config, sizesInUse(Object.values(this.state.machines))) < SIZE_VCPU[w.size]) continue;
+      if (vcpuFree(this.vcpuConfig(), sizesInUse(Object.values(this.state.machines))) < SIZE_VCPU[w.size]) continue;
       this.lastBakeTry.set(key, now);
       this.deps.log(`building the ${w.size} snapshot of ${w.repo}: ${w.why === "missing" ? "the repo gets this size now" : "the old one is stale"}`);
       this.bake({ repo: w.repo, size: w.size }).catch((e) => this.deps.log(`snapshot build of ${w.repo} did not start: ${(e as Error).message}`));
@@ -907,6 +916,7 @@ export class Daemon {
         this.t3Version ??= await this.deps.t3.version();
         const accounts = this.accounts();
         const antigravity = this.antigravityConfig();
+        const codexAuth = this.codexLogin();
         await install(
           this.remote,
           id,
@@ -915,11 +925,13 @@ export class Daemon {
           accounts,
           { label: machineLabel(m.repo, id, m.size), size: m.size },
           antigravity,
+          codexAuth ? { codexAuth } : {},
         );
         const installed = at("installing");
         installed.accounts = accounts.map((a) => a.id);
         installed.accountsKey = this.accountsKey();
         if (antigravity) installed.antigravity = true;
+        if (codexAuth) installed.codex = true;
         this.setPhase(installed, { kind: "linking" });
       }
       m = at("linking");
@@ -1162,18 +1174,49 @@ export class Daemon {
 
   /** Changes when an account is added, removed or given a new token. Not reversible to a token. */
   private accountsKey(): string {
-    return createHash("sha256").update(JSON.stringify(this.accounts())).digest("hex").slice(0, 16);
+    return createHash("sha256").update(JSON.stringify([this.accounts(), this.codexLogin() ?? null])).digest("hex").slice(0, 16);
   }
+
+  /**
+   * The ChatGPT login for Codex, or nothing. Codex refreshes a login about 8 days after its last
+   * refresh, and a refresh replaces the refresh token: a machine that did it would sign the devbox
+   * (and every other machine) out. So a login older than CODEX_MAX_AGE_MS is not handed out; the
+   * devbox's own Codex refreshes it the next time it runs.
+   */
+  private codexLogin(): string | undefined {
+    const text = this.deps.codexAuth?.();
+    if (!text) return undefined;
+    let refreshed = NaN;
+    try {
+      const d = JSON.parse(text) as { tokens?: unknown; last_refresh?: string };
+      if (!d.tokens) return undefined;
+      refreshed = Date.parse(d.last_refresh ?? "");
+    } catch {
+      return undefined;
+    }
+    const stale = !(this.deps.now() - refreshed < CODEX_MAX_AGE_MS);
+    if (stale !== this.codexStale) {
+      this.codexStale = stale;
+      if (stale) this.deps.log("the devbox's Codex login is close to its refresh; not giving it to machines until the devbox's Codex refreshes it (run codex there once)");
+    }
+    return stale ? undefined : text;
+  }
+
+  private codexStale = false;
 
   private accounts(): Account[] {
     return this.deps.config.accounts.map((id) => ({ id, token: this.deps.accountTokens[id] }));
   }
 
-  /** The account a new delegation should use: the first free one, else the one that frees first. */
+  /** The account a new delegation should use: the random free one, else the one that frees first. */
   private accountFor(m: Machine): AccountId | undefined {
     const accounts = machineAccounts(m, this.deps.config);
     const until = (a: AccountId) => this.state.accounts?.[a]?.limitedUntil ?? 0;
-    return nextFreeAccount(this.state, this.deps.now(), accounts) ?? [...accounts].sort((a, b) => until(a) - until(b))[0];
+    // A random free account, so new agents spread over the logins instead of all landing on the first.
+    const now = this.deps.now();
+    const free = accounts.filter((a) => !accountLimited(this.state, a, now));
+    if (free.length) return free[Math.floor(Math.random() * free.length)];
+    return [...accounts].sort((a, b) => until(a) - until(b))[0];
   }
 
   private waitView(m: Machine, now: number) {
@@ -1291,6 +1334,10 @@ export class Daemon {
       this.launch(`accounts:${id}`, async () => {
         try {
           await pushAccounts(this.remote, id, this.accounts());
+          const codexAuth = this.codexLogin();
+          if (codexAuth) await pushCodex(this.remote, id, codexAuth);
+          const cur = this.state.machines[id];
+          if (cur && codexAuth) cur.codex = true;
         } catch (e) {
           this.deps.log(`machine ${id}: giving it the current Claude accounts failed: ${(e as Error).message}`);
           return;
@@ -1399,8 +1446,30 @@ export class Daemon {
 
   // ---- reconcile with Lizard ----
 
+  /** vCPUs of running sandboxes on the Lizard account that are not this pool's: they count against vcpuLimit too. */
+  private othersVcpu = 0;
+
+  /** The config with other sandboxes on the account added to the reserve, for every vCPU decision. */
+  private vcpuConfig(): Config {
+    const { config } = this.deps;
+    return this.othersVcpu ? { ...config, vcpuReserve: (config.vcpuReserve ?? 0) + this.othersVcpu } : config;
+  }
+
+  private async countOtherSandboxes(): Promise<void> {
+    if (!this.deps.lizard.accountSandboxes) return;
+    const before = this.createsDone;
+    const all = await this.deps.lizard.accountSandboxes().catch((e: Error) => (this.deps.log(`Lizard account list failed: ${e.message}`), undefined));
+    // A create that finished meanwhile is ours but may not be in state under its real id yet.
+    if (!all || this.createsInFlight > 0 || this.createsDone !== before) return;
+    const others = all.filter((s) => !this.state.machines[s.id]);
+    const vcpu = others.reduce((n, s) => n + s.vcpu, 0);
+    if (vcpu !== this.othersVcpu) this.deps.log(`other sandboxes on the Lizard account use ${vcpu} vCPU${others.length ? ` (${others.map((s) => s.id).join(", ")})` : ""}`);
+    this.othersVcpu = vcpu;
+  }
+
   private async reconcile(): Promise<void> {
     if (this.createsInFlight > 0) return;
+    await this.countOtherSandboxes();
     const before = this.createsDone;
     let live: Set<MachineId>;
     try {
