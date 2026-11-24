@@ -33,15 +33,16 @@ export function sizesInUse(machines: Machine[]): Map<Size, number> {
 }
 
 /** vCPUs still free for new machines: the limit, less the reserve, less every machine counted in `used`. */
-export function vcpuFree(config: Pick<Config, "vcpuLimit" | "vcpuReserve">, used: Map<Size, number>): number {
-  if (config.vcpuLimit === undefined) return Number.POSITIVE_INFINITY;
+export function vcpuFree(config: Pick<Config, "vcpuLimit" | "vcpuReserve" | "vcpuPoolMax">, used: Map<Size, number>): number {
+  if (config.vcpuLimit === undefined && config.vcpuPoolMax === undefined) return Number.POSITIVE_INFINITY;
   let inUse = 0;
   for (const [size, n] of used) inUse += SIZE_VCPU[size] * n;
-  return config.vcpuLimit - (config.vcpuReserve ?? 0) - inUse;
+  const account = config.vcpuLimit === undefined ? Number.POSITIVE_INFINITY : config.vcpuLimit - (config.vcpuReserve ?? 0);
+  return Math.min(account, config.vcpuPoolMax ?? Number.POSITIVE_INFINITY) - inUse;
 }
 
 /** The first size on the ladder with room (its own max, and the vCPU limit when there is one). */
-export function sizeWithRoom(ladder: SizeSlot[], used: Map<Size, number>, config?: Pick<Config, "vcpuLimit" | "vcpuReserve">): Size | undefined {
+export function sizeWithRoom(ladder: SizeSlot[], used: Map<Size, number>, config?: Pick<Config, "vcpuLimit" | "vcpuReserve" | "vcpuPoolMax">): Size | undefined {
   const free = config ? vcpuFree(config, used) : Number.POSITIVE_INFINITY;
   return ladder.find((s) => (used.get(s.size) ?? 0) < s.max && SIZE_VCPU[s.size] <= free)?.size;
 }
@@ -295,6 +296,17 @@ export function plan(state: State, now: number, config: Config): Action[] {
     const min = state.repoMinSize?.[m.repo];
     if (min && SIZE_WEIGHT[m.size] < SIZE_WEIGHT[min]) continue;
     idleByRepo.set(m.repo, [...(idleByRepo.get(m.repo) ?? []), m]);
+  }
+  // Over the vCPU cap (it was lowered, or teammates started sandboxes): close idle machines, largest
+  // first, instead of handing them out again. Busy machines are left to finish.
+  let over = -vcpuFree(config, sizesInUse(machines.filter((m) => m.phase.kind !== "closing" && !closingNow.has(m.id))));
+  if (over > 0) {
+    for (const m of [...idleByRepo.values()].flat().sort((a, b) => SIZE_WEIGHT[b.size] - SIZE_WEIGHT[a.size])) {
+      if (over <= 0) break;
+      close(m, "idle");
+      over -= SIZE_VCPU[m.size];
+      idleByRepo.set(m.repo, idleByRepo.get(m.repo)!.filter((x) => x !== m));
+    }
   }
   // The oldest ticket gets the largest idle machine; among equals, the one with the most time left.
   for (const list of idleByRepo.values()) list.sort((a, b) => SIZE_WEIGHT[b.size] - SIZE_WEIGHT[a.size] || b.deadline - a.deadline);

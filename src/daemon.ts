@@ -529,7 +529,7 @@ export class Daemon {
     });
     return {
       now,
-      vcpu: { limit: config.vcpuLimit, reserve: config.vcpuReserve, otherSandboxes: this.othersVcpu, inUse: vcpuInUse, free: vcpuFree(this.vcpuConfig(), used) },
+      vcpu: { limit: config.vcpuLimit, poolMax: config.vcpuPoolMax, reserve: config.vcpuReserve, otherSandboxes: this.othersVcpu, inUse: vcpuInUse, free: vcpuFree(this.vcpuConfig(), used) },
       spend,
       learned,
       jobs: (this.state.jobs ?? []).slice(0, 100),

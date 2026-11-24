@@ -245,6 +245,8 @@ export interface Config {
   idleMaxMinutes?: number;
   /** vCPUs the pool leaves free for others in the Lizard workspace. */
   vcpuReserve: number;
+  /** The most vCPUs this pool uses, however much the account has free: the rest stays for teammates. */
+  vcpuPoolMax?: number;
   /** A repo's first machine size, before anything is learned. */
   defaultSize: Size;
   /** The dashboard's port, on 127.0.0.1 and publicBind. 0 turns it off. */
