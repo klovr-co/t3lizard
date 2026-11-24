@@ -40,7 +40,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "ticketId": {"type": "string"},
-                "maxSeconds": {"type": "integer", "minimum": 1, "maximum": 300, "default": 300, "description": "At most 300"},
+                "maxSeconds": {"type": "integer", "minimum": 1, "maximum": 300, "default": 30, "description": "Default 30, at most 300. Keep it short: messages reach you only between calls"},
             },
             "required": ["ticketId"],
         },
@@ -135,7 +135,7 @@ def call_tool(name, args):
     if name == "pool_acquire":
         return daemon("POST", "/acquire", {k: args.get(k) for k in ("repo", "ref", "holder")})
     if name == "pool_wait":
-        secs = max(1, min(300, int(args.get("maxSeconds", 300))))
+        secs = max(1, min(300, int(args.get("maxSeconds", 30))))
         return daemon("POST", "/wait", {"ticketId": args.get("ticketId"), "maxSeconds": secs}, timeout=secs + 30)
     if name == "pool_release":
         return daemon("POST", "/release", {k: args[k] for k in ("leaseId", "ticketId") if args.get(k)})
