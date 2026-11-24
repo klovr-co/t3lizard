@@ -383,7 +383,7 @@ export function queueInfo(state: State, ticketId: string, now: number, config: C
   if (!sizeWithRoom(ladder, used, config)) {
     const min = state.repoMinSize?.[ticket.repo];
     const free = vcpuFree(config, used);
-    const vcpu = Number.isFinite(free) ? `; ${Math.max(0, free)} vCPU free of ${config.vcpuLimit}` : "";
+    const vcpu = Number.isFinite(free) ? `; ${Math.max(0, free)} vCPU free of ${config.vcpuPoolMax !== undefined && config.vcpuPoolMax < (config.vcpuLimit ?? Infinity) ? `the pool's cap of ${config.vcpuPoolMax}` : config.vcpuLimit}` : "";
     return { position, reason: `no room for a new machine${min ? ` of ${min} or larger` : ""} (${ladderText(ladder, used)}${vcpu}); idle machines of other repos close to make room` };
   }
   return { position };
