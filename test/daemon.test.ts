@@ -335,6 +335,7 @@ test("a sandbox that vanishes during bring-up is dropped by reconcile and counts
 test("a thread that hits a usage limit continues on the next account; with all limited the machine waits", async (t) => {
   const A1 = "claudeAgent_acct1";
   const A2 = "claudeAgent_acct2";
+  t.mock.method(Math, "random", () => 0); // new leases pick a random free account; 0 picks the first
   const h = await harness(t, { accounts: [A1, A2], accountRetryMinutes: 30, leaseMinutes: 20, lifetimeMinutes: 30, maxLifetimeMinutes: 240 });
   const queued = await h.api("/acquire", { repo: REPO, ref: "main", holder: "thread-a" });
   await h.daemon.settled();
@@ -557,6 +558,7 @@ test("exec runs a command on the leased machine with no agent, waits for it, and
 test("an account shows as disabled only while a disabled notice decides its block, not after a later plain usage limit", async (t) => {
   const A1 = "claudeAgent_acct1";
   const A2 = "claudeAgent_acct2";
+  t.mock.method(Math, "random", () => 0); // new leases pick a random free account; 0 picks the first
   const h = await harness(t, { accounts: [A1, A2], accountRetryMinutes: 30, accountDisabledMinutes: 5, leaseMinutes: 120, lifetimeMinutes: 120, maxLifetimeMinutes: 240 });
   const queued = await h.api("/acquire", { repo: REPO, ref: "main", holder: "thread-a" });
   await h.daemon.settled();
@@ -913,4 +915,32 @@ test("snapshots follow the size a repo gets: a missing one is built by itself, a
   await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 1 });
   const small = h.daemon.state.snapshots![`${SNAP_REPO}|small`].id;
   assert.ok([...h.lizard.createdFrom.values()].includes(small));
+});
+
+test("a new lease gets a random free account, not always the first", async (t) => {
+  const accounts = ["claudeAgent_acct1", "claudeAgent_acct2", "claudeAgent_acct3"];
+  const seen = new Set<string>();
+  for (const r of [0, 0.4, 0.9]) {
+    t.mock.method(Math, "random", () => r);
+    const h = await harness(t, { accounts });
+    const q = await h.api("/acquire", { repo: REPO, ref: "main", holder: "thread-a" });
+    await h.daemon.settled();
+    seen.add((await h.api("/wait", { ticketId: q.ticketId, maxSeconds: 1 })).lease.providerInstanceId);
+  }
+  assert.deepEqual([...seen].sort(), accounts);
+});
+
+test("sandboxes in other projects on the Lizard account count against the vCPU limit", async (t) => {
+  const h = await harness(t, { vcpuLimit: 4, vcpuReserve: 0, perRepoCap: 4, sizes: [{ size: "small", max: 4 }], defaultSize: "small" });
+  h.lizard.otherProjects = [{ id: "someone-else", vcpu: 2 }];
+  await h.advance(1);
+  for (const holder of ["a", "b"]) await h.api("/acquire", { repo: REPO, ref: "main", holder });
+  await h.daemon.settled();
+  await h.advance(1);
+  assert.equal(h.lizard.machines.size, 1, "4 vCPU less 2 elsewhere leaves room for one small");
+  assert.ok(h.logs.some((l) => l.includes("other sandboxes on the Lizard account use 2 vCPU (someone-else)")));
+  h.lizard.otherProjects = [];
+  await h.advance(1);
+  await h.advance(1);
+  assert.equal(h.lizard.machines.size, 2, "the second small once the other sandbox is gone");
 });

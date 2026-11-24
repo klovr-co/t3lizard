@@ -7,7 +7,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 // @ts-ignore: plain JS module that runs on the machine
-import { applyAccounts, CONTINUE_MESSAGE, isDisabledNotice, limitNotice, main, isAuthNotice } from "../src/machine/accounts.mjs";
+import { applyAccounts, busy, CONTINUE_MESSAGE, isDisabledNotice, limitNotice, main, isAuthNotice, STALL_MS } from "../src/machine/accounts.mjs";
 
 const NOTICE = "Claude usage limit reached. This turn is paused until the 5-hour limit resets in 2h 2m.";
 
@@ -237,4 +237,16 @@ test("a revoked or expired login is a notice marked auth, not disabled", () => {
   }
   assert.equal(isAuthNotice("Claude usage limit reached."), false);
   assert.equal(isAuthNotice("Your organization has disabled Claude subscription access"), false);
+});
+
+test("busy leaves out a thread that says it is running but has not changed for STALL_MS", async () => {
+  const now = Date.parse("2026-11-24T07:00:00Z");
+  const ago = (ms: number) => new Date(now - ms).toISOString();
+  const threads = [
+    { threadId: "fresh", status: "running", updatedAt: ago(60_000) },
+    { threadId: "dead", status: "running", updatedAt: ago(STALL_MS + 60_000) },
+    { threadId: "no-time", status: "running" },
+  ];
+  const tools = { call: async () => ({ threads, nextCursor: null }) };
+  assert.equal(await busy(tools, now), 2);
 });

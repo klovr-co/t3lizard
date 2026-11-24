@@ -265,13 +265,20 @@ export async function continueThread(tools, threadId, runId, account) {
   return { threadId, account, runId: sent.runId, delivery: sent.delivery };
 }
 
-/** Threads (sub-agents included) still working: the T3 CLI's list leaves sub-agent threads out. */
-export async function busy(tools) {
+/** A thread that says it is working but has not changed for this long has stalled: its agent died. */
+export const STALL_MS = 45 * 60_000;
+
+/**
+ * Threads (sub-agents included) still working: the T3 CLI's list leaves sub-agent threads out.
+ * A thread that reports running but has not changed for STALL_MS does not count: it would keep the
+ * lease, and the machine, alive for nothing.
+ */
+export async function busy(tools, now = Date.now()) {
   const statuses = ["waiting", "running", "starting", "queued", "preparing"];
   let n = 0;
   for (let cursor = 0; cursor !== null; ) {
     const page = await tools.call("t3_thread_list", { allProjects: true, statuses, includeSubagents: true, limit: 100, cursor });
-    n += page.threads.length;
+    n += page.threads.filter((t) => !t.updatedAt || now - Date.parse(t.updatedAt) < STALL_MS).length;
     cursor = page.nextCursor;
   }
   return n;

@@ -632,6 +632,8 @@ echo "$n"`;
 /** How many of the machine's T3 threads are still working. */
 export async function busyThreads(r: Remote, id: MachineId, workspacePath: string): Promise<number> {
   // The CLI's list leaves sub-agent threads out, and every delegated job is one: ask T3's MCP tools.
+  // A machine brought up by an older t3lizard has an older accounts.mjs (no stall check).
+  await writeFile(r, id, "accounts.mjs", ACCOUNTS_JS, "600").catch(() => undefined);
   const viaMcp = await r.lizard.exec(id, script("busy", 'node "$D/accounts.mjs" busy'), 120_000);
   const m = viaMcp.exitCode === 0 ? viaMcp.stdout.match(/"busy":(\d+)/) : null;
   // A plain command (pool_exec) is work too: the lease must not expire under it.

@@ -10,7 +10,7 @@ import { paths } from "./config.ts";
 import { LizardLimitError, LizardPaymentError } from "./lizard.ts";
 import type { Lizard } from "./lizard.ts";
 import { learnSize, nextSizeUp, repoGaps, repoIdleMs, repoLadder, vcpuFree } from "./plan.ts";
-import { accountLimited, accountWait, BRINGING_UP, BUDGET_UNIT, createBackoff, createBlock, machineAccounts, nextFreeAccount, plan, queueInfo, repoCreateBlock, sizesInUse, usedSmallHours, utcDay } from "./plan.ts";
+import { accountLimited, accountWait, BRINGING_UP, BUDGET_UNIT, createBackoff, createBlock, machineAccounts, plan, queueInfo, repoCreateBlock, sizesInUse, usedSmallHours, utcDay } from "./plan.ts";
 import { startProxy } from "./proxy.ts";
 import type { ProbeResult } from "./probe.ts";
 import { addStep, readHistory, readSetup, removeStep } from "./setup.ts";
@@ -191,7 +191,7 @@ export class Daemon {
   /** Run the scheduler once and start what it decides. No Lizard listing. */
   step(): void {
     const now = this.deps.now();
-    for (const action of plan(this.state, now, this.deps.config)) this.apply(action);
+    for (const action of plan(this.state, now, this.vcpuConfig())) this.apply(action);
     this.pruneTickets(now);
     this.save();
   }
@@ -522,7 +522,7 @@ export class Daemon {
     });
     return {
       now,
-      vcpu: { limit: config.vcpuLimit, reserve: config.vcpuReserve, inUse: vcpuInUse, free: vcpuFree(config, used) },
+      vcpu: { limit: config.vcpuLimit, reserve: config.vcpuReserve, otherSandboxes: this.othersVcpu, inUse: vcpuInUse, free: vcpuFree(this.vcpuConfig(), used) },
       spend,
       learned,
       jobs: (this.state.jobs ?? []).slice(0, 100),
@@ -790,7 +790,7 @@ export class Daemon {
     const block = createBlock(this.state, this.deps.now(), config);
     if (block) throw new ApiError(409, block);
     const used = sizesInUse(Object.values(this.state.machines));
-    if (vcpuFree(config, used) < SIZE_VCPU[size]) throw new ApiError(409, `no room for a ${size} machine right now`);
+    if (vcpuFree(this.vcpuConfig(), used) < SIZE_VCPU[size]) throw new ApiError(409, `no room for a ${size} machine right now`);
     const key = snapKey(repo, size);
     this.baking = key;
     this.lastBakeTry.set(key, this.deps.now());
@@ -883,7 +883,7 @@ export class Daemon {
       const key = snapKey(w.repo, w.size);
       if (now - (this.lastBakeTry.get(key) ?? 0) < BAKE_RETRY_MS) continue;
       if (this.state.tickets.some((t) => t.status === "queued" && t.repo === w.repo)) continue;
-      if (vcpuFree(config, sizesInUse(Object.values(this.state.machines))) < SIZE_VCPU[w.size]) continue;
+      if (vcpuFree(this.vcpuConfig(), sizesInUse(Object.values(this.state.machines))) < SIZE_VCPU[w.size]) continue;
       this.lastBakeTry.set(key, now);
       this.deps.log(`building the ${w.size} snapshot of ${w.repo}: ${w.why === "missing" ? "the repo gets this size now" : "the old one is stale"}`);
       this.bake({ repo: w.repo, size: w.size }).catch((e) => this.deps.log(`snapshot build of ${w.repo} did not start: ${(e as Error).message}`));
@@ -1161,11 +1161,15 @@ export class Daemon {
     return this.deps.config.accounts.map((id) => ({ id, token: this.deps.accountTokens[id] }));
   }
 
-  /** The account a new delegation should use: the first free one, else the one that frees first. */
+  /** The account a new delegation should use: the random free one, else the one that frees first. */
   private accountFor(m: Machine): AccountId | undefined {
     const accounts = machineAccounts(m, this.deps.config);
     const until = (a: AccountId) => this.state.accounts?.[a]?.limitedUntil ?? 0;
-    return nextFreeAccount(this.state, this.deps.now(), accounts) ?? [...accounts].sort((a, b) => until(a) - until(b))[0];
+    // A random free account, so new agents spread over the logins instead of all landing on the first.
+    const now = this.deps.now();
+    const free = accounts.filter((a) => !accountLimited(this.state, a, now));
+    if (free.length) return free[Math.floor(Math.random() * free.length)];
+    return [...accounts].sort((a, b) => until(a) - until(b))[0];
   }
 
   private waitView(m: Machine, now: number) {
@@ -1391,8 +1395,30 @@ export class Daemon {
 
   // ---- reconcile with Lizard ----
 
+  /** vCPUs of running sandboxes on the Lizard account that are not this pool's: they count against vcpuLimit too. */
+  private othersVcpu = 0;
+
+  /** The config with other sandboxes on the account added to the reserve, for every vCPU decision. */
+  private vcpuConfig(): Config {
+    const { config } = this.deps;
+    return this.othersVcpu ? { ...config, vcpuReserve: (config.vcpuReserve ?? 0) + this.othersVcpu } : config;
+  }
+
+  private async countOtherSandboxes(): Promise<void> {
+    if (!this.deps.lizard.accountSandboxes) return;
+    const before = this.createsDone;
+    const all = await this.deps.lizard.accountSandboxes().catch((e: Error) => (this.deps.log(`Lizard account list failed: ${e.message}`), undefined));
+    // A create that finished meanwhile is ours but may not be in state under its real id yet.
+    if (!all || this.createsInFlight > 0 || this.createsDone !== before) return;
+    const others = all.filter((s) => !this.state.machines[s.id]);
+    const vcpu = others.reduce((n, s) => n + s.vcpu, 0);
+    if (vcpu !== this.othersVcpu) this.deps.log(`other sandboxes on the Lizard account use ${vcpu} vCPU${others.length ? ` (${others.map((s) => s.id).join(", ")})` : ""}`);
+    this.othersVcpu = vcpu;
+  }
+
   private async reconcile(): Promise<void> {
     if (this.createsInFlight > 0) return;
+    await this.countOtherSandboxes();
     const before = this.createsDone;
     let live: Set<MachineId>;
     try {
