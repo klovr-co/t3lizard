@@ -7,7 +7,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 // @ts-ignore: plain JS module that runs on the machine
-import { applyAccounts, busy, CONTINUE_MESSAGE, isDisabledNotice, limitNotice, main, isAuthNotice, STALL_MS } from "../src/machine/accounts.mjs";
+import { applyAccounts, busy, configureCodex, CONTINUE_MESSAGE, isDisabledNotice, limitNotice, main, isAuthNotice, STALL_MS } from "../src/machine/accounts.mjs";
 
 const NOTICE = "Claude usage limit reached. This turn is paused until the 5-hour limit resets in 2h 2m.";
 
@@ -249,4 +249,18 @@ test("busy leaves out a thread that says it is running but has not changed for S
   ];
   const tools = { call: async () => ({ threads, nextCursor: null }) };
   assert.equal(await busy(tools, now), 2);
+});
+
+test("configure-codex writes the login to Codex's home (mode 600), turns the Codex provider on and deletes its input", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t3lizard-codex-"));
+  const base = join(dir, "t3");
+  const input = join(dir, "codex.json");
+  const auth = JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: "x" } });
+  writeFileSync(input, JSON.stringify({ auth }));
+  configureCodex(base, input, join(dir, "codex-home"));
+  assert.equal(readFileSync(join(dir, "codex-home", "auth.json"), "utf8"), auth);
+  assert.equal(statSync(join(dir, "codex-home", "auth.json")).mode & 0o777, 0o600);
+  const settings = JSON.parse(readFileSync(join(base, "userdata", "settings.json"), "utf8"));
+  assert.deepEqual(settings.providerInstances.codex, { driver: "codex", displayName: "Codex", enabled: true });
+  assert.throws(() => statSync(input));
 });

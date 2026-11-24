@@ -119,6 +119,8 @@ export interface Machine {
   accountsKey?: string;
   /** True when Antigravity (agy binary + OAuth token) was installed and configured on this machine. */
   antigravity?: boolean;
+  /** Its Codex was given the ChatGPT login. */
+  codex?: boolean;
   /** Threads that hit a usage limit and wait to continue on another account. From the last scan. */
   limitedThreads?: LimitedThread[];
   /** Runs already continued on another account, so a scan that raced the continue never repeats it. */

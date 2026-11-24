@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { busyThreads, cloneRepo, configureFront, pushAccounts, continueOnAccount, execPoll, execStart, exportThreads, FRONT_PORT, install, machineLabel, pairAndLink, PUT_MAX_BYTES, putFile, removePutFiles, resetCheckout, runRepoSetup, scanLimits, scrubForSnapshot, setupProject } from "./bringup.ts";
+import { busyThreads, cloneRepo, configureFront, pushAccounts, pushCodex, continueOnAccount, execPoll, execStart, exportThreads, FRONT_PORT, install, machineLabel, pairAndLink, PUT_MAX_BYTES, putFile, removePutFiles, resetCheckout, runRepoSetup, scanLimits, scrubForSnapshot, setupProject } from "./bringup.ts";
 import type { Account, ExecView, Remote } from "./bringup.ts";
 import { paths } from "./config.ts";
 import { LizardLimitError, LizardPaymentError } from "./lizard.ts";
@@ -43,6 +43,9 @@ const LIMIT_SCAN_EVERY_MS = MINUTE;
 /** Allowed difference between the machine's clock and the devbox's. */
 const CLOCK_SKEW_MS = MINUTE;
 const ANTIGRAVITY_INSTANCE = "antigravity";
+const CODEX_INSTANCE = "codex";
+/** A Codex login refreshed longer ago than this is not handed out (Codex itself refreshes at about 8 days). */
+const CODEX_MAX_AGE_MS = 6 * 24 * 3_600_000;
 const DEFAULT_ANTIGRAVITY_MODEL = "gemini-4-neon";
 
 export interface DaemonDeps {
@@ -55,6 +58,8 @@ export interface DaemonDeps {
   accountTokens: Record<AccountId, string>;
   /** Antigravity OAuth token JSON. Written only to Antigravity's profile directory on each machine. */
   antigravityToken?: string;
+  /** Reads the ChatGPT login for Codex (the text of the devbox's ~/.codex/auth.json), fresh each time. */
+  codexAuth?: () => string | undefined;
   home: string;
   /** Asks one account's login what it can do (src/probe.ts). Unset: no probing (tests). */
   probe?: (token: string) => Promise<ProbeResult>;
@@ -89,6 +94,8 @@ export type LeaseView = {
   model?: string;
   /** Free Claude account to use when explicitly delegating to Claude instead of Antigravity. */
   claudeProviderInstanceId?: AccountId;
+  /** Set when the machine's Codex is signed in with the ChatGPT login: pass it as target.providerInstanceId to delegate to Codex. */
+  codexProviderInstanceId?: string;
 };
 
 export type TicketView =
@@ -615,6 +622,7 @@ export class Daemon {
       createsBlocked: createBlock(this.state, now, config),
       lastLizardError: this.state.lastLizardError,
       antigravityConfigured: Boolean(this.deps.antigravityToken),
+      codexConfigured: Boolean(this.codexLogin()),
       defaultProvider: this.deps.antigravityToken ? (config.defaultProvider ?? "antigravity") : "claude",
       ...(this.deps.antigravityToken && (config.defaultProvider ?? "antigravity") === "antigravity"
         ? { defaultModel: config.defaultModel ?? DEFAULT_ANTIGRAVITY_MODEL }
@@ -657,6 +665,7 @@ export class Daemon {
             : account
               ? { providerInstanceId: account }
               : {}),
+          ...(m.codex ? { codexProviderInstanceId: CODEX_INSTANCE } : {}),
         },
       };
     }
@@ -905,6 +914,7 @@ export class Daemon {
         this.t3Version ??= await this.deps.t3.version();
         const accounts = this.accounts();
         const antigravity = this.antigravityConfig();
+        const codexAuth = this.codexLogin();
         await install(
           this.remote,
           id,
@@ -913,11 +923,13 @@ export class Daemon {
           accounts,
           { label: machineLabel(m.repo, id, m.size), size: m.size },
           antigravity,
+          codexAuth ? { codexAuth } : {},
         );
         const installed = at("installing");
         installed.accounts = accounts.map((a) => a.id);
         installed.accountsKey = this.accountsKey();
         if (antigravity) installed.antigravity = true;
+        if (codexAuth) installed.codex = true;
         this.setPhase(installed, { kind: "linking" });
       }
       m = at("linking");
@@ -1154,8 +1166,35 @@ export class Daemon {
 
   /** Changes when an account is added, removed or given a new token. Not reversible to a token. */
   private accountsKey(): string {
-    return createHash("sha256").update(JSON.stringify(this.accounts())).digest("hex").slice(0, 16);
+    return createHash("sha256").update(JSON.stringify([this.accounts(), this.codexLogin() ?? null])).digest("hex").slice(0, 16);
   }
+
+  /**
+   * The ChatGPT login for Codex, or nothing. Codex refreshes a login about 8 days after its last
+   * refresh, and a refresh replaces the refresh token: a machine that did it would sign the devbox
+   * (and every other machine) out. So a login older than CODEX_MAX_AGE_MS is not handed out; the
+   * devbox's own Codex refreshes it the next time it runs.
+   */
+  private codexLogin(): string | undefined {
+    const text = this.deps.codexAuth?.();
+    if (!text) return undefined;
+    let refreshed = NaN;
+    try {
+      const d = JSON.parse(text) as { tokens?: unknown; last_refresh?: string };
+      if (!d.tokens) return undefined;
+      refreshed = Date.parse(d.last_refresh ?? "");
+    } catch {
+      return undefined;
+    }
+    const stale = !(this.deps.now() - refreshed < CODEX_MAX_AGE_MS);
+    if (stale !== this.codexStale) {
+      this.codexStale = stale;
+      if (stale) this.deps.log("the devbox's Codex login is close to its refresh; not giving it to machines until the devbox's Codex refreshes it (run codex there once)");
+    }
+    return stale ? undefined : text;
+  }
+
+  private codexStale = false;
 
   private accounts(): Account[] {
     return this.deps.config.accounts.map((id) => ({ id, token: this.deps.accountTokens[id] }));
@@ -1287,6 +1326,10 @@ export class Daemon {
       this.launch(`accounts:${id}`, async () => {
         try {
           await pushAccounts(this.remote, id, this.accounts());
+          const codexAuth = this.codexLogin();
+          if (codexAuth) await pushCodex(this.remote, id, codexAuth);
+          const cur = this.state.machines[id];
+          if (cur && codexAuth) cur.codex = true;
         } catch (e) {
           this.deps.log(`machine ${id}: giving it the current Claude accounts failed: ${(e as Error).message}`);
           return;

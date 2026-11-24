@@ -23,7 +23,7 @@ async function harness(
   t: { after(fn: () => unknown): void },
   overrides: Partial<Config> = {},
   shared?: { home: string; lizard: FakeLizard; t3: FakeT3; clock: { now: number } },
-  extra?: { antigravityToken?: string; probe?: (token: string) => Promise<import("../src/probe.ts").ProbeResult> },
+  extra?: { antigravityToken?: string; codexAuth?: () => string | undefined; probe?: (token: string) => Promise<import("../src/probe.ts").ProbeResult> },
 ) {
   const home = shared?.home ?? mkdtempSync(join(tmpdir(), "t3lizard-daemon-"));
   const clock = shared?.clock ?? { now: Date.parse("2026-11-19T12:00:00Z") };
@@ -38,6 +38,7 @@ async function harness(
     machineEnv: { GH_TOKEN: "gh-secret" },
     accountTokens: Object.fromEntries(config.accounts.map((a) => [a, `token-of-${a}`])),
     ...(extra?.antigravityToken ? { antigravityToken: extra.antigravityToken } : {}),
+    ...(extra?.codexAuth ? { codexAuth: extra.codexAuth } : {}),
     ...(extra?.probe ? { probe: extra.probe } : {}),
     home,
     resolveRepo: async (r) => normalizeOrigin(r),
@@ -943,4 +944,28 @@ test("sandboxes in other projects on the Lizard account count against the vCPU l
   await h.advance(1);
   await h.advance(1);
   assert.equal(h.lizard.machines.size, 2, "the second small once the other sandbox is gone");
+});
+
+test("a fresh Codex ChatGPT login goes to new and running machines; one near its refresh does not", async (t) => {
+  let auth: string | undefined;
+  const login = (daysAgo: number, tag: string) => JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: tag }, last_refresh: new Date(Date.parse("2026-11-20T00:00:00Z") - daysAgo * 86_400_000).toISOString() });
+  const h = await harness(t, { accounts: ["claudeAgent_acct1"] }, undefined, { codexAuth: () => auth });
+  h.clock.now = Date.parse("2026-11-20T00:00:00Z");
+  auth = login(7, "old");
+  const t0 = await h.api("/acquire", { repo: REPO, ref: "main", holder: "codex-test" });
+  await h.daemon.settled();
+  const g0 = await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 1 });
+  const m = h.lizard.machines.get("sb-1")!;
+  assert.ok(!m.steps.includes("codex"), "a login 7 days old is not handed out");
+  assert.equal(g0.lease.codexProviderInstanceId, undefined);
+  assert.ok(h.logs.some((l) => l.includes("Codex login is close to its refresh")));
+  assert.equal((await h.api("/status")).codexConfigured, false);
+
+  auth = login(1, "fresh");
+  await h.advance(6);
+  assert.ok(m.steps.includes("codex"), "the running machine gets the login once it is fresh");
+  assert.equal(JSON.parse(m.files.get("codex.json")!.content).auth, auth);
+  const g1 = await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 1 });
+  assert.equal(g1.lease.codexProviderInstanceId, "codex");
+  assert.equal((await h.api("/status")).codexConfigured, true);
 });

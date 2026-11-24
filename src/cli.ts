@@ -1,5 +1,5 @@
-import { appendFileSync, existsSync, mkdirSync, statSync } from "node:fs";
-import { hostname, userInfo } from "node:os";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { homedir, hostname, userInfo } from "node:os";
 import { parseArgs } from "node:util";
 import { call, serveApi } from "./api.ts";
 import { startDashboard } from "./dashboard.ts";
@@ -84,6 +84,14 @@ async function realDaemon(home: string): Promise<void> {
     probe: (token: string) => probeAccount(token),
     accountLabels: accountLabelsFromSecrets(secrets),
     ...(antigravityToken ? { antigravityToken } : {}),
+    // The devbox's own Codex ChatGPT login, read fresh so a refresh there reaches the machines.
+    codexAuth: () => {
+      try {
+        return readFileSync(process.env.T3LIZARD_CODEX_AUTH ?? `${homedir()}/.codex/auth.json`, "utf8");
+      } catch {
+        return undefined;
+      }
+    },
     home,
     resolveRepo,
     now: Date.now,

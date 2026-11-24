@@ -327,8 +327,8 @@ export async function install(
   accounts: Account[],
   machine: { label: string; size: string } = { label: id, size: "small" },
   antigravity?: AntigravityConfig,
-  /** bake: install the tools only, for a snapshot. No accounts, no T3, no label: nothing machine-specific. */
-  opts: { bake?: boolean } = {},
+  /** bake: install the tools only, for a snapshot. No accounts, no T3, no label: nothing machine-specific. codexAuth: a ChatGPT login for Codex. */
+  opts: { bake?: boolean; codexAuth?: string } = {},
 ): Promise<void> {
   await run(r, id, script("preflight", PREFLIGHT_SH));
   await writeFile(r, id, "env", envFile(secrets), "600");
@@ -383,6 +383,7 @@ export async function install(
     );
     await run(r, id, script("antigravity", 'node "$D/accounts.mjs" configure-antigravity "$D/antigravity.json"'));
   }
+  if (opts.codexAuth) await pushCodex(r, id, opts.codexAuth);
   // Before serve-start: T3 reads its label once, when it starts.
   const prep = await r.lizard.exec(id, script("prep", PREP_SH, machine.label, String(SWAP_MB[machine.size] ?? 2048)), 300_000);
   if (prep.exitCode !== 0) r.log?.(`machine ${id}: prep failed (continuing): ${(prep.stderr || prep.stdout).trim().slice(-300)}`);
@@ -399,6 +400,13 @@ export async function pushAccounts(r: Remote, id: MachineId, accounts: Account[]
   await writeFile(r, id, "accounts.mjs", ACCOUNTS_JS, "600");
   await writeFile(r, id, "accounts.json", JSON.stringify(accounts), "600");
   await run(r, id, script("accounts", 'node "$D/accounts.mjs" configure "$D/accounts.json"'));
+}
+
+/** Signs the machine's Codex in with a ChatGPT login (the text of an auth.json) and turns its T3 provider on. */
+export async function pushCodex(r: Remote, id: MachineId, auth: string): Promise<void> {
+  await writeFile(r, id, "accounts.mjs", ACCOUNTS_JS, "600");
+  await writeFile(r, id, "codex.json", JSON.stringify({ auth }), "600");
+  await run(r, id, script("codex", 'node "$D/accounts.mjs" configure-codex "$D/codex.json"'));
 }
 
 /** Clone the repo into the home directory, without T3: for a snapshot build. Returns the checkout path. */
@@ -431,7 +439,7 @@ if [ -n "$leak" ]; then echo "secret(s) found outside the env file:$leak" >&2; e
 for f in "$HOME/.t3/userdata/environment-id" "$HOME/.t3/userdata/statev2.sqlite" "$HOME/.t3/userdata/server-owner.sqlite"; do
   if [ -e "$f" ]; then echo "T3 has run on this machine ($f exists)" >&2; exit 1; fi
 done
-rm -rf "$D/env" "$D/accounts.json" "$D/antigravity.json" "$D/exec" "$D/export" "$D/repo-setup.sh" "$D/repo-setup.log" "$D/repo-setup.exit" "$D/install.log" "$D/project-id" "$D/front-host" "$D/label"
+rm -rf "$HOME/.codex/auth.json" "$D/codex.json" "$D/env" "$D/accounts.json" "$D/antigravity.json" "$D/exec" "$D/export" "$D/repo-setup.sh" "$D/repo-setup.log" "$D/repo-setup.exit" "$D/install.log" "$D/project-id" "$D/front-host" "$D/label"
 echo scrubbed`;
 
 export async function scrubForSnapshot(r: Remote, id: MachineId): Promise<void> {
