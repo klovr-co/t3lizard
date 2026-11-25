@@ -240,6 +240,7 @@ Each command prints JSON from the daemon. `t3lizard` is an alias of `xstack-clou
 ## Provider limits
 
 InstaBox Pro runs up to 100 machines at once. Measured on the account:
+- Tested live (2026-11-25): exec with `argv`, an 87 KB argument sent through stdin, a 330 s command with keepalive, a lease from a template in 41 s and from a snapshot in 21 s, and the T3 link and a delegated thread on the machine.
 
 - 64 commands at once per Pro workspace (32 on the free plan). Over it InstaBox answers 429 `quota_exceeded`; the daemon waits and retries for about a minute.
 - 30 machine starts a minute. Over it InstaBox answers 429 `rate_limited`; creates pause until its Retry-After.
@@ -270,7 +271,6 @@ These need a live test with a real API key:
 - whether `t3 environment link` accepts an `http://127.0.0.1:<port>` URL;
 - the bring-up script on a real Lizard machine;
 - the proxy against Lizard's real HTTPS and WebSocket route, through the machine's front proxy;
-- on InstaBox: exec with `argv` (the docs list it; `cmd` is what was measured), a create from a snapshot (the body sends `templateId` with `snapshotId`), the list's `metadata` filter, and a command longer than 5 minutes (Node's `fetch` stops waiting for response headers after 5 minutes).
 
 ## How a machine is reached
 

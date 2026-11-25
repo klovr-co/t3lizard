@@ -147,6 +147,9 @@ test("near the deadline an idle machine closes and a leased one is extended up t
   assert.deepEqual(plan(state([capped]), NOW, config), [{ kind: "extend", machineId: "m3", deadline: NOW + 30 * MIN }]);
   const atMax = machine("m4", "a", { kind: "leased", leaseId: "l" }, { createdAt: NOW - 176 * MIN, deadline: NOW + 4 * MIN });
   assert.deepEqual(plan(state([atMax]), NOW, config), []);
+  // Past its last deadline it closes, lease and all: InstaBox has no timeout of its own to end it.
+  const over = machine("m5", "a", { kind: "leased", leaseId: "l" }, { createdAt: NOW - 180 * MIN, deadline: NOW });
+  assert.deepEqual(plan(state([over]), NOW, config), [{ kind: "close", machineId: "m5", reason: "deadline" }]);
 });
 
 test("does not grant a machine that is about to hit its deadline", () => {

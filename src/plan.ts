@@ -277,6 +277,8 @@ export function plan(state: State, now: number, config: Config): Action[] {
       const want = Math.max(near ? m.deadline + config.lifetimeMinutes * MINUTE : 0, holds.get(m.id) ?? 0);
       const target = Math.min(m.createdAt + config.maxLifetimeMinutes * MINUTE, want);
       if (target > m.deadline) extends_.push({ kind: "extend", machineId: m.id, deadline: target });
+      // At maxLifetimeMinutes it cannot be extended. Lizard kills it at the deadline itself; InstaBox does not.
+      else if (now >= m.deadline) close(m, "deadline");
     } else if (m.deadline - now <= DEADLINE_MARGIN_MS) {
       close(m, "deadline");
     } else if (kind === "idle" && now - m.createdAt >= config.recycleMinutes * MINUTE) {
