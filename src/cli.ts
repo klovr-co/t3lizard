@@ -80,7 +80,7 @@ function machineProvider(config: Config, secrets: Record<string, string>, home: 
   const key = secrets[API_KEY_SECRET[config.provider]];
   if (!key) throw new Error(`${API_KEY_SECRET[config.provider]} missing from the environment and ${paths(home).secrets}`);
   if (config.provider === "instabox") {
-    return realInstabox({ apiKey: key, template: config.template, tag: config.sandboxTag, maxLifetimeMs: config.maxLifetimeMinutes * 60_000, execConcurrency: config.execConcurrency });
+    return realInstabox({ apiKey: key, template: config.template, tag: config.sandboxTag, maxLifetimeMs: config.maxLifetimeMinutes * 60_000, execConcurrency: config.execConcurrency, autoSuspendMinutes: config.autoSuspendMinutes });
   }
   if (!config.project) throw new Error(`"project" (the Lizard project id) missing from ${paths(home).config}`);
   return realLizard({ apiKey: key, projectId: config.project, user: config.sandboxUser, template: config.template, tag: config.sandboxTag });

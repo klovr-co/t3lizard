@@ -93,3 +93,9 @@ test("execConcurrency is a positive whole number, at most 32 on instabox, where 
   assert.throws(() => parseConfig({ provider: "instabox", execConcurrency: 0 }));
   assert.throws(() => parseConfig({ provider: "instabox", execConcurrency: 1.5 }));
 });
+
+test("autoSuspendMinutes takes 0 or 5-30, InstaBox's range", () => {
+  assert.equal(parseConfig({ provider: "instabox", autoSuspendMinutes: 30 }).autoSuspendMinutes, 30);
+  assert.equal(parseConfig({ provider: "instabox", autoSuspendMinutes: 0 }).autoSuspendMinutes, 0);
+  assert.throws(() => parseConfig({ provider: "instabox", autoSuspendMinutes: 3 }));
+});

@@ -34,6 +34,8 @@ export interface InstaboxOptions {
   maxLifetimeMs: number;
   /** Execs in flight at once (default DEFAULT_EXEC_CONCURRENCY). Every daemon on the account shares its limit. */
   execConcurrency?: number;
+  /** Minutes idle before InstaBox pauses a machine; 0 (default) never. The free plan accepts only 30. */
+  autoSuspendMinutes?: number;
   fetch?: typeof fetch;
   baseUrl?: string;
   sleep?: (ms: number) => Promise<void>;
@@ -156,7 +158,7 @@ export function realInstabox(opts: InstaboxOptions): MachineProvider {
         // A machine starts from a template or a snapshot, never both; a snapshot is locked to the size it was taken at.
         ...(snapshotId ? { snapshotId } : { templateId: opts.template, ...shape }),
         metadata: { [tag]: "1", repo },
-        autoSuspendAfterSeconds: 0,
+        autoSuspendAfterSeconds: (opts.autoSuspendMinutes ?? 0) * 60,
         deleteAfterSeconds: Math.min(86_400, Math.ceil((Math.max(lifetimeMs, opts.maxLifetimeMs) + 30 * MINUTE) / 1000)),
       });
       const id: MachineId = op.machineId;

@@ -223,6 +223,8 @@ export interface Config {
    * different tags, or each kills the other's machines as orphans. Lizard's "Sandbox already deleted" is how it shows.
    */
   sandboxTag?: string;
+  /** InstaBox: minutes idle before a machine pauses; 0 (default) never. Pro takes 0 or 5-30; the free plan only 30. */
+  autoSuspendMinutes?: number;
   /** The size ladder, largest first. A ticket that needs a new machine gets the largest size with room. */
   sizes: SizeSlot[];
   perRepoCap: number;
