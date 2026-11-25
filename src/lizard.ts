@@ -75,6 +75,7 @@ export function realLizard(opts: { apiKey: string; projectId: string; user: stri
 
   return {
     name: "Lizard",
+    portAuth: { kind: "header", name: "X-Lizard-Access-Token" },
     accountSandboxes: () =>
       mapErrors(async () => {
         const all = (await Sandbox.list({ ...conn } as Parameters<typeof Sandbox.list>[0])) as { sandboxId?: string; id?: string; status?: string; size?: string }[];

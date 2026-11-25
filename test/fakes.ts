@@ -27,6 +27,7 @@ const ok = (stdout = ""): ExecResult => ({ stdout, stderr: "", exitCode: 0 });
  */
 export class FakeProvider implements MachineProvider, SandboxDirectory {
   readonly name = "fake";
+  readonly portAuth = { kind: "header", name: "X-Lizard-Access-Token" } as const;
   machines = new Map<MachineId, FakeMachine>();
   killed: MachineId[] = [];
   timeouts: [MachineId, number][] = [];

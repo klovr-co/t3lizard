@@ -4,6 +4,8 @@ import http from "node:http";
 import net from "node:net";
 import { startProxy } from "../src/proxy.ts";
 
+const HEADER = { kind: "header", name: "X-Lizard-Access-Token" } as const;
+
 async function upstream() {
   const seen: http.IncomingHttpHeaders[] = [];
   const server = http.createServer((req, res) => {
@@ -32,7 +34,7 @@ async function upstream() {
 
 test("forwards an HTTP request with the access token and the upstream host", async (t) => {
   const up = await upstream();
-  const proxy = await startProxy({ port: 0, upstream: up.url, accessToken: "secret" });
+  const proxy = await startProxy({ port: 0, upstream: up.url, accessToken: "secret", portAuth: HEADER });
   t.after(async () => { await proxy.close(); await up.close(); });
 
   const res = await fetch(`http://127.0.0.1:${proxy.port}/api/x?y=1`, {
@@ -47,9 +49,22 @@ test("forwards an HTTP request with the access token and the upstream host", asy
   assert.equal(up.seen[0].host, up.url.host);
 });
 
+test("with cookie auth, sends the token as a cookie next to the client's own, and drops a client-sent copy", async (t) => {
+  const up = await upstream();
+  const cookie = { kind: "cookie", name: "__Host-instabox_port_auth" } as const;
+  const proxy = await startProxy({ port: 0, upstream: up.url, accessToken: "secret", portAuth: cookie });
+  t.after(async () => { await proxy.close(); await up.close(); });
+
+  await fetch(`http://127.0.0.1:${proxy.port}/`, { headers: { cookie: "a=1; __Host-instabox_port_auth=forged; b=2" } });
+  await fetch(`http://127.0.0.1:${proxy.port}/`);
+  assert.equal(up.seen[0].cookie, "a=1; b=2; __Host-instabox_port_auth=secret");
+  assert.equal(up.seen[1].cookie, "__Host-instabox_port_auth=secret");
+  assert.equal(up.seen[0]["x-lizard-access-token"], undefined, "no header token with cookie auth");
+});
+
 test("forwards a WebSocket upgrade and relays bytes both ways", async (t) => {
   const up = await upstream();
-  const proxy = await startProxy({ port: 0, upstream: up.url, accessToken: "secret" });
+  const proxy = await startProxy({ port: 0, upstream: up.url, accessToken: "secret", portAuth: HEADER });
   t.after(async () => { await proxy.close(); await up.close(); });
 
   const sock = net.connect(proxy.port, "127.0.0.1");
@@ -72,7 +87,7 @@ test("forwards a WebSocket upgrade and relays bytes both ways", async (t) => {
 test("answers 502 when the upstream is down", async (t) => {
   const up = await upstream();
   await up.close();
-  const proxy = await startProxy({ port: 0, upstream: up.url, accessToken: "secret" });
+  const proxy = await startProxy({ port: 0, upstream: up.url, accessToken: "secret", portAuth: HEADER });
   t.after(() => proxy.close());
   const res = await fetch(`http://127.0.0.1:${proxy.port}/`);
   assert.equal(res.status, 502);

@@ -1604,7 +1604,7 @@ export class Daemon {
     const candidates = m.proxyPort ? [m.proxyPort] : Array.from({ length: hi - lo + 1 }, (_, i) => lo + i).filter((p) => !taken.has(p));
     for (const port of candidates) {
       try {
-        const proxy = await startProxy({ port, upstream: new URL(`https://${m.hostname}`), accessToken: m.accessToken!, extraHosts: this.deps.config.publicBind });
+        const proxy = await startProxy({ port, upstream: new URL(`https://${m.hostname}`), accessToken: m.accessToken!, portAuth: this.deps.provider.portAuth, extraHosts: this.deps.config.publicBind });
         this.proxies.set(m.id, proxy);
         m.proxyPort = port;
         this.save();

@@ -6,10 +6,15 @@ export interface ExecResult {
   exitCode: number;
 }
 
+/** How the provider's edge takes the exposed port's access token: as a request header or a cookie. */
+export type PortAuth = { kind: "header"; name: string } | { kind: "cookie"; name: string };
+
 /** Everything the daemon needs from a cloud machine provider (Lizard, InstaBox). Tests use a fake. */
 export interface MachineProvider {
   /** For logs and status, e.g. "Lizard". */
   readonly name: string;
+  /** How the devbox proxy sends the token from exposePort. */
+  readonly portAuth: PortAuth;
   /** With snapshotId the machine starts from that saved snapshot, at the snapshot's own size (`size` is then ignored). */
   create(repo: RepoKey, size: Size, lifetimeMs: number, snapshotId?: string): Promise<{ id: MachineId; deadline: number }>;
   /** Saves the machine's files as a private snapshot and waits until it is ready. Returns its id. Storage is billed until it is deleted. */
