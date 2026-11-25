@@ -13,9 +13,11 @@ export const INSTABOX_SIZES: Partial<Record<Size, { vcpus: number; memMiB: numbe
 const MINUTE = 60_000;
 /** Execs in flight at once: under the free plan's 32 and well under Pro's 64, leaving room for a second daemon. */
 export const DEFAULT_EXEC_CONCURRENCY = 24;
-/** Machine states that will never run a command again. */
-const GONE = new Set(["deleting", "deleted", "error"]);
-const NOT_ALIVE = new Set([...GONE, "stopped"]);
+/** Machine states on their way out. */
+const GONE = new Set(["deleting", "deleted"]);
+/** States in which a machine runs no command. The daemon never stops a machine, so one of its own in these is dead. */
+const DEAD = new Set(["stopped", "error"]);
+const NOT_ALIVE = new Set([...GONE, ...DEAD]);
 /** Codes InstaBox sends with 402 (docs, reference/errors). */
 const PAYMENT_CODES = new Set(["credit_exhausted", "spend_limit_reached", "subscription_required", "payment_method_required", "payment_required", "early_allowance_ended", "payment_failed"]);
 /** How long an exec keeps retrying the account-wide concurrent exec limit (429 quota_exceeded, sent with no Retry-After). */
@@ -79,11 +81,14 @@ export function realInstabox(opts: InstaboxOptions): MachineProvider {
       parsed = undefined;
     }
     // With X-Instabox-Exec-Keepalive an error after the 200 went out arrives as {"error", "status"} (docs: exec, Keepalive).
-    const status = res.ok && parsed?.error && typeof parsed.status === "number" ? parsed.status : res.status;
+    const late = res.ok && parsed?.error && typeof parsed.status === "number";
+    const status = late ? parsed.status : res.status;
     if (status >= 200 && status < 300) return parsed;
     const err = parsed?.error ?? {};
     const code = typeof err.code === "string" ? err.code : undefined;
     const message = `InstaBox ${method} ${path.split("?")[0]}: ${status}${code ? ` ${code}` : ""}${typeof err.message === "string" ? `: ${err.message}` : ""}`;
+    // An error after the keepalive 200 came after the command started: exec must not retry it as a limit.
+    if (late) throw new InstaboxError(message, status, code);
     if (status === 402 || (code && PAYMENT_CODES.has(code))) throw new ProviderPaymentError(message, code);
     if (status === 429 || code === "no_capacity") {
       const header = Number(res.headers.get("retry-after"));
@@ -206,6 +211,7 @@ export function realInstabox(opts: InstaboxOptions): MachineProvider {
     },
     async list() {
       const own: MachineId[] = [];
+      const dead: MachineId[] = [];
       const seen = new Set<string>();
       let cursor: string | undefined;
       do {
@@ -213,11 +219,18 @@ export function realInstabox(opts: InstaboxOptions): MachineProvider {
         if (cursor) q.set("cursor", cursor);
         const page = await request("GET", `/v1/machines?${q}`);
         // Checked here too: a filter InstaBox ignored must never make someone else's machine an orphan to kill.
-        for (const m of page?.machines ?? []) if (!GONE.has(m.state) && m.metadata?.[tag] === "1") own.push(m.id);
+        for (const m of page?.machines ?? []) {
+          if (m.metadata?.[tag] !== "1" || GONE.has(m.state)) continue;
+          if (DEAD.has(m.state)) dead.push(m.id);
+          else own.push(m.id);
+        }
         cursor = page?.nextCursor ?? undefined;
         if (cursor && seen.has(cursor)) throw new Error("InstaBox list: the same page came back twice");
         if (cursor) seen.add(cursor);
       } while (cursor);
+      // Not live, so the daemon drops it (or never sees it, after a start whose cleanup failed); delete it here
+      // instead of waiting for deleteAfterSeconds, which InstaBox does not always honour. Retried each list until gone.
+      await Promise.all(dead.map((id) => kill(id).catch(() => {})));
       return own;
     },
     async alive(id) {

@@ -125,6 +125,12 @@ test("an argv over InstaBox's 64 KiB cap goes through stdin and still reaches th
   assert.deepEqual(calls[1].body, { argv: ["true"], timeoutSeconds: 120 });
 });
 
+test("a quota error sent after the keepalive 200 is not retried: the command may already have run", async () => {
+  const { provider, calls } = api(() => ({ body: { error: { code: "quota_exceeded", message: "too many" }, status: 429 } }));
+  await assert.rejects(provider.exec("mc_1", ["rm", "-rf", "build"]), (e: Error) => !(e instanceof ProviderLimitError) && /429 quota_exceeded/.test(e.message));
+  assert.equal(calls.length, 1);
+});
+
 test("exec asks for keepalive, and an error sent after the 200 (keepalive's error body) is an error", async () => {
   const { provider, calls } = api(() => ({ body: { error: { code: "host_unavailable", message: "connection to the sandbox was lost" }, status: 503 } }));
   await assert.rejects(provider.exec("mc_1", ["sleep", "400"], 400_000), /503 host_unavailable: connection to the sandbox was lost/);
@@ -176,9 +182,11 @@ test("a command that runs out its time is reported as timed out, which the daemo
   await assert.rejects(provider.exec("mc_1", ["sleep", "999"], 30_000), /timed out after 30 s/);
 });
 
-test("list follows the cursor and keeps only live machines tagged as this daemon's", async () => {
+test("list follows the cursor and keeps only live machines tagged as this daemon's; its stopped or failed ones are deleted", async () => {
   const { provider, calls } = api((c) =>
-    !c.query.get("cursor")
+    c.method === "DELETE"
+      ? { body: {} }
+      : !c.query.get("cursor")
       ? { body: { machines: [{ id: "a", state: "running", metadata: { t3lizard: "1" } }, { id: "b", state: "deleted", metadata: { t3lizard: "1" } }], nextCursor: "p2" } }
       : {
           body: {
@@ -186,13 +194,17 @@ test("list follows the cursor and keeps only live machines tagged as this daemon
               { id: "c", state: "creating", metadata: { t3lizard: "1" } },
               { id: "d", state: "running", metadata: { owner: "someone else" } },
               { id: "e", state: "error", metadata: { t3lizard: "1" } },
+              { id: "f", state: "stopped", metadata: { t3lizard: "1" } },
+              { id: "g", state: "stopped", metadata: { owner: "someone else" } },
             ],
             nextCursor: null,
           },
         },
   );
   assert.deepEqual(await provider.list(), ["a", "c"]);
-  assert.deepEqual(calls.map((c) => [c.query.get("metadata"), c.query.get("cursor")]), [["t3lizard:1", null], ["t3lizard:1", "p2"]]);
+  const gets = calls.filter((c) => c.method === "GET");
+  assert.deepEqual(gets.map((c) => [c.query.get("metadata"), c.query.get("cursor")]), [["t3lizard:1", null], ["t3lizard:1", "p2"]]);
+  assert.deepEqual(calls.filter((c) => c.method === "DELETE").map((c) => c.path).sort(), ["/v1/machines/e", "/v1/machines/f"]);
 });
 
 test("alive is false for a machine InstaBox no longer has or reports stopped, and throws when it cannot tell", async () => {
