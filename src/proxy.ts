@@ -3,8 +3,8 @@ import https from "node:https";
 import net from "node:net";
 import tls from "node:tls";
 import type { Duplex } from "node:stream";
+import type { PortAuth } from "./provider.ts";
 
-export const TOKEN_HEADER = "x-lizard-access-token";
 /** The Host the client used. The machine's front proxy gives it to T3, so each client sees its own origin. */
 export const CLIENT_HOST_HEADER = "x-t3lizard-host";
 
@@ -15,24 +15,33 @@ export interface Proxy {
 
 /**
  * Listen on 127.0.0.1:port and forward HTTP requests and upgrades (WebSocket) to `upstream`,
- * adding the Lizard access token. The local T3 links to this port, so it never sees the token.
+ * adding the port's access token as `portAuth` says. The local T3 links to this port, so it never
+ * sees the token. A token the client sent itself is dropped.
  */
-export async function startProxy(opts: { port: number; upstream: URL; accessToken: string; extraHosts?: string[] }): Promise<Proxy> {
-  const { upstream, accessToken } = opts;
+export async function startProxy(opts: { port: number; upstream: URL; accessToken: string; portAuth: PortAuth; extraHosts?: string[] }): Promise<Proxy> {
+  const { upstream, accessToken, portAuth } = opts;
   const secure = upstream.protocol === "https:";
   const upstreamPort = Number(upstream.port) || (secure ? 443 : 80);
   const sockets = new Set<Duplex>();
+  const authHeader = portAuth.kind === "header" ? portAuth.name.toLowerCase() : undefined;
 
   const forwardHeaders = (raw: string[]): [string, string][] => {
     const out: [string, string][] = [];
+    const cookies: string[] = [];
     let clientHost = "";
     for (let i = 0; i < raw.length; i += 2) {
       const name = raw[i].toLowerCase();
       if (name === "host") clientHost = raw[i + 1];
-      if (name === "host" || name === TOKEN_HEADER || name === CLIENT_HOST_HEADER) continue;
+      if (name === "host" || name === authHeader || name === CLIENT_HOST_HEADER) continue;
+      if (portAuth.kind === "cookie" && name === "cookie") {
+        cookies.push(...raw[i + 1].split(";").map((c) => c.trim()).filter((c) => c && c.split("=")[0].trim() !== portAuth.name));
+        continue;
+      }
       out.push([raw[i], raw[i + 1]]);
     }
-    out.push(["Host", upstream.host], ["X-Lizard-Access-Token", accessToken]);
+    out.push(["Host", upstream.host]);
+    if (portAuth.kind === "header") out.push([portAuth.name, accessToken]);
+    else out.push(["Cookie", [...cookies, `${portAuth.name}=${accessToken}`].join("; ")]);
     if (clientHost) out.push(["X-T3lizard-Host", clientHost]);
     return out;
   };
@@ -55,7 +64,7 @@ export async function startProxy(opts: { port: number; upstream: URL; accessToke
     );
     up.on("error", (e) => {
       if (!res.headersSent) res.writeHead(502, { "content-type": "text/plain" });
-      res.end(`t3lizard proxy: ${e.message}`);
+      res.end(`xstack-cloud proxy: ${e.message}`);
     });
     req.pipe(up);
   });

@@ -1,54 +1,7 @@
 import { LimitExceededError, NotFoundError, PaymentRequiredError, Sandbox } from "@lizard-build/sdk";
-import { SIZE_VCPU, type MachineId, type RepoKey, type Size } from "./types.ts";
-
-export interface ExecResult {
-  stdout: string;
-  stderr: string;
-  exitCode: number;
-}
-
-/** Everything t3lizard needs from Lizard. The daemon depends on this, so tests use a fake. */
-export interface Lizard {
-  /** With snapshotId the machine starts from that saved snapshot, at the snapshot's own size (`size` is then ignored by Lizard). */
-  create(repo: RepoKey, size: Size, lifetimeMs: number, snapshotId?: string): Promise<{ id: MachineId; deadline: number }>;
-  /** Saves the machine's files as a private snapshot (about 2 s) and waits until it is ready. Returns its id. Storage is billed until it is deleted. */
-  snapshot(id: MachineId, name: string): Promise<string>;
-  deleteSnapshot(snapshotId: string): Promise<void>;
-  /** Live sandboxes in the project that t3lizard created (metadata t3lizard=1). Never anyone else's. */
-  list(): Promise<MachineId[]>;
-  /** Every running sandbox on the Lizard account, in any project, with its vCPUs: they all count against the account's vCPU limit. */
-  accountSandboxes?(): Promise<{ id: MachineId; vcpu: number }[]>;
-  /** False when Lizard no longer knows the sandbox or reports it stopped or crashed. Throws when it cannot tell. */
-  alive(id: MachineId): Promise<boolean>;
-  exec(id: MachineId, cmd: string[], timeoutMs?: number): Promise<ExecResult>;
-  exposePort(id: MachineId, port: number): Promise<{ hostname: string; accessToken: string }>;
-  setTimeout(id: MachineId, msFromNow: number): Promise<void>;
-  kill(id: MachineId): Promise<void>;
-}
-
-/** Lizard refused a create because of a sandbox or rate limit. Creates pause until retryAfterS. */
-export class LizardLimitError extends Error {
-  code?: string;
-  retryAfterS?: number;
-  constructor(message: string, code?: string, retryAfterS?: number) {
-    super(message);
-    this.name = "LizardLimitError";
-    this.code = code;
-    this.retryAfterS = retryAfterS;
-  }
-}
-
-/** The account must pay or start Pro before it can create anything. */
-export class LizardPaymentError extends Error {
-  code?: string;
-  url?: string;
-  constructor(message: string, code?: string, url?: string) {
-    super(message);
-    this.name = "LizardPaymentError";
-    this.code = code;
-    this.url = url;
-  }
-}
+import { DEFAULT_TAG, ProviderLimitError, ProviderPaymentError } from "./provider.ts";
+import type { MachineProvider } from "./provider.ts";
+import { SIZE_VCPU, type MachineId, type Size } from "./types.ts";
 
 /**
  * The two raw Lizard calls that ownership needs. The real `Sandbox.list()` answer has no
@@ -59,12 +12,6 @@ export interface SandboxDirectory {
   /** undefined when the sandbox no longer exists. */
   getInfo(id: MachineId): Promise<{ status?: string; metadata?: Record<string, string> } | undefined>;
 }
-
-/**
- * The metadata key that marks a sandbox as made by this daemon. Two daemons on one Lizard key that share a tag
- * kill each other's machines as orphans (each sees the other's as unknown), so each daemon needs its own.
- */
-export const DEFAULT_TAG = "t3lizard";
 
 const ENDED = new Set(["stopped", "crashed"]);
 
@@ -103,7 +50,7 @@ export async function sandboxAlive(dir: SandboxDirectory, id: MachineId): Promis
   return !!info && !ENDED.has(String(info.status));
 }
 
-export function realLizard(opts: { apiKey: string; projectId: string; user: string; template: string; tag?: string }): Lizard {
+export function realLizard(opts: { apiKey: string; projectId: string; user: string; template: string; tag?: string }): MachineProvider {
   const tag = opts.tag ?? DEFAULT_TAG;
   const conn = { apiKey: opts.apiKey };
   const sandbox = (id: MachineId) => new Sandbox({ sandboxId: id, ...conn });
@@ -121,6 +68,11 @@ export function realLizard(opts: { apiKey: string; projectId: string; user: stri
   const listOwn = ownSandboxLister(dir, tag);
 
   return {
+    name: "Lizard",
+    portAuth: { kind: "header", name: "X-Lizard-Access-Token" },
+    home: `/home/${opts.user}`,
+    // Sandbox docs: nano $0.00405/h, mini $0.0081/h, small $0.0162/h, medium $0.0324/h, large $0.0648/h, big $0.1296/h.
+    usdPerSmallHour: 0.0162,
     accountSandboxes: () =>
       mapErrors(async () => {
         const all = (await Sandbox.list({ ...conn } as Parameters<typeof Sandbox.list>[0])) as { sandboxId?: string; id?: string; status?: string; size?: string }[];
@@ -129,14 +81,14 @@ export function realLizard(opts: { apiKey: string; projectId: string; user: stri
           .map((s) => ({ id: (s.sandboxId ?? s.id) as MachineId, vcpu: SIZE_VCPU[s.size as Size] ?? SIZE_VCPU.medium }))
           .filter((s) => s.id);
       }),
-    create: (repo, size, lifetimeMs, snapshotId) =>
+    create: (repo, size, lifetimeMs, snapshotId, labels) =>
       mapErrors(async () => {
         const sb = await Sandbox.create(opts.template, {
           ...conn,
           projectId: opts.projectId,
           size,
           timeoutMs: lifetimeMs,
-          metadata: { [tag]: "1", repo },
+          metadata: { ...labels, [tag]: "1", repo },
           ...(snapshotId ? { snapshotId } : {}),
         });
         // Lizard answers "Sandbox already deleted" (NotFoundError) to calls made in the first moments after create.
@@ -189,8 +141,8 @@ async function mapErrors<T>(fn: () => Promise<T>): Promise<T> {
   try {
     return await fn();
   } catch (e) {
-    if (e instanceof LimitExceededError) throw new LizardLimitError(e.message, e.code, e.retryAfterS);
-    if (e instanceof PaymentRequiredError) throw new LizardPaymentError(e.message, e.code, e.url);
+    if (e instanceof LimitExceededError) throw new ProviderLimitError(e.message, e.code, e.retryAfterS);
+    if (e instanceof PaymentRequiredError) throw new ProviderPaymentError(e.message, e.code, e.url);
     throw e;
   }
 }

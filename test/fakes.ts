@@ -1,5 +1,6 @@
 import { ownSandboxLister, sandboxAlive } from "../src/lizard.ts";
-import type { ExecResult, Lizard, SandboxDirectory } from "../src/lizard.ts";
+import type { SandboxDirectory } from "../src/lizard.ts";
+import type { ExecResult, MachineProvider } from "../src/provider.ts";
 import type { LocalT3 } from "../src/t3local.ts";
 import { SIZE_VCPU, type MachineId, type RepoKey, type Size } from "../src/types.ts";
 
@@ -18,13 +19,17 @@ type StepHandler = (m: FakeMachine, args: string[]) => ExecResult | undefined;
 const ok = (stdout = ""): ExecResult => ({ stdout, stderr: "", exitCode: 0 });
 
 /**
- * An in-memory Lizard. Each exec is dispatched on the `# t3lizard:<step>` line that every
+ * An in-memory provider, shaped like Lizard. Each exec is dispatched on the `# t3lizard:<step>` line that every
  * machine script starts with; `on[step]` overrides a step's default answer.
  *
  * Like the real API, `listSandboxes()` carries no metadata and `getInfo()` does. `list()` and
  * `alive()` run the production code over those two calls.
  */
-export class FakeLizard implements Lizard, SandboxDirectory {
+export class FakeProvider implements MachineProvider, SandboxDirectory {
+  readonly name = "fake";
+  readonly portAuth = { kind: "header", name: "X-Lizard-Access-Token" } as const;
+  readonly usdPerSmallHour = 0.0162;
+  home = "/home/user";
   machines = new Map<MachineId, FakeMachine>();
   killed: MachineId[] = [];
   timeouts: [MachineId, number][] = [];
@@ -58,7 +63,7 @@ export class FakeLizard implements Lizard, SandboxDirectory {
     this.now = now;
   }
 
-  async create(repo: RepoKey, size: Size, lifetimeMs: number, snapshotId?: string) {
+  async create(repo: RepoKey, size: Size, lifetimeMs: number, snapshotId?: string, labels: Record<string, string> = {}) {
     if (snapshotId && this.snapshotCreateError) throw this.snapshotCreateError;
     if (this.nextCreateError) {
       const e = this.nextCreateError;
@@ -67,7 +72,7 @@ export class FakeLizard implements Lizard, SandboxDirectory {
     }
     const id = `sb-${++this.n}`;
     const deadline = this.now() + lifetimeMs;
-    this.machines.set(id, { metadata: { t3lizard: "1", repo }, status: "running", repo, size, deadline, files: new Map(), steps: [] });
+    this.machines.set(id, { metadata: { ...labels, t3lizard: "1", repo }, status: "running", repo, size, deadline, files: new Map(), steps: [] });
     this.createdFrom.set(id, snapshotId);
     return { id, deadline };
   }
@@ -126,7 +131,7 @@ export class FakeLizard implements Lizard, SandboxDirectory {
         return ok();
       case "put":
         m.files.set(`~/${args[0]}`, { content: Buffer.from(args[1], "base64").toString(), mode: args[2] });
-        return ok(`PATH=/home/user/${args[0]}\nREL=${args[0]}\n`);
+        return ok(`PATH=${this.home}/${args[0]}\nREL=${args[0]}\n`);
       case "put-clean":
         for (const rel of args) m.files.delete(`~/${rel}`);
         return ok();

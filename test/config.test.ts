@@ -66,3 +66,36 @@ test("account labels come from CLAUDE_ACCOUNT_LABEL_<n>, unquoted, and only for 
     { claudeAgent_acct1: "claude-dev-klovr", claudeAgent_acct3: "claude-xianjun-klovr", claudeAgent_acct4: "claude-maxine-klovr" },
   );
 });
+
+test("the provider defaults to lizard, so an existing config is unchanged", () => {
+  const c = parseConfig({ project: "p" });
+  assert.equal(c.provider, "lizard");
+  assert.equal(c.template, "claude");
+  assert.throws(() => parseConfig({ provider: "aws" }));
+});
+
+test("instabox needs no project, defaults to its own template and sizes, and refuses sizes it does not have", () => {
+  const c = parseConfig({ provider: "instabox" });
+  assert.equal(c.provider, "instabox");
+  assert.equal(c.template, "agent-browser");
+  assert.deepEqual(c.sizes, [{ size: "medium", max: 1 }, { size: "small", max: 2 }]);
+  assert.equal(parseConfig({ provider: "instabox", template: "mine" }).template, "mine");
+  assert.deepEqual(parseConfig({ provider: "instabox", sizes: [{ size: "large", max: 1 }] }).sizes, [{ size: "large", max: 1 }]);
+  assert.throws(() => parseConfig({ provider: "instabox", sizes: [{ size: "mini", max: 1 }] }), /InstaBox has no "mini" size \(it has small, medium, large\)/);
+  assert.throws(() => parseConfig({ provider: "instabox", size: "nano" }), /no "nano" size/);
+  assert.throws(() => parseConfig({ provider: "instabox", defaultSize: "big" }), /no "big" size/);
+});
+
+test("execConcurrency is a positive whole number, at most 64 on instabox, where every daemon on a Pro workspace shares 64", () => {
+  assert.equal(parseConfig({ provider: "instabox" }).execConcurrency, undefined);
+  assert.equal(parseConfig({ provider: "instabox", execConcurrency: 16 }).execConcurrency, 16);
+  assert.throws(() => parseConfig({ provider: "instabox", execConcurrency: 65 }), /at most 64/);
+  assert.throws(() => parseConfig({ provider: "instabox", execConcurrency: 0 }));
+  assert.throws(() => parseConfig({ provider: "instabox", execConcurrency: 1.5 }));
+});
+
+test("autoSuspendMinutes takes 0 or 5-30, InstaBox's range", () => {
+  assert.equal(parseConfig({ provider: "instabox", autoSuspendMinutes: 30 }).autoSuspendMinutes, 30);
+  assert.equal(parseConfig({ provider: "instabox", autoSuspendMinutes: 0 }).autoSuspendMinutes, 0);
+  assert.throws(() => parseConfig({ provider: "instabox", autoSuspendMinutes: 3 }));
+});

@@ -6,20 +6,20 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ACCOUNTS_JS, busyThreads, configureFront, execPoll, execStart, FRONT_JS, install, pairAndLink, PREFLIGHT_SH, putFile, removePutFiles, resetCheckout, runRepoSetup, setupProject } from "../src/bringup.ts";
 import { realLocalT3 } from "../src/t3local.ts";
-import { FakeLizard, FakeT3, noSleep } from "./fakes.ts";
+import { FakeProvider, FakeT3, noSleep } from "./fakes.ts";
 
 async function machine() {
-  const lizard = new FakeLizard();
-  const { id } = await lizard.create("github.com/acme/app", "small", 3_600_000);
-  return { lizard, id, m: lizard.machines.get(id)!, r: { lizard, sleep: noSleep } };
+  const provider = new FakeProvider();
+  const { id } = await provider.create("github.com/acme/app", "small", 3_600_000);
+  return { provider, id, m: provider.machines.get(id)!, r: { provider, sleep: noSleep } };
 }
 
 test("install writes the secrets file with mode 600, waits for the install, then for t3 serve", async () => {
   const { r, id, m } = await machine();
   let polls = 0;
-  r.lizard.on["install-poll"] = () => ({ stdout: ++polls < 3 ? "running\n" : "done\n", stderr: "", exitCode: 0 });
+  r.provider.on["install-poll"] = () => ({ stdout: ++polls < 3 ? "running\n" : "done\n", stderr: "", exitCode: 0 });
   let healthChecks = 0;
-  r.lizard.on.health = () => ({ stdout: "", stderr: "", exitCode: ++healthChecks < 2 ? 7 : 0 });
+  r.provider.on.health = () => ({ stdout: "", stderr: "", exitCode: ++healthChecks < 2 ? 7 : 0 });
 
   await install(r, id, { GH_TOKEN: "gh'x" }, "0.1.11", [{ id: "claudeAgent_acct1", token: "tok-1" }]);
 
@@ -58,15 +58,15 @@ test("install configures Antigravity before serve-start when provided", async ()
 
 test("install reports the log when the install script failed", async () => {
   const { r, id } = await machine();
-  r.lizard.on["install-poll"] = () => ({ stdout: "failed\ncurl: (6) Could not resolve host\n", stderr: "", exitCode: 0 });
+  r.provider.on["install-poll"] = () => ({ stdout: "failed\ncurl: (6) Could not resolve host\n", stderr: "", exitCode: 0 });
   await assert.rejects(install(r, id, {}, "0.1.11", []), /install failed:\ncurl: \(6\)/);
 });
 
 test("serve-start supervises T3 on 127.0.0.1:3773 and the front proxy on 3774", async () => {
   const { r, id } = await machine();
   let started = "";
-  const exec = r.lizard.exec.bind(r.lizard);
-  r.lizard.exec = async (mid, cmd, ms) => {
+  const exec = r.provider.exec.bind(r.provider);
+  r.provider.exec = async (mid, cmd, ms) => {
     if (cmd[2].includes("# t3lizard:serve-start")) started = cmd[2];
     return exec(mid, cmd, ms);
   };
@@ -78,7 +78,7 @@ test("serve-start supervises T3 on 127.0.0.1:3773 and the front proxy on 3774", 
 test("configureFront writes the devbox Host for the front proxy and waits for it", async () => {
   const { r, id, m } = await machine();
   let checks = 0;
-  r.lizard.on["front-health"] = () => ({ stdout: "", stderr: "", exitCode: ++checks < 3 ? 7 : 0 });
+  r.provider.on["front-health"] = () => ({ stdout: "", stderr: "", exitCode: ++checks < 3 ? 7 : 0 });
   assert.equal(await configureFront(r, id, 47305), "127.0.0.1:47305");
   assert.deepEqual(m.files.get("front-host"), { content: "127.0.0.1:47305\n", mode: "600" });
   assert.equal(checks, 3);
@@ -86,7 +86,7 @@ test("configureFront writes the devbox Host for the front proxy and waits for it
 
 test("install stops at the preflight on an image without glibc and writes nothing", async () => {
   const { r, id, m } = await machine();
-  r.lizard.on.preflight = () => ({ stdout: "", stderr: "no glibc on this image (Alpine Linux v3.24). T3 Code needs glibc", exitCode: 1 });
+  r.provider.on.preflight = () => ({ stdout: "", stderr: "no glibc on this image (Alpine Linux v3.24). T3 Code needs glibc", exitCode: 1 });
   await assert.rejects(install(r, id, { GH_TOKEN: "x" }, "0.1.11", []), /preflight failed \(exit 1\): no glibc on this image \(Alpine/);
   assert.deepEqual(m.steps, ["preflight"]);
   assert.equal(m.files.size, 0);
@@ -109,7 +109,7 @@ test("the preflight script passes on glibc and explains a musl image in a real s
 test("setupProject returns the workspace path and T3 project id", async () => {
   const { r, id, m } = await machine();
   let args: string[] = [];
-  r.lizard.on.project = (_m, a) => {
+  r.provider.on.project = (_m, a) => {
     args = a;
     return undefined;
   };
@@ -135,16 +135,16 @@ test("pairAndLink links the proxy URL with a fresh pairing code per attempt", as
 test("resetCheckout tells a missing ref apart from a broken machine", async () => {
   const { r, id } = await machine();
   assert.deepEqual(await resetCheckout(r, id, "/home/user/app", "main"), { ok: true });
-  r.lizard.on.reset = () => ({ stdout: "", stderr: "fatal: couldn't find remote ref nope", exitCode: 10 });
+  r.provider.on.reset = () => ({ stdout: "", stderr: "fatal: couldn't find remote ref nope", exitCode: 10 });
   const bad = await resetCheckout(r, id, "/home/user/app", "nope");
   assert.equal(bad.ok, false);
-  r.lizard.on.reset = () => ({ stdout: "", stderr: "disk full", exitCode: 1 });
+  r.provider.on.reset = () => ({ stdout: "", stderr: "disk full", exitCode: 1 });
   await assert.rejects(resetCheckout(r, id, "/home/user/app", "main"), /disk full/);
 });
 
 test("busyThreads counts only working threads", async () => {
   const { r, id } = await machine();
-  r.lizard.threads = [{ status: "running" }, { status: "idle" }, { status: "waiting" }, { status: "completed" }];
+  r.provider.threads = [{ status: "running" }, { status: "idle" }, { status: "waiting" }, { status: "completed" }];
   assert.equal(await busyThreads(r, id, "/home/user/app"), 2);
 });
 
@@ -190,12 +190,12 @@ test("the reset and thread scripts work in a real shell against a real git repo"
   writeFileSync(fakeT3, `#!/bin/sh\n[ "$GH_TOKEN" = 'a'"'"'b c$x' ] || exit 3\necho '[{"status":"running"},{"status":"idle"}]'\n`);
   chmodSync(fakeT3, 0o755);
 
-  const lizard = new FakeLizard();
-  lizard.exec = async (_id, cmd) => {
+  const provider = new FakeProvider();
+  provider.exec = async (_id, cmd) => {
     const res = spawnSync(cmd[0], cmd.slice(1), { env: { HOME: home, PATH: process.env.PATH }, encoding: "utf8" });
     return { stdout: res.stdout, stderr: res.stderr, exitCode: res.status ?? 1 };
   };
-  const r = { lizard, sleep: noSleep };
+  const r = { provider, sleep: noSleep };
 
   assert.deepEqual(await resetCheckout(r, "sb", ws, "main"), { ok: true });
   assert.equal(git(ws, "log", "-1", "--format=%s").trim(), "two");
@@ -210,12 +210,12 @@ test("runRepoSetup runs the repo script in the checkout in a real shell: output,
   const home = mkdtempSync(join(tmpdir(), "t3lizard-reposetup-"));
   const ws = join(home, "app");
   mkdirSync(ws);
-  const lizard = new FakeLizard();
-  lizard.exec = async (_id, cmd) => {
+  const provider = new FakeProvider();
+  provider.exec = async (_id, cmd) => {
     const res = spawnSync(cmd[0], cmd.slice(1), { env: { HOME: home, PATH: process.env.PATH }, encoding: "utf8" });
     return { stdout: res.stdout, stderr: res.stderr, exitCode: res.status ?? 1 };
   };
-  const r = { lizard, sleep: (ms: number) => new Promise<void>((res) => setTimeout(res, Math.min(ms, 50))) };
+  const r = { provider, sleep: (ms: number) => new Promise<void>((res) => setTimeout(res, Math.min(ms, 50))) };
   const outputs: string[] = [];
 
   const ok = "#!/usr/bin/env bash\nset -euo pipefail\necho \"in $(pwd)\"\necho ran >> ran.txt\necho done-ok\n";
@@ -251,12 +251,12 @@ test("execStart saves the command as a script and runs it in the checkout under 
   await execStart(r, id, "/home/user/app", "abc12345", "bun run typecheck\necho done", 600);
   assert.deepEqual(m.files.get("exec/abc12345.sh"), { content: "bun run typecheck\necho done", mode: "700" });
   assert.ok(m.steps.includes("exec-start"));
-  r.lizard.execRunsFor = 1;
-  r.lizard.execOutput = "line 1\nline 2\n";
+  r.provider.execRunsFor = 1;
+  r.provider.execOutput = "line 1\nline 2\n";
   const running = await execPoll(r, id, "abc12345");
   assert.equal(running.status, "running");
   assert.equal(running.exitCode, undefined);
-  r.lizard.execExit = 2;
+  r.provider.execExit = 2;
   const done = await execPoll(r, id, "abc12345");
   assert.deepEqual({ status: done.status, exitCode: done.exitCode, output: done.output, truncated: done.truncated }, { status: "exited", exitCode: 2, output: "line 1\nline 2\n", truncated: false });
   await assert.rejects(execPoll(r, id, "nope"), /no exec nope/);
@@ -264,11 +264,11 @@ test("execStart saves the command as a script and runs it in the checkout under 
 
 test("a running exec counts as work, so the lease cannot expire under it", async () => {
   const { r, id } = await machine();
-  r.lizard.threads = [];
-  r.lizard.execRunsFor = 5;
+  r.provider.threads = [];
+  r.provider.execRunsFor = 5;
   await execStart(r, id, "/home/user/app", "e1", "sleep 1", 600);
   assert.equal(await busyThreads(r, id, "/home/user/app"), 1);
-  r.lizard.execRunsFor = 0;
+  r.provider.execRunsFor = 0;
   assert.equal(await busyThreads(r, id, "/home/user/app"), 0);
 });
 
@@ -278,8 +278,8 @@ test("putFile writes under the home folder in a real shell, with the mode, and n
   symlinkSync(outside, join(home, "escape"));
   mkdirSync(join(home, "afolder"));
   // Runs each machine script in bash on this machine, with HOME at the temp folder.
-  const lizard = new FakeLizard();
-  lizard.exec = async (_id, cmd) => {
+  const provider = new FakeProvider();
+  provider.exec = async (_id, cmd) => {
     try {
       const stdout = execFileSync(cmd[0], cmd.slice(1), { env: { HOME: home, PATH: process.env.PATH }, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
       return { stdout, stderr: "", exitCode: 0 };
@@ -288,7 +288,7 @@ test("putFile writes under the home folder in a real shell, with the mode, and n
       return { stdout: x.stdout, stderr: x.stderr, exitCode: x.status };
     }
   };
-  const r = { lizard, sleep: noSleep };
+  const r = { provider, sleep: noSleep };
   const secret = "S3CRET-value\nline two\n";
   const b64 = Buffer.from(secret).toString("base64");
 

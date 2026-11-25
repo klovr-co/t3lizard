@@ -18,7 +18,7 @@ test("the CLI and the MCP server drive a daemon running on fakes", async (t) => 
   t.after(() => daemon.kill("SIGTERM"));
   for (let i = 0; i < 100 && !existsSync(join(home, "daemon.sock")); i++) await new Promise((r) => setTimeout(r, 50));
 
-  const cli = async (...args: string[]) => JSON.parse((await run(join(root, "bin/t3lizard"), args, { env })).stdout);
+  const cli = async (...args: string[]) => JSON.parse((await run(join(root, "bin/xstack-cloud"), args, { env })).stdout);
   const queued = await cli("acquire", "https://github.com/acme/app.git", "main", "--holder", "e2e");
   assert.equal(queued.status, "queued");
   const granted = await cli("wait", queued.ticketId, "--max", "20");
@@ -27,7 +27,7 @@ test("the CLI and the MCP server drive a daemon running on fakes", async (t) => 
   assert.equal((await cli("status")).pools["github.com/acme/app"].leases[0].holder, "e2e");
   const put = (stdin: string, ...args: string[]) =>
     new Promise<any>((resolve, reject) => {
-      const c = execFile(join(root, "bin/t3lizard"), ["put", ...args], { env }, (e, out) => (e ? reject(e) : resolve(JSON.parse(out))));
+      const c = execFile(join(root, "bin/xstack-cloud"), ["put", ...args], { env }, (e, out) => (e ? reject(e) : resolve(JSON.parse(out))));
       c.stdin!.end(stdin);
     });
   const putOut = await put("A_SECRET=value\n", granted.lease.leaseId, "~/.config/app/secrets.env", "--mode", "600");
@@ -35,7 +35,9 @@ test("the CLI and the MCP server drive a daemon running on fakes", async (t) => 
   assert.deepEqual(await cli("release", granted.lease.leaseId), { released: true });
   await assert.rejects(put("x", granted.lease.leaseId, "~/x"), /no lease/);
 
-  const raw = async (...args: string[]) => (await run(join(root, "bin/t3lizard"), args, { env })).stdout;
+  const raw = async (...args: string[]) => (await run(join(root, "bin/xstack-cloud"), args, { env })).stdout;
+  const viaAlias = JSON.parse((await run(join(root, "bin/t3lizard"), ["status"], { env })).stdout);
+  assert.ok(viaAlias.pools["github.com/acme/app"], "the old t3lizard name still works");
   const added = await cli("setup", "add", "https://github.com/acme/app.git", "--reason", "needs bun", "--", "command", "-v", "bun", ">/dev/null", "||", "curl -fsSL https://bun.sh/install | bash");
   assert.equal(added.added, true);
   assert.equal(added.steps[0].line, "command -v bun >/dev/null || curl -fsSL https://bun.sh/install | bash");
@@ -43,7 +45,7 @@ test("the CLI and the MCP server drive a daemon running on fakes", async (t) => 
   assert.match(shown, /^github\.com\/acme\/app: .*repos\/acme\/app\/setup\.sh\n\n1\. \d{4}-\d{2}-\d{2}: needs bun \(cli:/);
 
   const client = new Client({ name: "e2e", version: "0" });
-  await client.connect(new StdioClientTransport({ command: join(root, "bin/t3lizard-mcp"), env: env as Record<string, string> }));
+  await client.connect(new StdioClientTransport({ command: join(root, "bin/xstack-cloud-mcp"), env: env as Record<string, string> }));
   t.after(() => client.close());
   const { tools } = await client.listTools();
   assert.deepEqual(tools.map((x) => x.name).sort(), ["pool_acquire", "pool_exec", "pool_exec_wait", "pool_release", "pool_renew", "pool_setup_add", "pool_status", "pool_wait"]);

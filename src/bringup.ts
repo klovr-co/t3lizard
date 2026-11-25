@@ -1,11 +1,11 @@
 import { readFileSync } from "node:fs";
-import type { ExecResult, Lizard } from "./lizard.ts";
+import type { ExecResult, MachineProvider } from "./provider.ts";
 import type { LocalT3 } from "./t3local.ts";
 import type { AccountId, LimitedThread, MachineId, RepoKey } from "./types.ts";
 
 /** T3 Code on the machine. Bound to 127.0.0.1: only the front proxy reaches it. */
 export const T3_PORT = 3773;
-/** The machine front proxy. This is the port Lizard exposes. */
+/** The machine front proxy. This is the port the provider exposes. */
 export const FRONT_PORT = 3774;
 /** On the machine: what the front proxy sets as Host, i.e. the devbox proxy's 127.0.0.1:<port>. */
 export const FRONT_HOST_FILE = "front-host";
@@ -131,13 +131,13 @@ const START_SUPERVISED = [
 ].join("\n");
 
 export interface Remote {
-  lizard: Lizard;
+  provider: MachineProvider;
   sleep(ms: number): Promise<void>;
   log?(line: string): void;
 }
 
 async function run(r: Remote, id: MachineId, cmd: string[], timeoutMs?: number): Promise<ExecResult> {
-  const res = await r.lizard.exec(id, cmd, timeoutMs);
+  const res = await r.provider.exec(id, cmd, timeoutMs);
   if (res.exitCode !== 0) {
     const step = cmd[2].match(/# t3lizard:([\w-]+)/)?.[1] ?? "step";
     throw new Error(`${step} failed (exit ${res.exitCode}): ${(res.stderr || res.stdout).trim().slice(-2000)}`);
@@ -306,8 +306,8 @@ done
 `;
 
 /** What T3 shows for the machine, e.g. "t3lizard aldrent · arrow-universe-1yxp (mini)". */
-export function machineLabel(repo: RepoKey, id: MachineId, size: string): string {
-  return `t3lizard ${repo.split("/").pop()} · ${id} (${size})`;
+export function machineLabel(repo: RepoKey, id: MachineId, size: string, owner?: string): string {
+  return `t3lizard${owner ? ` ${owner}` : ""} · ${repo.split("/").pop()} · ${id} (${size})`;
 }
 
 export interface Account {
@@ -391,11 +391,11 @@ export async function install(
   }
   if (opts.codexAuth) await pushCodex(r, id, opts.codexAuth);
   // Before serve-start: T3 reads its label once, when it starts.
-  const prep = await r.lizard.exec(id, script("prep", PREP_SH, machine.label, String(SWAP_MB[machine.size] ?? 2048)), 300_000);
+  const prep = await r.provider.exec(id, script("prep", PREP_SH, machine.label, String(SWAP_MB[machine.size] ?? 2048)), 300_000);
   if (prep.exitCode !== 0) r.log?.(`machine ${id}: prep failed (continuing): ${(prep.stderr || prep.stdout).trim().slice(-300)}`);
   await run(r, id, script("serve-start", START_SUPERVISED));
   const health = script("health", `curl -fsS -m 5 http://127.0.0.1:${T3_PORT}/.well-known/t3/environment > /dev/null`);
-  await pollUntil(r, HEALTH_TIMEOUT_MS, 3_000, async () => (await r.lizard.exec(id, health, 30_000)).exitCode === 0, "t3 serve start");
+  await pollUntil(r, HEALTH_TIMEOUT_MS, 3_000, async () => (await r.provider.exec(id, health, 30_000)).exitCode === 0, "t3 serve start");
 }
 
 /**
@@ -532,7 +532,7 @@ export async function configureFront(r: Remote, id: MachineId, devboxPort: numbe
   const host = `127.0.0.1:${devboxPort}`;
   await writeFile(r, id, FRONT_HOST_FILE, `${host}\n`, "600");
   const health = script("front-health", `curl -fsS -m 5 http://127.0.0.1:${FRONT_PORT}/.well-known/t3/environment > /dev/null`);
-  await pollUntil(r, HEALTH_TIMEOUT_MS, 3_000, async () => (await r.lizard.exec(id, health, 30_000)).exitCode === 0, "front proxy start");
+  await pollUntil(r, HEALTH_TIMEOUT_MS, 3_000, async () => (await r.provider.exec(id, health, 30_000)).exitCode === 0, "front proxy start");
   return host;
 }
 
@@ -558,7 +558,7 @@ export type ResetResult = { ok: true } | { ok: false; badRef: string };
 /** Point the checkout at `ref` before a lease is handed out. Keeps ignored files (node_modules) warm. */
 export async function resetCheckout(r: Remote, id: MachineId, workspacePath: string, ref: string): Promise<ResetResult> {
   const body = 'cd "$1"\ngit fetch origin "$2" || exit 10\ngit checkout --force --detach FETCH_HEAD\ngit clean -ffd';
-  const res = await r.lizard.exec(id, script("reset", body, workspacePath, ref), 600_000);
+  const res = await r.provider.exec(id, script("reset", body, workspacePath, ref), 600_000);
   if (res.exitCode === 10) return { ok: false, badRef: `cannot fetch ${ref}: ${res.stderr.trim().slice(-500)}` };
   if (res.exitCode !== 0) throw new Error(`reset failed (exit ${res.exitCode}): ${(res.stderr || res.stdout).trim().slice(-2000)}`);
   return { ok: true };
@@ -649,7 +649,7 @@ export async function busyThreads(r: Remote, id: MachineId, workspacePath: strin
   // The CLI's list leaves sub-agent threads out, and every delegated job is one: ask T3's MCP tools.
   // A machine brought up by an older t3lizard has an older accounts.mjs (no stall check).
   await writeFile(r, id, "accounts.mjs", ACCOUNTS_JS, "600").catch(() => undefined);
-  const viaMcp = await r.lizard.exec(id, script("busy", 'node "$D/accounts.mjs" busy'), 120_000);
+  const viaMcp = await r.provider.exec(id, script("busy", 'node "$D/accounts.mjs" busy'), 120_000);
   const m = viaMcp.exitCode === 0 ? viaMcp.stdout.match(/"busy":(\d+)/) : null;
   // A plain command (pool_exec) is work too: the lease must not expire under it.
   const execs = await runningExecs(r, id).catch(() => 0);

@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
@@ -7,8 +7,8 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSy
 import { busyThreads, cloneRepo, configureFront, pushAccounts, pushCodex, continueOnAccount, execPoll, execStart, exportThreads, FRONT_PORT, install, machineLabel, pairAndLink, PUT_MAX_BYTES, putFile, removePutFiles, resetCheckout, runRepoSetup, scanLimits, scrubForSnapshot, setupProject } from "./bringup.ts";
 import type { Account, ExecView, Remote } from "./bringup.ts";
 import { paths } from "./config.ts";
-import { LizardLimitError, LizardPaymentError } from "./lizard.ts";
-import type { Lizard } from "./lizard.ts";
+import { ProviderLimitError, ProviderPaymentError } from "./provider.ts";
+import type { MachineProvider } from "./provider.ts";
 import { learnSize, nextSizeUp, repoGaps, repoIdleMs, repoLadder, vcpuFree } from "./plan.ts";
 import { accountLimited, accountWait, BRINGING_UP, BUDGET_UNIT, createBackoff, createBlock, machineAccounts, plan, queueInfo, repoCreateBlock, sizesInUse, usedSmallHours, utcDay } from "./plan.ts";
 import { startProxy } from "./proxy.ts";
@@ -17,7 +17,7 @@ import { addStep, readHistory, readSetup, removeStep } from "./setup.ts";
 import type { RepoSetup } from "./setup.ts";
 import type { Proxy } from "./proxy.ts";
 import type { LocalT3 } from "./t3local.ts";
-import { emptyState, SIZE_USD_PER_HOUR, SIZE_VCPU, SIZE_WEIGHT } from "./types.ts";
+import { emptyState, SIZE_VCPU, SIZE_WEIGHT } from "./types.ts";
 import type { JobRecord, SnapshotRecord } from "./types.ts";
 import type { AccountId, Action, CloseReason, Config, CreateRecord, Lease, Machine, MachineId, MachinePhase, RepoKey, Size, State, Ticket } from "./types.ts";
 
@@ -51,7 +51,7 @@ const CODEX_MAX_AGE_MS = 6 * 24 * 3_600_000;
 const DEFAULT_ANTIGRAVITY_MODEL = "gemini-4-neon";
 
 export interface DaemonDeps {
-  lizard: Lizard;
+  provider: MachineProvider;
   t3: LocalT3;
   config: Config;
   /** Values written to the machine's env file (config.forwardEnv). Never a Claude/Antigravity token. */
@@ -138,7 +138,7 @@ export class Daemon {
   constructor(deps: DaemonDeps) {
     this.deps = deps;
     this.files = paths(deps.home);
-    this.remote = { lizard: deps.lizard, sleep: deps.sleep, log: (l) => deps.log(l) };
+    this.remote = { provider: deps.provider, sleep: deps.sleep, log: (l) => deps.log(l) };
     this.changes.setMaxListeners(0);
   }
 
@@ -197,7 +197,7 @@ export class Daemon {
     }
   }
 
-  /** Run the scheduler once and start what it decides. No Lizard listing. */
+  /** Run the scheduler once and start what it decides. No provider listing. */
   step(): void {
     const now = this.deps.now();
     for (const action of plan(this.state, now, this.vcpuConfig())) this.apply(action);
@@ -261,7 +261,7 @@ export class Daemon {
    */
   async put(req: { leaseId: string; path: string; contentBase64: string; mode?: string }): Promise<{ path: string; bytes: number; mode: string }> {
     const { lease, machine } = this.leased(req.leaseId);
-    const rel = homeRelative(req.path, this.deps.config.sandboxUser);
+    const rel = homeRelative(req.path, this.deps.provider.home);
     const mode = req.mode ?? "600";
     if (!/^[A-Za-z0-9+/]*={0,2}$/.test(req.contentBase64) || req.contentBase64.length % 4 !== 0) throw new ApiError(400, "contentBase64 is not base64");
     const content = Buffer.from(req.contentBase64, "base64");
@@ -275,7 +275,7 @@ export class Daemon {
       try {
         out = await putFile(this.remote, machine.id, rel, req.contentBase64, mode);
       } catch (e) {
-        // Only fixed words go back: the machine's output or a Lizard error could quote the content.
+        // Only fixed words go back: the machine's output or a provider error could quote the content.
         const msg = (e as Error).message;
         const why = msg.match(/the path leaves the home folder|the path is a folder/)?.[0] ?? msg.match(/\(exit \d+\)/)?.[0] ?? "the machine did not answer";
         throw new ApiError(502, `writing ~/${rel} on ${machine.id} failed: ${why}`);
@@ -401,7 +401,7 @@ export class Daemon {
   /** At grant: zero the machine's mem-peak and note where guard.log ends, so the stats are this lease's. */
   private async resetPeak(id: MachineId, leaseId: string): Promise<void> {
     try {
-      const out = (await this.deps.lizard.exec(id, ["bash", "-c", 'D="$HOME/.t3lizard"; echo 0 > "$D/mem-peak" 2>/dev/null; wc -l < "$D/guard.log" 2>/dev/null || echo 0'], 30_000)).stdout;
+      const out = (await this.deps.provider.exec(id, ["bash", "-c", 'D="$HOME/.t3lizard"; echo 0 > "$D/mem-peak" 2>/dev/null; wc -l < "$D/guard.log" 2>/dev/null || echo 0'], 30_000)).stdout;
       const lease = this.state.leases[leaseId];
       if (lease) {
         lease.guardLogLines = Number(out.trim()) || 0;
@@ -418,7 +418,7 @@ export class Daemon {
     if (this.state.machines[lease.machineId] && !this.state.machines[lease.machineId].unresponsiveSince) {
       try {
         const from = (lease.guardLogLines ?? 0) + 1;
-        const out = (await this.deps.lizard.exec(
+        const out = (await this.deps.provider.exec(
           lease.machineId,
           ["bash", "-c", 'D="$HOME/.t3lizard"; echo "peak=$(cat "$D/mem-peak" 2>/dev/null)"; echo "kills=$(tail -n +"$1" "$D/guard.log" 2>/dev/null | grep -c killed)"', "t3lizard", String(from)],
           30_000,
@@ -493,7 +493,7 @@ export class Daemon {
     const used = new Map<Size, number>();
     for (const m of Object.values(this.state.machines)) used.set(m.size, (used.get(m.size) ?? 0) + 1);
     const vcpuInUse = [...used].reduce((n, [size, k]) => n + SIZE_VCPU[size] * k, 0);
-    const usdPerSmallSecond = SIZE_USD_PER_HOUR.small / 3600;
+    const usdPerSmallSecond = this.deps.provider.usdPerSmallHour / 3600;
     const days = Object.entries(this.state.usage).sort(([a], [b]) => (a < b ? 1 : -1)).slice(0, 31);
     const month = new Date(now).toISOString().slice(0, 7);
     const spend = {
@@ -531,7 +531,7 @@ export class Daemon {
     });
     return {
       now,
-      vcpu: { limit: config.vcpuLimit, reserve: config.vcpuReserve, otherSandboxes: this.othersVcpu, inUse: vcpuInUse, free: vcpuFree(this.vcpuConfig(), used) },
+      vcpu: { limit: config.vcpuLimit, poolMax: config.vcpuPoolMax, reserve: config.vcpuReserve, otherSandboxes: this.othersVcpu, inUse: vcpuInUse, free: vcpuFree(this.vcpuConfig(), used) },
       spend,
       learned,
       jobs: (this.state.jobs ?? []).slice(0, 100),
@@ -554,7 +554,7 @@ export class Daemon {
     for (const m of ms) {
       const base = `http://${publicHost}:${m.proxyPort}`;
       const minutesLeft = Math.max(5, Math.ceil((m.deadline - this.deps.now()) / MINUTE));
-      const out = (await this.deps.lizard.exec(
+      const out = (await this.deps.provider.exec(
         m.id,
         ["bash", "-c", 'export PATH="$HOME/.local/bin:$PATH"; t3 auth pairing create --base-dir "$HOME/.t3" --json --ttl "$1m" --label "browser" --base-url "$2"', "t3lizard", String(minutesLeft), base],
         60_000,
@@ -564,7 +564,7 @@ export class Daemon {
       const credential = typeof json.credential === "string" ? json.credential : undefined;
       const link = url ?? (credential ? `${base}/pair#token=${credential}` : undefined);
       if (!link) throw new Error(`no pairing link from ${m.id}`);
-      links.push({ machineId: m.id, label: machineLabel(m.repo, m.id, m.size), url: link });
+      links.push({ machineId: m.id, label: machineLabel(m.repo, m.id, m.size, this.owner()), url: link });
     }
     return { links, ...(links.length ? {} : { note: "no linked machines right now" }) };
   }
@@ -584,7 +584,9 @@ export class Daemon {
         ageMinutes: minutes(now - m.createdAt),
         deadlineInMinutes: minutes(m.deadline - now),
         environmentId: m.environmentId,
-        label: machineLabel(m.repo, m.id, m.size),
+        label: machineLabel(m.repo, m.id, m.size, this.owner()),
+        startedBy: this.owner(),
+        ...(m.requestedBy ? { requestedBy: m.requestedBy } : {}),
         ...(m.antigravity ? { antigravity: true } : {}),
         ...(m.unresponsiveSince ? { notAnswering: `no answer since ${minutes(now - m.unresponsiveSince)} min ago (likely out of memory)` } : {}),
         ...(m.limitedThreads?.length ? { limitedThreads: m.limitedThreads } : {}),
@@ -612,7 +614,7 @@ export class Daemon {
       ...(this.baking ? { baking: this.baking } : {}),
       ...(this.state.lastBake ? { lastBake: { ...this.state.lastBake, at: new Date(this.state.lastBake.at).toISOString() } } : {}),
       budget: {
-        unit: `${BUDGET_UNIT}: 1 h of small = 1, mini = 0.5, nano = 0.25 (Lizard per-hour prices)`,
+        unit: `${BUDGET_UNIT}: 1 h of small = 1, mini = 0.5, nano = 0.25 (per-hour prices)`,
         usedToday: Number(usedSmallHours(this.state, now).toFixed(2)),
         dailyLimit: config.dailySmallMachineHours,
       },
@@ -622,7 +624,7 @@ export class Daemon {
       })(),
       perRepoCap: config.perRepoCap,
       createsBlocked: createBlock(this.state, now, config),
-      lastLizardError: this.state.lastLizardError,
+      lastProviderError: this.state.lastProviderError,
       antigravityConfigured: Boolean(this.deps.antigravityToken),
       codexConfigured: Boolean(this.codexLogin()),
       defaultProvider: this.deps.antigravityToken ? (config.defaultProvider ?? "antigravity") : "claude",
@@ -719,13 +721,15 @@ export class Daemon {
     const lifetimeMs = config.lifetimeMinutes * MINUTE;
     const snap = this.state.snapshots?.[snapKey(repo, size)];
     const pendingId = `${PENDING}${randomUUID()}`;
-    this.state.machines[pendingId] = { id: pendingId, repo, size, createdAt: now, deadline: now + lifetimeMs, phase: { kind: "creating" } };
+    // The oldest waiting request of the repo is the one this machine is started for.
+    const requestedBy = this.state.tickets.find((t) => t.status === "queued" && t.repo === repo)?.holder;
+    this.state.machines[pendingId] = { id: pendingId, repo, size, createdAt: now, deadline: now + lifetimeMs, phase: { kind: "creating" }, ...(requestedBy ? { requestedBy } : {}) };
     const record: CreateRecord = { machineId: pendingId, repo, at: now, outcome: "pending" };
     (this.state.creates ??= []).push(record);
     this.createsInFlight++;
     this.launch(`create:${pendingId}`, async () => {
       try {
-        const { id, deadline } = await this.deps.lizard.create(repo, size, lifetimeMs, snap?.id);
+        const { id, deadline } = await this.deps.provider.create(repo, size, lifetimeMs, snap?.id, this.labels(requestedBy ? { requestedBy } : {}));
         const pending = this.state.machines[pendingId];
         delete this.state.machines[pendingId];
         // From a snapshot the tools and the repo's setup are already on disk: bring-up finds them and skips them.
@@ -740,14 +744,14 @@ export class Daemon {
         this.launch(`bringup:${id}`, () => this.bringUp(id));
       } catch (e) {
         delete this.state.machines[pendingId];
-        // Lizard made no machine, so this is not a create for the breaker; recordLizardError pauses creates.
+        // The provider made no machine, so this is not a create for the breaker; recordProviderError pauses creates.
         this.state.creates = this.state.creates?.filter((r) => r !== record);
-        if (snap && !(e instanceof LizardLimitError) && !(e instanceof LizardPaymentError)) {
+        if (snap && !(e instanceof ProviderLimitError) && !(e instanceof ProviderPaymentError)) {
           // The snapshot may be gone or broken: forget it, so the next machine starts the long way.
           delete this.state.snapshots?.[snapKey(repo, size)];
           this.deps.log(`snapshot ${snap.id} of ${repo} could not be used and is dropped: ${(e as Error).message}`);
         } else {
-          this.recordLizardError(e as Error);
+          this.recordProviderError(e as Error);
         }
         this.save();
       } finally {
@@ -757,15 +761,15 @@ export class Daemon {
     });
   }
 
-  private recordLizardError(e: Error): void {
+  private recordProviderError(e: Error): void {
     const now = this.deps.now();
     const err = e as Error & { code?: string; url?: string };
     let pauseMs = MINUTE;
-    if (e instanceof LizardLimitError) pauseMs = (e.retryAfterS ?? 60) * 1000;
-    if (e instanceof LizardPaymentError) pauseMs = 10 * MINUTE;
+    if (e instanceof ProviderLimitError) pauseMs = (e.retryAfterS ?? 60) * 1000;
+    if (e instanceof ProviderPaymentError) pauseMs = 10 * MINUTE;
     this.state.createsPausedUntil = now + pauseMs;
-    this.state.lastLizardError = { at: now, message: e.message, ...(err.code ? { code: err.code } : {}), ...(err.url ? { url: err.url } : {}) };
-    this.deps.log(`Lizard create failed, creates paused for ${Math.round(pauseMs / 1000)} s: ${e.message}`);
+    this.state.lastProviderError = { at: now, message: e.message, ...(err.code ? { code: err.code } : {}), ...(err.url ? { url: err.url } : {}) };
+    this.deps.log(`${this.deps.provider.name} create failed, creates paused for ${Math.round(pauseMs / 1000)} s: ${e.message}`);
   }
 
   private antigravityConfig() {
@@ -817,32 +821,32 @@ export class Daemon {
     try {
       this.t3Version ??= await this.deps.t3.version();
       const setup = this.repoSetup(repo);
-      const created = await this.deps.lizard.create(repo, size, BAKE_LIFETIME_MINUTES * MINUTE);
+      const created = await this.deps.provider.create(repo, size, BAKE_LIFETIME_MINUTES * MINUTE, undefined, this.labels({ purpose: "snapshot build" }));
       id = created.id;
       this.state.machines[id] = { id, repo, size, createdAt: startedAt, deadline: created.deadline, phase: { kind: "baking" } };
       const day = utcDay(startedAt);
       this.state.usage[day] = (this.state.usage[day] ?? 0) + config.createChargeMinutes * 60 * SIZE_WEIGHT[size];
       this.deps.log(`machine ${id} (${size}) created to build the snapshot of ${repo}`);
       this.save();
-      await install(this.remote, id, this.deps.machineEnv, this.t3Version, [], { label: `${machineLabel(repo, id, size)} (snapshot build)`, size }, this.antigravityConfig(), { bake: true });
+      await install(this.remote, id, this.deps.machineEnv, this.t3Version, [], { label: `${machineLabel(repo, id, size, this.owner())} (snapshot build)`, size }, this.antigravityConfig(), { bake: true });
       const workspacePath = await cloneRepo(this.remote, id, repo);
       if (setup?.script) await runRepoSetup(this.remote, id, workspacePath, setup.script, config.setupTimeoutMinutes * MINUTE, (log) => this.logSetupOutput(id!, log));
       await scrubForSnapshot(this.remote, id);
-      const snapshotId = await this.deps.lizard.snapshot(id, `t3lizard-${repo.split("/").pop()}-${size}-${new Date(this.deps.now()).toISOString().slice(0, 10)}`);
+      const snapshotId = await this.deps.provider.snapshot(id, `t3lizard-${repo.split("/").pop()}-${size}-${new Date(this.deps.now()).toISOString().slice(0, 19).replace(/\D/g, "")}-${randomUUID().slice(0, 6)}`);
       const old = this.state.snapshots?.[key];
       (this.state.snapshots ??= {})[key] = { id: snapshotId, repo, size, setupHash: setup?.hash ?? "", t3Version: this.t3Version, builtAt: this.deps.now() };
       this.state.lastBake = { at: this.deps.now(), repo, size, ok: true };
       this.save();
       this.deps.log(`snapshot ${snapshotId} of ${repo} (${size}) built in ${Math.round((this.deps.now() - startedAt) / 1000)} s`);
       if (old && old.id !== snapshotId) {
-        await this.deps.lizard.deleteSnapshot(old.id).catch((e) => this.deps.log(`old snapshot ${old.id} was not deleted: ${(e as Error).message}`));
+        await this.deps.provider.deleteSnapshot(old.id).catch((e) => this.deps.log(`old snapshot ${old.id} was not deleted: ${(e as Error).message}`));
       }
       await this.pruneSnapshots(repo);
     } catch (e) {
       const message = (e as Error).message.slice(0, 600);
       this.state.lastBake = { at: this.deps.now(), repo, size, ok: false, message };
       this.deps.log(`snapshot build of ${repo} (${size}) failed, no snapshot changed: ${message}`);
-      if (e instanceof LizardLimitError || e instanceof LizardPaymentError) this.recordLizardError(e);
+      if (e instanceof ProviderLimitError || e instanceof ProviderPaymentError) this.recordProviderError(e);
       this.save();
     } finally {
       if (id && this.state.machines[id]) this.beginClose(id, "manual");
@@ -856,7 +860,7 @@ export class Daemon {
 
   /**
    * Keeps what storage is paid for useful: a repo's snapshot of the size it gets now, and one size up
-   * (where a job that ran out of memory goes next). Others are deleted, as Lizard bills them by the day.
+   * (where a job that ran out of memory goes next). Others are deleted, as storage is billed.
    */
   private async pruneSnapshots(repo: RepoKey): Promise<void> {
     const want = this.wantedSize(repo);
@@ -866,7 +870,7 @@ export class Daemon {
       if (s.repo !== repo || s.size === want || s.size === up) continue;
       delete this.state.snapshots[key];
       this.save();
-      await this.deps.lizard.deleteSnapshot(s.id).then(
+      await this.deps.provider.deleteSnapshot(s.id).then(
         () => this.deps.log(`snapshot ${s.id} of ${repo} (${s.size}) deleted: the repo gets ${want} now`),
         (e) => this.deps.log(`snapshot ${s.id} was not deleted: ${(e as Error).message}`),
       );
@@ -923,7 +927,7 @@ export class Daemon {
           this.deps.machineEnv,
           this.t3Version,
           accounts,
-          { label: machineLabel(m.repo, id, m.size), size: m.size },
+          { label: machineLabel(m.repo, id, m.size, this.owner()), size: m.size },
           antigravity,
           codexAuth ? { codexAuth } : {},
         );
@@ -951,12 +955,12 @@ export class Daemon {
         this.save();
       }
       if (this.deps.config.linkEnvironment === false) {
-        // exec-only: pool_exec goes through Lizard's exec API, so no proxy and no link are needed.
+        // exec-only: pool_exec goes through the provider's exec API, so no proxy and no link are needed.
         m.environmentId ??= NO_LINK;
       } else {
         if (!m.hostname || !m.accessToken) {
-          // Lizard exposes the front proxy, never T3 itself: see src/machine/front.mjs.
-          const { hostname, accessToken } = await this.deps.lizard.exposePort(id, FRONT_PORT);
+          // The provider exposes the front proxy, never T3 itself: see src/machine/front.mjs.
+          const { hostname, accessToken } = await this.deps.provider.exposePort(id, FRONT_PORT);
           m = at("linking");
           Object.assign(m, { hostname, accessToken });
           this.save();
@@ -1056,7 +1060,7 @@ export class Daemon {
 
   private async extend(id: MachineId, deadline: number): Promise<void> {
     try {
-      await this.deps.lizard.setTimeout(id, deadline - this.deps.now());
+      await this.deps.provider.setTimeout(id, deadline - this.deps.now());
       const m = this.state.machines[id];
       if (m) m.deadline = deadline;
       this.save();
@@ -1091,7 +1095,7 @@ export class Daemon {
     this.launch(`close:${id}`, () => this.finishClose(id));
   }
 
-  /** Stop the proxy, unlink locally, kill at Lizard, forget. Each part converges when re-run. */
+  /** Stop the proxy, unlink locally, kill at the provider, forget. Each part converges when re-run. */
   private async finishClose(id: MachineId): Promise<void> {
     await this.closeProxy(id);
     const m = this.state.machines[id];
@@ -1106,7 +1110,7 @@ export class Daemon {
       }
     }
     try {
-      await this.deps.lizard.kill(id);
+      await this.deps.provider.kill(id);
     } catch (e) {
       this.setPhase(m, { kind: "failed", error: `kill failed: ${(e as Error).message}` });
       return;
@@ -1444,9 +1448,9 @@ export class Daemon {
     this.save();
   }
 
-  // ---- reconcile with Lizard ----
+  // ---- reconcile with the provider ----
 
-  /** vCPUs of running sandboxes on the Lizard account that are not this pool's: they count against vcpuLimit too. */
+  /** vCPUs of running machines on the provider account that are not this pool's: they count against vcpuLimit too. */
   private othersVcpu = 0;
 
   /** The config with other sandboxes on the account added to the reserve, for every vCPU decision. */
@@ -1455,15 +1459,26 @@ export class Daemon {
     return this.othersVcpu ? { ...config, vcpuReserve: (config.vcpuReserve ?? 0) + this.othersVcpu } : config;
   }
 
+  /** Who runs this pool: config.owner, else user@host. */
+  private owner(): string {
+    return this.deps.config.owner ?? `${userInfo().username}@${hostname()}`;
+  }
+
+  /** Lizard metadata for a new sandbox, so anyone on the account can see whose pool started it and for whom. */
+  private labels(extra: Record<string, string>): Record<string, string> {
+    const clean = (v: string) => v.replace(/[^\x20-\x7e]/g, "").trim().slice(0, 100);
+    return Object.fromEntries(Object.entries({ startedBy: this.owner(), ...extra }).map(([k, v]) => [k, clean(v)]));
+  }
+
   private async countOtherSandboxes(): Promise<void> {
-    if (!this.deps.lizard.accountSandboxes) return;
+    if (!this.deps.provider.accountSandboxes) return;
     const before = this.createsDone;
-    const all = await this.deps.lizard.accountSandboxes().catch((e: Error) => (this.deps.log(`Lizard account list failed: ${e.message}`), undefined));
+    const all = await this.deps.provider.accountSandboxes().catch((e: Error) => (this.deps.log(`${this.deps.provider.name} account list failed: ${e.message}`), undefined));
     // A create that finished meanwhile is ours but may not be in state under its real id yet.
     if (!all || this.createsInFlight > 0 || this.createsDone !== before) return;
     const others = all.filter((s) => !this.state.machines[s.id]);
     const vcpu = others.reduce((n, s) => n + s.vcpu, 0);
-    if (vcpu !== this.othersVcpu) this.deps.log(`other sandboxes on the Lizard account use ${vcpu} vCPU${others.length ? ` (${others.map((s) => s.id).join(", ")})` : ""}`);
+    if (vcpu !== this.othersVcpu) this.deps.log(`other sandboxes on the ${this.deps.provider.name} account use ${vcpu} vCPU${others.length ? ` (${others.map((s) => s.id).join(", ")})` : ""}`);
     this.othersVcpu = vcpu;
   }
 
@@ -1473,9 +1488,9 @@ export class Daemon {
     const before = this.createsDone;
     let live: Set<MachineId>;
     try {
-      live = new Set(await this.deps.lizard.list());
+      live = new Set(await this.deps.provider.list());
     } catch (e) {
-      this.deps.log(`Lizard list failed: ${(e as Error).message}`);
+      this.deps.log(`${this.deps.provider.name} list failed: ${(e as Error).message}`);
       return;
     }
     if (this.createsInFlight > 0 || this.createsDone !== before) return;
@@ -1484,7 +1499,7 @@ export class Daemon {
       this.deps.log(`killing orphan sandbox ${id}`);
       this.launch(`orphan:${id}`, async () => {
         try {
-          await this.deps.lizard.kill(id);
+          await this.deps.provider.kill(id);
           this.orphansKilled.add(id);
         } catch (e) {
           this.deps.log(`orphan kill ${id} failed: ${(e as Error).message}`);
@@ -1493,18 +1508,18 @@ export class Daemon {
     }
     for (const m of Object.values(this.state.machines)) {
       if (live.has(m.id) || m.phase.kind === "closing" || m.id.startsWith(PENDING)) continue;
-      // A listing can lag or miss a sandbox. Drop a machine only when Lizard confirms it is gone.
+      // A listing can lag or miss a sandbox. Drop a machine only when the provider confirms it is gone.
       let alive: boolean;
       try {
-        alive = await this.deps.lizard.alive(m.id);
+        alive = await this.deps.provider.alive(m.id);
       } catch (e) {
         this.deps.log(`cannot tell whether ${m.id} is alive, keeping it: ${(e as Error).message}`);
         continue;
       }
       const current = this.state.machines[m.id];
       if (alive || !current || current.phase.kind === "closing") continue;
-      this.deps.log(`machine ${m.id} is gone at Lizard; dropping it`);
-      if (BRINGING_UP.has(current.phase.kind)) this.settleCreate(m.id, "lost", `${m.id} vanished at Lizard during bring-up (${current.phase.kind})`);
+      this.deps.log(`machine ${m.id} is gone at ${this.deps.provider.name}; dropping it`);
+      if (BRINGING_UP.has(current.phase.kind)) this.settleCreate(m.id, "lost", `${m.id} vanished at ${this.deps.provider.name} during bring-up (${current.phase.kind})`);
       if (current.phase.kind === "leased") delete this.state.leases[current.phase.leaseId];
       this.setPhase(current, { kind: "closing" });
       this.launch(`close:${m.id}`, () => this.finishClose(m.id));
@@ -1604,7 +1619,7 @@ export class Daemon {
     const candidates = m.proxyPort ? [m.proxyPort] : Array.from({ length: hi - lo + 1 }, (_, i) => lo + i).filter((p) => !taken.has(p));
     for (const port of candidates) {
       try {
-        const proxy = await startProxy({ port, upstream: new URL(`https://${m.hostname}`), accessToken: m.accessToken!, extraHosts: this.deps.config.publicBind });
+        const proxy = await startProxy({ port, upstream: new URL(`https://${m.hostname}`), accessToken: m.accessToken!, portAuth: this.deps.provider.portAuth, extraHosts: this.deps.config.publicBind });
         this.proxies.set(m.id, proxy);
         m.proxyPort = port;
         this.save();
@@ -1667,15 +1682,15 @@ export class Daemon {
 }
 
 /**
- * A path under the sandbox user's home, as a path relative to it: "~/a/b", "/home/<user>/a/b" and
+ * A path under the machine's home folder, as a path relative to it: "~/a/b", "<home>/a/b" and
  * "a/b" all give "a/b". Anything else, or a "." or ".." part, is refused.
  */
-export function homeRelative(path: string, user: string): string {
+export function homeRelative(path: string, home: string): string {
   if (/[\0\n\r]/.test(path)) throw new ApiError(400, "the path has a control character");
   let rel = path;
   if (rel.startsWith("~/")) rel = rel.slice(2);
-  else if (rel.startsWith(`/home/${user}/`)) rel = rel.slice(`/home/${user}/`.length);
-  else if (rel.startsWith("/") || rel.startsWith("~")) throw new ApiError(400, `the path must be under the home folder (~/ or /home/${user}/)`);
+  else if (rel.startsWith(`${home}/`)) rel = rel.slice(home.length + 1);
+  else if (rel.startsWith("/") || rel.startsWith("~")) throw new ApiError(400, `the path must be under the home folder (~/ or ${home}/)`);
   const parts = rel.split("/").filter((p) => p !== "");
   if (!parts.length || parts.some((p) => p === "." || p === "..")) throw new ApiError(400, "the path must name a file under the home folder, with no . or .. parts");
   return parts.join("/");

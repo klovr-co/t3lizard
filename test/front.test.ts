@@ -10,6 +10,8 @@ import { startProxy } from "../src/proxy.ts";
 // @ts-ignore: plain JS module that runs on the machine
 import { clientHost, rewriteHeaders, startFront } from "../src/machine/front.mjs";
 
+const HEADER = { kind: "header", name: "X-Lizard-Access-Token" } as const;
+
 const EDGE_HOST = "example-name-abcd-3774.sandbox.us-east-1.onlizard.com";
 const listening = (server: net.Server) => new Promise<number>((r) => server.listen(0, "127.0.0.1", () => r((server.address() as net.AddressInfo).port)));
 
@@ -169,7 +171,7 @@ test("end to end: the devbox client sees and signs for http://127.0.0.1:<port>",
     child.once("exit", (code) => reject(new Error(`front exited ${code}`)));
   });
   const edge = await fakeEdge(frontPort);
-  const devbox = await startProxy({ port: 0, upstream: new URL(`http://127.0.0.1:${edge.port}`), accessToken: "secret" });
+  const devbox = await startProxy({ port: 0, upstream: new URL(`http://127.0.0.1:${edge.port}`), accessToken: "secret", portAuth: HEADER });
   t.after(async () => (await devbox.close(), await edge.close(), await t3.close()));
   writeFileSync(file, `127.0.0.1:${devbox.port}\n`); // what bring-up writes (configureFront)
 
@@ -189,7 +191,7 @@ test("end to end: the devbox client sees and signs for http://127.0.0.1:<port>",
 test("without the front proxy, T3 sees the onlizard origin: the live-test failure", async (t) => {
   const t3 = await fakeT3();
   const edge = await fakeEdge(t3.port);
-  const devbox = await startProxy({ port: 0, upstream: new URL(`http://127.0.0.1:${edge.port}`), accessToken: "secret" });
+  const devbox = await startProxy({ port: 0, upstream: new URL(`http://127.0.0.1:${edge.port}`), accessToken: "secret", portAuth: HEADER });
   t.after(async () => (await devbox.close(), await edge.close(), await t3.close()));
   const base = `http://127.0.0.1:${devbox.port}`;
   const res = await fetch(`${base}/mcp`, { headers: { "x-signed-htu": `${base}/mcp` } });
@@ -202,7 +204,7 @@ test("a browser on another devbox address (Tailscale) gets its own origin, throu
   const file = hostFile();
   const front = await startFront({ listenPort: 0, t3Port: t3.port, hostFile: file, listenHost: "127.0.0.1" });
   const edge = await fakeEdge(front.port);
-  const devbox = await startProxy({ port: 0, upstream: new URL(`http://127.0.0.1:${edge.port}`), accessToken: "secret", extraHosts: ["127.0.0.2"] });
+  const devbox = await startProxy({ port: 0, upstream: new URL(`http://127.0.0.1:${edge.port}`), accessToken: "secret", portAuth: HEADER, extraHosts: ["127.0.0.2"] });
   t.after(async () => (await devbox.close(), await edge.close(), await front.close(), await t3.close()));
   writeFileSync(file, `127.0.0.1:${devbox.port}\n`);
 

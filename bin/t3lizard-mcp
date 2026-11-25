@@ -1,4 +1,1 @@
-#!/usr/bin/env node
-import { serveMcp } from "../src/mcp.ts";
-
-await serveMcp();
+xstack-cloud-mcp

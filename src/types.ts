@@ -9,11 +9,8 @@ export type Size = "nano" | "mini" | "small" | "medium" | "large" | "big";
  */
 export const SIZE_WEIGHT: Record<Size, number> = { nano: 0.25, mini: 0.5, small: 1, medium: 2, large: 4, big: 8 };
 
-/** vCPUs per size (Lizard): Pro plans limit the vCPUs running at once, not machines. */
+/** vCPUs per size (Lizard and InstaBox): Lizard Pro limits the vCPUs running at once, not machines. */
 export const SIZE_VCPU: Record<Size, number> = { nano: 0.5, mini: 1, small: 2, medium: 4, large: 8, big: 16 };
-
-/** Lizard's price per hour in USD (sandbox docs), for the spend shown on the dashboard. */
-export const SIZE_USD_PER_HOUR: Record<Size, number> = { nano: 0.00405, mini: 0.0081, small: 0.0162, medium: 0.0324, large: 0.0648, big: 0.1296 };
 
 /** One finished lease, kept for learning each repo's size and for the dashboard. */
 export interface JobRecord {
@@ -119,6 +116,8 @@ export interface Machine {
   accountsKey?: string;
   /** True when Antigravity (agy binary + OAuth token) was installed and configured on this machine. */
   antigravity?: boolean;
+  /** The holder of the request that made the pool start this machine. */
+  requestedBy?: string;
   /** Its Codex was given the ChatGPT login. */
   codex?: boolean;
   /** Threads that hit a usage limit and wait to continue on another account. From the last scan. */
@@ -156,16 +155,16 @@ export type Ticket =
   | (TicketBase & { status: "granted"; leaseId: string })
   | (TicketBase & { status: "cancelled" | "expired"; endedAt: number; error?: string });
 
-export interface LizardError {
+export interface ProviderError {
   at: number;
   message: string;
   code?: string;
   url?: string;
 }
 
-/** One machine the daemon asked Lizard for. Drives the create circuit breaker. */
+/** One machine the daemon asked the provider for. Drives the create circuit breaker. */
 export interface CreateRecord {
-  /** `pending:<uuid>` until Lizard answers, then the sandbox id. */
+  /** `pending:<uuid>` until the provider answers, then the machine id. */
   machineId: MachineId;
   repo: RepoKey;
   at: number;
@@ -193,7 +192,7 @@ export interface State {
   usage: Record<string, number>;
   usageAccruedAt?: number;
   createsPausedUntil?: number;
-  lastLizardError?: LizardError;
+  lastProviderError?: ProviderError;
   /** Creates of the last 24 hours. Optional so older state files still load. */
   creates?: CreateRecord[];
   /** Per Claude account. Optional so older state files still load. */
@@ -210,15 +209,24 @@ export interface State {
   jobs?: JobRecord[];
 }
 
+export type ProviderName = "lizard" | "instabox";
+
 export interface Config {
+  /** Where machines run. Default "lizard". */
+  provider: ProviderName;
+  /** The Lizard project id. Only Lizard needs one. */
   project: string;
-  /** Lizard template. Must be a glibc image: the T3 binary does not run on musl (Alpine). */
+  /** Machine template. Must be a glibc image: the T3 binary does not run on musl (Alpine). */
   template: string;
+  /** InstaBox only: execs in flight at once. A Pro workspace allows 64 across every daemon on it (free plan 32). Default 24. */
+  execConcurrency?: number;
   /**
-   * Metadata key marking this daemon's sandboxes (default "t3lizard"). Two daemons on one Lizard API key must use
+   * Metadata key marking this daemon's sandboxes (default "t3lizard"). Two daemons on one provider account must use
    * different tags, or each kills the other's machines as orphans. Lizard's "Sandbox already deleted" is how it shows.
    */
   sandboxTag?: string;
+  /** InstaBox: minutes idle before a machine pauses; 0 (default) never. Pro takes 0 or 5-30; the free plan only 30. */
+  autoSuspendMinutes?: number;
   /** The size ladder, largest first. A ticket that needs a new machine gets the largest size with room. */
   sizes: SizeSlot[];
   perRepoCap: number;
@@ -242,6 +250,7 @@ export interface Config {
   createChargeMinutes: number;
   proxyPortRange: [number, number];
   forwardEnv: string[];
+  /** Lizard: the user commands run as. InstaBox runs them as its image's own user. */
   sandboxUser: string;
   tickSeconds: number;
   /** The repo setup script (~/.t3lizard/repos/<owner>/<name>/setup.sh) is stopped after this long. */
@@ -256,6 +265,10 @@ export interface Config {
   idleMaxMinutes?: number;
   /** vCPUs the pool leaves free for others in the Lizard workspace. */
   vcpuReserve: number;
+  /** The most vCPUs this pool uses, however much the account has free: the rest stays for teammates. */
+  vcpuPoolMax?: number;
+  /** Who runs this pool, shown in machine names and on each sandbox at Lizard (startedBy). Default user@host. */
+  owner?: string;
   /** A repo's first machine size, before anything is learned. */
   defaultSize: Size;
   /** The dashboard's port, on 127.0.0.1 and publicBind. 0 turns it off. */
