@@ -218,7 +218,7 @@ export interface Config {
   project: string;
   /** Machine template. Must be a glibc image: the T3 binary does not run on musl (Alpine). */
   template: string;
-  /** InstaBox only: execs in flight at once. The account allows 32 across every daemon on it. Default 24. */
+  /** InstaBox only: execs in flight at once. A Pro workspace allows 64 across every daemon on it (free plan 32). Default 24. */
   execConcurrency?: number;
   /**
    * Metadata key marking this daemon's sandboxes (default "t3lizard"). Two daemons on one provider account must use

@@ -66,8 +66,8 @@ const INSTABOX_DEFAULTS = {
     { size: "small", max: 2 },
   ] as SizeSlot[],
 };
-/** The account runs at most 32 execs at once, across every daemon on it. */
-const INSTABOX_MAX_EXECS = 32;
+/** A Pro workspace runs at most 64 execs at once across every daemon on it (32 per user on the free plan; docs: exec). */
+const INSTABOX_MAX_EXECS = 64;
 
 const positive = z.number().int().positive();
 const SizeName = z.enum(["nano", "mini", "small", "medium", "large", "big"]);

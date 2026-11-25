@@ -98,7 +98,7 @@ On Lizard, with more keys:
 - `provider` is `lizard` (the default, so older configs are unchanged) or `instabox`.
 - `template` must be a glibc image. The default is `agent-browser` (Debian 13) on InstaBox and `claude` (Debian 12) on Lizard. Lizard's `base` template is Alpine (musl), and T3 Code does not run there. Bring-up checks this first and fails with a clear message.
 - InstaBox has three sizes: small (2 vCPU, 4 GiB), medium (4, 8 GiB) and large (8, 16 GiB). A config with another size is refused.
-- `execConcurrency` (InstaBox only, default 24, at most 32) is how many commands the daemon runs on machines at once. The account allows 32 across every daemon on it.
+- `execConcurrency` (InstaBox only, default 24, at most 64) is how many commands the daemon runs on machines at once. A Pro workspace allows 64 across every daemon on it; the free plan 32.
 - `sandboxTag` (default `t3lizard`) marks this daemon's machines. Two daemons on one account need different tags, or each kills the other's machines as orphans.
 - `sizes` is the size ladder: at most `max` machines of each size at once. A ticket that needs a new machine gets the largest size with room. The oldest ticket gets the largest idle machine. The lease and `status` show the size.
 - `dailySmallMachineHours` is a hard budget, in small-machine-hours. An hour of a small machine counts 1, a medium 2, a mini 0.5, a nano 0.25 (both providers price sizes in this ratio). The daemon creates no machine once today's total (UTC) reaches it.
@@ -241,7 +241,7 @@ Each command prints JSON from the daemon. `t3lizard` is an alias of `xstack-clou
 
 InstaBox Pro runs up to 100 machines at once. Measured on the account:
 
-- 32 commands at once per account. Over it InstaBox answers 429 `quota_exceeded`; the daemon waits and retries for about a minute.
+- 64 commands at once per Pro workspace (32 on the free plan). Over it InstaBox answers 429 `quota_exceeded`; the daemon waits and retries for about a minute.
 - 30 machine starts a minute. Over it InstaBox answers 429 `rate_limited`; creates pause until its Retry-After.
 - A command runs at most 10 minutes.
 - A snapshot takes about 3.5 minutes to build. A machine starts from one in about 6 s.
@@ -302,9 +302,9 @@ Several daemons can share one InstaBox account:
 1. `git clone https://github.com/klovr-co/xstack-cloud ~/t3lizard`, then `npm install`. The xstack plugin's MCP entry runs `~/t3lizard/bin/xstack-cloud-mcp.py`.
 2. Install Node 24 and the `t3` CLI.
 3. Write `~/.t3lizard/config.json` with `"provider": "instabox"` and a `sandboxTag` no other daemon uses. Two daemons with one tag kill each other's machines.
-4. Split the account's limits: `execConcurrency` so all daemons sum to 32 at most (16 each for two), and each size's `max` so all daemons together run at most 100 machines.
+4. Split the account's limits: `execConcurrency` so all daemons sum to 64 at most (24 each for two leaves headroom), and each size's `max` so all daemons together run at most 100 machines.
 5. Add the secrets: `INSTABOX_API_KEY` (from Infisical, or your own key), `GH_TOKEN`, the Claude tokens, and a git identity for commits made on machines (`GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, `GIT_COMMITTER_EMAIL`, listed in `forwardEnv`).
-6. Install the systemd unit (see Install) and run `bin/xstack-cloud doctor`.
+6. Install the systemd unit (see Install). It reads the Infisical project id from `~/.t3lizard/systemd.env` (`INFISICAL_PROJECT_ID=<id>`). Then run `bin/xstack-cloud doctor`.
 7. Update the xstack plugin to get the MCP tools.
 
 ## Credits

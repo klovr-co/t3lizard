@@ -11,7 +11,7 @@ export const INSTABOX_SIZES: Partial<Record<Size, { vcpus: number; memMiB: numbe
 };
 
 const MINUTE = 60_000;
-/** Execs in flight at once, below the account's 32. */
+/** Execs in flight at once: under the free plan's 32 and well under Pro's 64, leaving room for a second daemon. */
 export const DEFAULT_EXEC_CONCURRENCY = 24;
 /** Machine states that will never run a command again. */
 const GONE = new Set(["deleting", "deleted", "error"]);

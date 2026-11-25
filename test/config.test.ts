@@ -86,10 +86,10 @@ test("instabox needs no project, defaults to its own template and sizes, and ref
   assert.throws(() => parseConfig({ provider: "instabox", defaultSize: "big" }), /no "big" size/);
 });
 
-test("execConcurrency is a positive whole number, at most 32 on instabox, where every daemon on the account shares 32", () => {
+test("execConcurrency is a positive whole number, at most 64 on instabox, where every daemon on a Pro workspace shares 64", () => {
   assert.equal(parseConfig({ provider: "instabox" }).execConcurrency, undefined);
   assert.equal(parseConfig({ provider: "instabox", execConcurrency: 16 }).execConcurrency, 16);
-  assert.throws(() => parseConfig({ provider: "instabox", execConcurrency: 33 }), /at most 32/);
+  assert.throws(() => parseConfig({ provider: "instabox", execConcurrency: 65 }), /at most 64/);
   assert.throws(() => parseConfig({ provider: "instabox", execConcurrency: 0 }));
   assert.throws(() => parseConfig({ provider: "instabox", execConcurrency: 1.5 }));
 });
