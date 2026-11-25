@@ -30,6 +30,8 @@ Use it for heavy work: builds, full typechecks, pre-push gates, long test runs.
    Never put a secret in a pool_exec command, a delegate_task prompt or any tool argument: those are saved in transcripts.
 5. Call pool_release with the leaseId as soon as the delegated work is done. Machines are shared and cost money.
    A lease expires after about 90 minutes unless you call pool_renew; a busy thread on the machine keeps it alive.
+   Once everything you ran on the machine has finished, t3lizard releases the lease itself after about 5 minutes.
+   To run more after that, call pool_acquire again.
 6. When a job on the machine fails because a tool or system package is missing, add the install step with
    pool_setup_add (repo, one shell line, reason), so the next machine for that repo has it. Then install it by
    hand on the current machine and carry on. The line runs as the sandbox user in the checkout, on every new machine,

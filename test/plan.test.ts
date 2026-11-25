@@ -46,6 +46,7 @@ function state(machines: Machine[], tickets: Ticket[] = [], extra: Partial<State
   };
 }
 
+const HOUR_MS = 60 * MIN;
 const idle = (minutes: number): MachinePhase => ({ kind: "idle", since: NOW - minutes * MIN });
 
 test("grants the oldest queued ticket of the repo to an idle machine", () => {
@@ -486,4 +487,16 @@ test("over vcpuPoolMax, idle machines close instead of being handed out again; b
   assert.ok(!closes.includes("busy"));
   assert.equal(grants.length, 1, "the other idle small still serves the queued ticket");
   assert.ok(!actions.some((a) => a.kind === "create"), "no create while at the cap");
+});
+
+test("an idle machine bigger than its repo now needs is closed, not handed out again", () => {
+  const ladder: Config = { ...config, sizes: [{ size: "large", max: 4 }, { size: "medium", max: 4 }, { size: "small", max: 4 }] };
+  const learned = { repoSize: { a: { size: "medium" as const, why: "light jobs", at: NOW - HOUR_MS } } };
+  const s = state([machine("L1", "a", idle(1), { size: "large" }), machine("M1", "a", idle(1), { size: "medium" })], [queued("t1", "a")], learned);
+  const actions = plan(s, NOW, ladder);
+  assert.deepEqual(actions.filter((a) => a.kind === "close"), [{ kind: "close", machineId: "L1", reason: "oversized" }]);
+  assert.deepEqual(actions.filter((a) => a.kind === "grant"), [{ kind: "grant", ticketId: "t1", machineId: "M1" }]);
+  // A machine of the repo's size, or smaller, is still handed out.
+  const fits = state([machine("M2", "a", idle(1), { size: "medium" })], [queued("t2", "a")], learned);
+  assert.deepEqual(plan(fits, NOW, ladder), [{ kind: "grant", ticketId: "t2", machineId: "M2" }]);
 });

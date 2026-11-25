@@ -1018,3 +1018,35 @@ test("each new sandbox is tagged at Lizard with who runs the pool and whose requ
   assert.equal(row.requestedBy, "thread-ship-42");
   assert.match(row.label, /^t3lizard Maxine · app · sb-1/);
 });
+
+test("a lease is released a few minutes after its last thread finishes, and kept while nothing has run yet", async (t) => {
+  const h = await harness(t, { leaseMinutes: 90, idleCloseMinutes: 60, releaseIdleMinutes: 5 });
+  const t0 = await h.api("/acquire", { repo: REPO, ref: "main", holder: "a" });
+  await h.daemon.settled();
+  await h.advance(0);
+  assert.equal((await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 0 })).status, "granted");
+  // Nothing has run yet: the holder may still be setting up, so the lease stays.
+  await h.advance(20);
+  assert.equal((await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 0 })).status, "granted");
+  h.provider.threads = [{ status: "running" }];
+  await h.advance(4);
+  assert.equal((await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 0 })).status, "granted");
+  h.provider.threads = [{ status: "completed" }];
+  await h.advance(4);
+  assert.equal((await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 0 })).status, "granted", "within the grace, a follow-up can still start");
+  await h.advance(6);
+  assert.equal((await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 0 })).status, "released");
+  assert.equal((await h.api("/status")).pools["github.com/Acme/app"].machines[0].phase, "idle");
+  assert.ok(h.logs.some((l) => /released: its threads and commands are done/.test(l)));
+});
+
+test("releaseIdleMinutes 0 keeps a finished lease until it expires", async (t) => {
+  const h = await harness(t, { leaseMinutes: 90, idleCloseMinutes: 60, releaseIdleMinutes: 0 });
+  const t0 = await h.api("/acquire", { repo: REPO, ref: "main", holder: "a" });
+  await h.daemon.settled();
+  h.provider.threads = [{ status: "running" }];
+  await h.advance(4);
+  h.provider.threads = [{ status: "completed" }];
+  await h.advance(30);
+  assert.equal((await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 0 })).status, "granted");
+});

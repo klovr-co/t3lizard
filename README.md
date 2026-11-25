@@ -98,6 +98,7 @@ On Lizard, with more keys:
 - `provider` is `lizard` (the default, so older configs are unchanged) or `instabox`.
 - `template` must be a glibc image. The default is `agent-browser` (Debian 13) on InstaBox and `claude` (Debian 12) on Lizard. Lizard's `base` template is Alpine (musl), and T3 Code does not run there. Bring-up checks this first and fails with a clear message.
 - InstaBox has three sizes: small (2 vCPU, 4 GiB), medium (4, 8 GiB) and large (8, 16 GiB). A config with another size is refused.
+- `releaseIdleMinutes` (default 5, 0 to turn off): once every thread and command on a leased machine has finished, the lease is released after this many minutes, as if its holder had released it. A lease on which nothing has run yet is kept.
 - `execConcurrency` (InstaBox only, default 24, at most 64) is how many commands the daemon runs on machines at once. A Pro workspace allows 64 across every daemon on it; the free plan 32.
 - `sandboxTag` (default `t3lizard`) marks this daemon's machines. Two daemons on one account need different tags, or each kills the other's machines as orphans.
 - `sizes` is the size ladder: at most `max` machines of each size at once. A ticket that needs a new machine gets the largest size with room. The oldest ticket gets the largest idle machine. The lease and `status` show the size.

@@ -297,6 +297,12 @@ export function plan(state: State, now: number, config: Config): Action[] {
     // Too small for this repo's jobs (learned): left to close as idle, never granted.
     const min = state.repoMinSize?.[m.repo];
     if (min && SIZE_WEIGHT[m.size] < SIZE_WEIGHT[min]) continue;
+    // Bigger than the repo's jobs need now (it moved down a size): closed, so the next job gets a machine its size.
+    const want = repoLadder(state, config, m.repo)[0]?.size;
+    if (want && SIZE_WEIGHT[m.size] > SIZE_WEIGHT[want]) {
+      close(m, "oversized");
+      continue;
+    }
     idleByRepo.set(m.repo, [...(idleByRepo.get(m.repo) ?? []), m]);
   }
   // Over the vCPU cap (it was lowered, or teammates started sandboxes): close idle machines, largest

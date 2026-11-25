@@ -79,6 +79,7 @@ const ConfigFile = z
     execConcurrency: positive,
     sandboxTag: z.string().regex(/^[A-Za-z][\w-]{0,63}$/),
     autoSuspendMinutes: z.union([z.literal(0), z.number().int().min(5).max(30)]),
+    releaseIdleMinutes: z.number().min(0),
     /** max is optional with vcpuLimit: then the vCPU limit decides how many of each fit. */
     sizes: z.array(z.object({ size: SizeName, max: positive.optional() }).strict()).min(1),
     /** Older configs: one size, at most totalCap machines. Read as sizes [{ size, max: totalCap }]. */
