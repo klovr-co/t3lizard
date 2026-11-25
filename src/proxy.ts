@@ -64,7 +64,7 @@ export async function startProxy(opts: { port: number; upstream: URL; accessToke
     );
     up.on("error", (e) => {
       if (!res.headersSent) res.writeHead(502, { "content-type": "text/plain" });
-      res.end(`t3lizard proxy: ${e.message}`);
+      res.end(`xstack-cloud proxy: ${e.message}`);
     });
     req.pipe(up);
   });

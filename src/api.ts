@@ -92,7 +92,7 @@ export function call(socketPath: string, method: "GET" | "POST", path: string, b
       });
     });
     req.on("error", (e: NodeJS.ErrnoException) =>
-      reject(e.code === "ENOENT" || e.code === "ECONNREFUSED" ? new Error(`t3lizard daemon is not running (no ${socketPath})`) : e),
+      reject(e.code === "ENOENT" || e.code === "ECONNREFUSED" ? new Error(`xstack-cloud daemon is not running (no ${socketPath})`) : e),
     );
     req.end(body === undefined ? undefined : JSON.stringify(body));
   });

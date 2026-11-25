@@ -8,7 +8,7 @@ import { paths, t3lizardHome } from "./config.ts";
 export const INSTRUCTIONS = readFileSync(new URL("./mcp-instructions.txt", import.meta.url), "utf8").trimEnd();
 
 export async function serveMcp(socket = paths(t3lizardHome()).socket): Promise<McpServer> {
-  const server = new McpServer({ name: "t3lizard", version: "0.1.0" }, { instructions: INSTRUCTIONS });
+  const server = new McpServer({ name: "xstack-cloud", version: "0.1.0" }, { instructions: INSTRUCTIONS });
   const reply = async (fn: () => Promise<unknown>) => {
     try {
       return { content: [{ type: "text" as const, text: JSON.stringify(await fn(), null, 2) }] };

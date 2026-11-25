@@ -1,4 +1,4 @@
-t3lizard lends you a T3 Code environment on a Lizard cloud machine, from a shared pool per repo.
+xstack-cloud lends you a T3 Code environment on a cloud machine (InstaBox or Lizard), from a shared pool per repo.
 Use it for heavy work: builds, full typechecks, pre-push gates, long test runs.
 1. Push the commit you want tested. The machine checks out the ref you name, so it must exist on origin.
 2. pool_acquire with repo (origin URL or local checkout path), ref and holder (your thread id or name).
@@ -19,12 +19,12 @@ Use it for heavy work: builds, full typechecks, pre-push gates, long test runs.
    lease.size says how big it is: medium is 4 vCPU / 8 GB, small 2 vCPU / 4 GB. When the mediums are busy you get a
    small instead of waiting; give a heavy build less parallelism there (one test worker, one dev server or browser at a time).
    A repo whose jobs froze a smaller machine is never given that size again.
-   If the delegated thread stops on a Claude usage limit, keep the lease and do not start over: t3lizard continues that
+   If the delegated thread stops on a Claude usage limit, keep the lease and do not start over: xstack-cloud continues that
    thread on the next free account, or when the first account frees, and keeps the machine until then.
 4c. A job that needs a login or an .env file (a staging sign-in, an API key for tests): from a shell on the devbox, run
-   t3lizard put <leaseId> <path under ~> [--mode 600] < file
+   xstack-cloud put <leaseId> <path under ~> [--mode 600] < file
    It writes stdin to that file on the leased machine only, mode 600 by default, and never logs or echoes it.
-   A relative path is under ~, not the checkout. t3lizard removes the file when the lease ends; delete files the job made from it
+   A relative path is under ~, not the checkout. xstack-cloud removes the file when the lease ends; delete files the job made from it
    (a browser state with cookies) yourself before you release.
    Never put a secret in a pool_exec command, a delegate_task prompt or any tool argument: those are saved in transcripts.
 5. Call pool_release with the leaseId as soon as the delegated work is done. Machines are shared and cost money.

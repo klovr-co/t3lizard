@@ -1,12 +1,14 @@
 {
-  "name": "t3lizard",
+  "name": "xstack-cloud",
   "version": "0.1.0",
-  "description": "Per-repo pool of Lizard cloud sandboxes that run T3 Code environments for agent threads",
+  "description": "Per-repo pool of cloud machines (InstaBox or Lizard) that run T3 Code environments for agent threads",
   "type": "module",
   "engines": {
     "node": ">=24"
   },
   "bin": {
+    "xstack-cloud": "bin/xstack-cloud",
+    "xstack-cloud-mcp": "bin/xstack-cloud-mcp",
     "t3lizard": "bin/t3lizard",
     "t3lizard-mcp": "bin/t3lizard-mcp"
   },
@@ -21,6 +23,6 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/klovr-co/t3lizard.git"
+    "url": "git+https://github.com/klovr-co/xstack-cloud.git"
   }
 }

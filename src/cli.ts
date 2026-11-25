@@ -15,33 +15,34 @@ import type { Config } from "./types.ts";
 import { resolveRepo } from "./repo.ts";
 import { realLocalT3 } from "./t3local.ts";
 
-const USAGE = `t3lizard: a pool of Lizard cloud machines running T3 Code, per repo.
+const USAGE = `xstack-cloud: a pool of cloud machines (InstaBox or Lizard) running T3 Code, per repo.
+(t3lizard is an alias of xstack-cloud.)
 
-  t3lizard daemon                          run the daemon (systemd runs this)
-  t3lizard acquire <repo> <ref> [--holder <name>]
+  xstack-cloud daemon                          run the daemon (systemd runs this)
+  xstack-cloud acquire <repo> <ref> [--holder <name>]
                                            ask for a machine; <repo> is an origin URL or a checkout path
-  t3lizard wait <ticketId> [--max <seconds>]
+  xstack-cloud wait <ticketId> [--max <seconds>]
                                            long-poll a queued ticket (at most 300 s)
-  t3lizard release <leaseId|ticketId>      give a machine back, or stop waiting
-  t3lizard put <leaseId> <path> [--mode 600] < file
+  xstack-cloud release <leaseId|ticketId>      give a machine back, or stop waiting
+  xstack-cloud put <leaseId> <path> [--mode 600] < file
                                            write stdin to a file under the machine's home (a login, an .env);
                                            the content is never logged or echoed
-  t3lizard exec <leaseId> [--max <seconds>] -- <shell command>
+  xstack-cloud exec <leaseId> [--max <seconds>] -- <shell command>
                                            run a command on the machine, in its checkout, with no agent; waits up to
                                            --max (default 120, at most 300); a longer job returns an execId
-  t3lizard exec-wait <leaseId> <execId> [--max <seconds>]
+  xstack-cloud exec-wait <leaseId> <execId> [--max <seconds>]
                                            wait for a still-running exec; prints its exit code and output tail
-  t3lizard renew <leaseId>                 push the lease expiry out by leaseMinutes
-  t3lizard status                          pools, queues, leases, budget
-  t3lizard bake <repo> [size]              build the repo's snapshot (new machines start from it)
-  t3lizard snapshots                       list snapshots, and whether each needs a rebuild
-  t3lizard close <machineId>               close one machine now
-  t3lizard connect [machineId]            pairing links to open a machine's threads in your T3 app
-  t3lizard doctor                          check config, secrets and the daemon
-  t3lizard setup add <repo> [--reason <why>] -- <shell line>
+  xstack-cloud renew <leaseId>                 push the lease expiry out by leaseMinutes
+  xstack-cloud status                          pools, queues, leases, budget
+  xstack-cloud bake <repo> [size]              build the repo's snapshot (new machines start from it)
+  xstack-cloud snapshots                       list snapshots, and whether each needs a rebuild
+  xstack-cloud close <machineId>               close one machine now
+  xstack-cloud connect [machineId]            pairing links to open a machine's threads in your T3 app
+  xstack-cloud doctor                          check config, secrets and the daemon
+  xstack-cloud setup add <repo> [--reason <why>] -- <shell line>
                                            add a step to the repo's machine setup (runs on new machines)
-  t3lizard setup show <repo>               the repo's setup steps, script and history
-  t3lizard setup remove <repo> <step>      remove a step by its number (see setup show)
+  xstack-cloud setup show <repo>               the repo's setup steps, script and history
+  xstack-cloud setup remove <repo> <step>      remove a step by its number (see setup show)
 `;
 
 /** Starts the API and the tick loop. Resolves when the daemon is told to stop. */
@@ -49,7 +50,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
   const daemon = new Daemon(deps);
   await daemon.start();
   const server = await serveApi(daemon, paths(deps.home).socket);
-  deps.log(`t3lizard daemon listening on ${paths(deps.home).socket}`);
+  deps.log(`xstack-cloud daemon listening on ${paths(deps.home).socket}`);
   const dashboards = await startDashboard(daemon, deps.config.dashboardPort, deps.config.publicBind ?? [], deps.log);
   const tick = () => daemon.tick().catch((e) => deps.log(`tick failed: ${e.stack ?? e}`));
   const timer = setInterval(tick, deps.config.tickSeconds * 1000);
@@ -62,7 +63,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
   clearInterval(timer);
   server.close();
   for (const d of dashboards) d.close();
-  deps.log("t3lizard daemon stopped");
+  deps.log("xstack-cloud daemon stopped");
   process.exit(0);
 }
 
@@ -201,7 +202,7 @@ export async function main(argv: string[]): Promise<number> {
     }
     case "put": {
       need(2);
-      if (process.stdin.isTTY) throw new Error("pipe the file's content on stdin: t3lizard put <leaseId> <path> < file");
+      if (process.stdin.isTTY) throw new Error("pipe the file's content on stdin: xstack-cloud put <leaseId> <path> < file");
       const chunks: Buffer[] = [];
       for await (const c of process.stdin) chunks.push(c as Buffer);
       print(await call(socket, "POST", "/put", { leaseId: args[0], path: args[1], contentBase64: Buffer.concat(chunks).toString("base64"), ...(values.mode ? { mode: values.mode } : {}) }));
@@ -209,7 +210,7 @@ export async function main(argv: string[]): Promise<number> {
     }
     case "exec": {
       need(1);
-      if (!shellLine) throw new Error("exec needs a command after --: t3lizard exec <leaseId> -- <shell command>");
+      if (!shellLine) throw new Error("exec needs a command after --: xstack-cloud exec <leaseId> -- <shell command>");
       print(await call(socket, "POST", "/exec", { leaseId: args[0], command: shellLine, maxSeconds: Number(values.max ?? 120) }));
       return 0;
     }
@@ -262,7 +263,7 @@ export async function main(argv: string[]): Promise<number> {
         print(await call(socket, "POST", "/setup/remove", { repo, step: Number(step), by }));
         return 0;
       }
-      throw new Error(`usage:\n  t3lizard setup add <repo> [--reason <why>] -- <shell line>\n  t3lizard setup show <repo>\n  t3lizard setup remove <repo> <step>`);
+      throw new Error(`usage:\n  xstack-cloud setup add <repo> [--reason <why>] -- <shell line>\n  xstack-cloud setup show <repo>\n  xstack-cloud setup remove <repo> <step>`);
     }
     case "doctor": {
       const lines = await doctor(home);
