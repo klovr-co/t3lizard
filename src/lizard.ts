@@ -1,5 +1,5 @@
 import { LimitExceededError, NotFoundError, PaymentRequiredError, Sandbox } from "@lizard-build/sdk";
-import { ProviderLimitError, ProviderPaymentError } from "./provider.ts";
+import { DEFAULT_TAG, ProviderLimitError, ProviderPaymentError } from "./provider.ts";
 import type { MachineProvider } from "./provider.ts";
 import { SIZE_VCPU, type MachineId, type Size } from "./types.ts";
 
@@ -12,12 +12,6 @@ export interface SandboxDirectory {
   /** undefined when the sandbox no longer exists. */
   getInfo(id: MachineId): Promise<{ status?: string; metadata?: Record<string, string> } | undefined>;
 }
-
-/**
- * The metadata key that marks a sandbox as made by this daemon. Two daemons on one Lizard key that share a tag
- * kill each other's machines as orphans (each sees the other's as unknown), so each daemon needs its own.
- */
-export const DEFAULT_TAG = "t3lizard";
 
 const ENDED = new Set(["stopped", "crashed"]);
 

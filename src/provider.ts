@@ -6,6 +6,12 @@ export interface ExecResult {
   exitCode: number;
 }
 
+/**
+ * The metadata key that marks a machine as made by this daemon. Two daemons on one account that share a tag
+ * kill each other's machines as orphans (each sees the other's as unknown), so each daemon needs its own.
+ */
+export const DEFAULT_TAG = "t3lizard";
+
 /** How the provider's edge takes the exposed port's access token: as a request header or a cookie. */
 export type PortAuth = { kind: "header"; name: string } | { kind: "cookie"; name: string };
 
