@@ -74,7 +74,8 @@ test("create from a snapshot sends the snapshot and no size, since a snapshot ke
   });
   await provider.create("github.com/acme/app", "medium", 60_000, "sn_1");
   assert.equal(calls[0].body.snapshotId, "sn_1");
-  assert.equal("vcpus" in calls[0].body || "memMiB" in calls[0].body, false);
+  // InstaBox takes a template or a snapshot, never both.
+  assert.equal("templateId" in calls[0].body || "vcpus" in calls[0].body || "memMiB" in calls[0].body, false);
 });
 
 test("a machine whose start fails is deleted and the error names the reason", async () => {
@@ -108,6 +109,26 @@ test("exec runs argv with no shell, so every argument reaches the program as sen
   assert.deepEqual(out, { stdout: out.stdout, stderr: "", exitCode: 0 });
   assert.equal(calls[0].body.timeoutSeconds, 91);
   assert.equal("cmd" in calls[0].body, false);
+});
+
+test("an argv over InstaBox's 64 KiB cap goes through stdin and still reaches the program exactly", async () => {
+  const { provider, calls } = api((c) => {
+    const [file, ...args] = c.body.argv as string[];
+    return ran(execFileSync(file, args, { input: c.body.stdin, encoding: "utf8", maxBuffer: 1 << 21 }));
+  });
+  const big = Buffer.alloc(64 * 1024, 7).toString("base64"); // a `put` at PUT_MAX_BYTES
+  const out = await provider.exec("mc_1", ["bash", "-c", 'printf "%s|%s|%s" "${#1}" "$2" "$0"', "zero", big, "a b\nc"]);
+  assert.equal(out.stdout, `${big.length}|a b\nc|zero`);
+  assert.equal(Buffer.byteLength(JSON.stringify(calls[0].body.argv)) < 1024, true);
+  // A small argv is sent as it is.
+  await provider.exec("mc_1", ["true"]);
+  assert.deepEqual(calls[1].body, { argv: ["true"], timeoutSeconds: 120 });
+});
+
+test("exec asks for keepalive, and an error sent after the 200 (keepalive's error body) is an error", async () => {
+  const { provider, calls } = api(() => ({ body: { error: { code: "host_unavailable", message: "connection to the sandbox was lost" }, status: 503 } }));
+  await assert.rejects(provider.exec("mc_1", ["sleep", "400"], 400_000), /503 host_unavailable: connection to the sandbox was lost/);
+  assert.equal(calls[0].headers["x-instabox-exec-keepalive"], "1");
 });
 
 test("exec waits out the account's concurrent exec limit (429 quota_exceeded, no Retry-After) with growing pauses", async () => {

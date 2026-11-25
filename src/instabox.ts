@@ -20,6 +20,10 @@ const NOT_ALIVE = new Set([...GONE, "stopped"]);
 const PAYMENT_CODES = new Set(["credit_exhausted", "spend_limit_reached", "subscription_required", "payment_method_required", "payment_required", "early_allowance_ended", "payment_failed"]);
 /** How long an exec keeps retrying the account-wide concurrent exec limit (429 quota_exceeded, sent with no Retry-After). */
 const EXEC_RETRY_MS = 60_000;
+/** InstaBox's cap on argv: each element's UTF-8 length plus one (docs: ExecRequest.argv). */
+const ARGV_MAX_BYTES = 65_536;
+/** Reads NUL-separated arguments from stdin and runs them, for an argv over ARGV_MAX_BYTES. stdin carries up to 1 MiB. */
+const ARGS_FROM_STDIN = 'mapfile -d "" -t a; exec "${a[@]}"';
 
 export interface InstaboxOptions {
   apiKey: string;
@@ -72,17 +76,19 @@ export function realInstabox(opts: InstaboxOptions): MachineProvider {
     } catch {
       parsed = undefined;
     }
-    if (res.ok) return parsed;
+    // With X-Instabox-Exec-Keepalive an error after the 200 went out arrives as {"error", "status"} (docs: exec, Keepalive).
+    const status = res.ok && parsed?.error && typeof parsed.status === "number" ? parsed.status : res.status;
+    if (status >= 200 && status < 300) return parsed;
     const err = parsed?.error ?? {};
     const code = typeof err.code === "string" ? err.code : undefined;
-    const message = `InstaBox ${method} ${path.split("?")[0]}: ${res.status}${code ? ` ${code}` : ""}${typeof err.message === "string" ? `: ${err.message}` : ""}`;
-    if (res.status === 402 || (code && PAYMENT_CODES.has(code))) throw new ProviderPaymentError(message, code);
-    if (res.status === 429 || code === "no_capacity") {
+    const message = `InstaBox ${method} ${path.split("?")[0]}: ${status}${code ? ` ${code}` : ""}${typeof err.message === "string" ? `: ${err.message}` : ""}`;
+    if (status === 402 || (code && PAYMENT_CODES.has(code))) throw new ProviderPaymentError(message, code);
+    if (status === 429 || code === "no_capacity") {
       const header = Number(res.headers.get("retry-after"));
       const retryAfterS = Number.isFinite(header) && header > 0 ? header : typeof err.retryAfterSeconds === "number" ? err.retryAfterSeconds : 60;
       throw new ProviderLimitError(message, code, retryAfterS);
     }
-    throw new InstaboxError(message, res.status, code);
+    throw new InstaboxError(message, status, code);
   }
 
   /** A mutating POST or DELETE: InstaBox requires an Idempotency-Key on each. */
@@ -102,8 +108,12 @@ export function realInstabox(opts: InstaboxOptions): MachineProvider {
 
   async function execOnce(id: MachineId, argv: string[], timeoutMs: number): Promise<ExecResult> {
     const timeoutSeconds = Math.min(600, Math.max(1, Math.ceil(timeoutMs / 1000)));
-    // argv runs with no shell (docs: ExecRequest). cmd would go through `bash -lc` and is capped at 64 KiB, too small for `put`.
-    const r = await request("POST", `/v1/machines/${id}/exec`, { argv, timeoutSeconds }, { timeoutMs: timeoutSeconds * 1000 + MINUTE });
+    // argv runs with no shell (docs: ExecRequest). An argv over its 64 KiB cap (a `put` near PUT_MAX_BYTES) goes through stdin instead.
+    const argvBytes = argv.reduce((n, a) => n + Buffer.byteLength(a) + 1, 0);
+    const body = argvBytes <= ARGV_MAX_BYTES ? { argv, timeoutSeconds } : { argv: ["bash", "-c", ARGS_FROM_STDIN], stdin: argv.map((a) => a + "\0").join(""), timeoutSeconds };
+    // Keepalive: the server answers 200 after 15 s and sends a newline every 15 s, so a long command outlasts
+    // Node fetch's 300 s wait for headers and any proxy that closes a quiet connection.
+    const r = await request("POST", `/v1/machines/${id}/exec`, body, { headers: { "X-Instabox-Exec-Keepalive": "1" }, timeoutMs: timeoutSeconds * 1000 + MINUTE });
     // The daemon reads "timed out" as a machine that stopped answering.
     if (r.timedOut) throw new Error(`command on ${id} timed out after ${timeoutSeconds} s`);
     return { stdout: r.stdout ?? "", stderr: r.stderr ?? "", exitCode: r.exitCode ?? -1 };
@@ -143,9 +153,8 @@ export function realInstabox(opts: InstaboxOptions): MachineProvider {
       const shape = INSTABOX_SIZES[size];
       if (!shape) throw new Error(`InstaBox has no ${size} machine (sizes: ${Object.keys(INSTABOX_SIZES).join(", ")})`);
       const op = await mutate("POST", "/v1/machines", {
-        templateId: opts.template,
-        // A snapshot is locked to the size it was taken at.
-        ...(snapshotId ? { snapshotId } : shape),
+        // A machine starts from a template or a snapshot, never both; a snapshot is locked to the size it was taken at.
+        ...(snapshotId ? { snapshotId } : { templateId: opts.template, ...shape }),
         metadata: { [tag]: "1", repo },
         autoSuspendAfterSeconds: 0,
         deleteAfterSeconds: Math.min(86_400, Math.ceil((Math.max(lifetimeMs, opts.maxLifetimeMs) + 30 * MINUTE) / 1000)),

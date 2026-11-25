@@ -828,7 +828,7 @@ export class Daemon {
       const workspacePath = await cloneRepo(this.remote, id, repo);
       if (setup?.script) await runRepoSetup(this.remote, id, workspacePath, setup.script, config.setupTimeoutMinutes * MINUTE, (log) => this.logSetupOutput(id!, log));
       await scrubForSnapshot(this.remote, id);
-      const snapshotId = await this.deps.provider.snapshot(id, `t3lizard-${repo.split("/").pop()}-${size}-${new Date(this.deps.now()).toISOString().slice(0, 10)}`);
+      const snapshotId = await this.deps.provider.snapshot(id, `t3lizard-${repo.split("/").pop()}-${size}-${new Date(this.deps.now()).toISOString().slice(0, 19).replace(/\D/g, "")}-${randomUUID().slice(0, 6)}`);
       const old = this.state.snapshots?.[key];
       (this.state.snapshots ??= {})[key] = { id: snapshotId, repo, size, setupHash: setup?.hash ?? "", t3Version: this.t3Version, builtAt: this.deps.now() };
       this.state.lastBake = { at: this.deps.now(), repo, size, ok: true };
