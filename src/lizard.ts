@@ -81,14 +81,14 @@ export function realLizard(opts: { apiKey: string; projectId: string; user: stri
           .map((s) => ({ id: (s.sandboxId ?? s.id) as MachineId, vcpu: SIZE_VCPU[s.size as Size] ?? SIZE_VCPU.medium }))
           .filter((s) => s.id);
       }),
-    create: (repo, size, lifetimeMs, snapshotId) =>
+    create: (repo, size, lifetimeMs, snapshotId, labels) =>
       mapErrors(async () => {
         const sb = await Sandbox.create(opts.template, {
           ...conn,
           projectId: opts.projectId,
           size,
           timeoutMs: lifetimeMs,
-          metadata: { [tag]: "1", repo },
+          metadata: { ...labels, [tag]: "1", repo },
           ...(snapshotId ? { snapshotId } : {}),
         });
         // Lizard answers "Sandbox already deleted" (NotFoundError) to calls made in the first moments after create.

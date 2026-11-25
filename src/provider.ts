@@ -25,8 +25,11 @@ export interface MachineProvider {
   readonly home: string;
   /** USD per hour of a small machine (2 vCPU); other sizes cost in SIZE_WEIGHT proportion. For the dashboard's spend. */
   readonly usdPerSmallHour: number;
-  /** With snapshotId the machine starts from that saved snapshot, at the snapshot's own size (`size` is then ignored). */
-  create(repo: RepoKey, size: Size, lifetimeMs: number, snapshotId?: string): Promise<{ id: MachineId; deadline: number }>;
+  /**
+   * With snapshotId the machine starts from that saved snapshot, at the snapshot's own size (`size` is then ignored).
+   * labels go on the machine's metadata (startedBy, requestedBy), so anyone on the account can see whose pool started it.
+   */
+  create(repo: RepoKey, size: Size, lifetimeMs: number, snapshotId?: string, labels?: Record<string, string>): Promise<{ id: MachineId; deadline: number }>;
   /** Saves the machine's files as a private snapshot and waits until it is ready. Returns its id. Storage is billed until it is deleted. */
   snapshot(id: MachineId, name: string): Promise<string>;
   deleteSnapshot(snapshotId: string): Promise<void>;

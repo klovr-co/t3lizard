@@ -468,3 +468,19 @@ test("repoIdleMs: waits long enough for 3 in 4 recent gaps, within idleCloseMinu
   (state.machines["m1"].phase as any).since = now - 19 * M;
   assert.ok(plan(state, now, config).some((a: any) => a.kind === "close" && a.reason === "idle"));
 });
+
+test("over vcpuPoolMax, idle machines close instead of being handed out again; busy ones are left alone", () => {
+  const leased: MachinePhase = { kind: "leased", leaseId: "l1" };
+  const s = state(
+    [machine("busy", "a", leased), machine("idle1", "a", idle(1)), machine("idle2", "a", idle(1))],
+    [queued("t1", "a")],
+    { leases: { l1: { id: "l1", machineId: "busy", ticketId: "t0", holder: "h", grantedAt: NOW - MIN, expiresAt: NOW + 60 * MIN } as Lease } },
+  );
+  const actions = plan(s, NOW, { ...config, vcpuPoolMax: 4 });
+  const closes = actions.filter((a) => a.kind === "close").map((a) => (a as { machineId: string }).machineId);
+  const grants = actions.filter((a) => a.kind === "grant").map((a) => (a as { machineId: string }).machineId);
+  assert.equal(closes.length, 1, "6 vCPU in use, cap 4: one idle small closes");
+  assert.ok(!closes.includes("busy"));
+  assert.equal(grants.length, 1, "the other idle small still serves the queued ticket");
+  assert.ok(!actions.some((a) => a.kind === "create"), "no create while at the cap");
+});

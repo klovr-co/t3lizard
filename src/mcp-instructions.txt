@@ -3,7 +3,8 @@ Use it for heavy work: builds, full typechecks, pre-push gates, long test runs.
 1. Push the commit you want tested. The machine checks out the ref you name, so it must exist on origin.
 2. pool_acquire with repo (origin URL or local checkout path), ref and holder (your thread id or name).
    It returns status "granted" with a lease, or "queued" with a position and a reason.
-3. While queued, call pool_wait with the ticketId. Each call waits up to 300 seconds and returns early on a grant.
+3. While queued, call pool_wait with the ticketId. Each call waits 30 seconds by default (at most 300) and returns early on a grant; call it again to keep waiting.
+   A message sent to you only reaches you when a tool call returns, so keep waits short: a 300-second wait leaves you deaf for 5 minutes.
    Do not create machines any other way. If you stop waiting, call pool_release with the ticketId.
 4. Two ways to use a granted machine:
    a. A command with no agent (cheaper, no Claude usage): pool_exec with the leaseId and a shell script. Use it for

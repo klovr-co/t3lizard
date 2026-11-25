@@ -63,7 +63,7 @@ export class FakeProvider implements MachineProvider, SandboxDirectory {
     this.now = now;
   }
 
-  async create(repo: RepoKey, size: Size, lifetimeMs: number, snapshotId?: string) {
+  async create(repo: RepoKey, size: Size, lifetimeMs: number, snapshotId?: string, labels: Record<string, string> = {}) {
     if (snapshotId && this.snapshotCreateError) throw this.snapshotCreateError;
     if (this.nextCreateError) {
       const e = this.nextCreateError;
@@ -72,7 +72,7 @@ export class FakeProvider implements MachineProvider, SandboxDirectory {
     }
     const id = `sb-${++this.n}`;
     const deadline = this.now() + lifetimeMs;
-    this.machines.set(id, { metadata: { t3lizard: "1", repo }, status: "running", repo, size, deadline, files: new Map(), steps: [] });
+    this.machines.set(id, { metadata: { ...labels, t3lizard: "1", repo }, status: "running", repo, size, deadline, files: new Map(), steps: [] });
     this.createdFrom.set(id, snapshotId);
     return { id, deadline };
   }

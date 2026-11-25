@@ -116,6 +116,8 @@ export interface Machine {
   accountsKey?: string;
   /** True when Antigravity (agy binary + OAuth token) was installed and configured on this machine. */
   antigravity?: boolean;
+  /** The holder of the request that made the pool start this machine. */
+  requestedBy?: string;
   /** Its Codex was given the ChatGPT login. */
   codex?: boolean;
   /** Threads that hit a usage limit and wait to continue on another account. From the last scan. */
@@ -263,6 +265,10 @@ export interface Config {
   idleMaxMinutes?: number;
   /** vCPUs the pool leaves free for others in the Lizard workspace. */
   vcpuReserve: number;
+  /** The most vCPUs this pool uses, however much the account has free: the rest stays for teammates. */
+  vcpuPoolMax?: number;
+  /** Who runs this pool, shown in machine names and on each sandbox at Lizard (startedBy). Default user@host. */
+  owner?: string;
   /** A repo's first machine size, before anything is learned. */
   defaultSize: Size;
   /** The dashboard's port, on 127.0.0.1 and publicBind. 0 turns it off. */

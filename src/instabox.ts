@@ -151,13 +151,13 @@ export function realInstabox(opts: InstaboxOptions): MachineProvider {
     home: "/data/home",
     // $0.004 per vCPU-hour + $0.00225 per GiB-hour: small 0.017, medium 0.034, large 0.068.
     usdPerSmallHour: 0.017,
-    async create(repo, size, lifetimeMs, snapshotId) {
+    async create(repo, size, lifetimeMs, snapshotId, labels) {
       const shape = INSTABOX_SIZES[size];
       if (!shape) throw new Error(`InstaBox has no ${size} machine (sizes: ${Object.keys(INSTABOX_SIZES).join(", ")})`);
       const op = await mutate("POST", "/v1/machines", {
         // A machine starts from a template or a snapshot, never both; a snapshot is locked to the size it was taken at.
         ...(snapshotId ? { snapshotId } : { templateId: opts.template, ...shape }),
-        metadata: { [tag]: "1", repo },
+        metadata: { ...labels, [tag]: "1", repo },
         autoSuspendAfterSeconds: (opts.autoSuspendMinutes ?? 0) * 60,
         deleteAfterSeconds: Math.min(86_400, Math.ceil((Math.max(lifetimeMs, opts.maxLifetimeMs) + 30 * MINUTE) / 1000)),
       });

@@ -1004,3 +1004,17 @@ test("a fresh Codex ChatGPT login goes to new and running machines; one near its
   assert.equal(g1.lease.codexProviderInstanceId, "codex");
   assert.equal((await h.api("/status")).codexConfigured, true);
 });
+
+test("each new sandbox is tagged at Lizard with who runs the pool and whose request started it", async (t) => {
+  const h = await harness(t, { owner: "Maxine" });
+  const q = await h.api("/acquire", { repo: REPO, ref: "main", holder: "thread-ship-42" });
+  await h.daemon.settled();
+  await h.api("/wait", { ticketId: q.ticketId, maxSeconds: 1 });
+  const m = h.provider.machines.get("sb-1")!;
+  assert.equal(m.metadata.startedBy, "Maxine");
+  assert.equal(m.metadata.requestedBy, "thread-ship-42");
+  assert.equal(m.metadata.t3lizard, "1");
+  const row = (await h.api("/status")).pools["github.com/Acme/app"].machines[0];
+  assert.equal(row.requestedBy, "thread-ship-42");
+  assert.match(row.label, /^t3lizard Maxine · app · sb-1/);
+});

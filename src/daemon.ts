@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
@@ -531,7 +531,7 @@ export class Daemon {
     });
     return {
       now,
-      vcpu: { limit: config.vcpuLimit, reserve: config.vcpuReserve, otherSandboxes: this.othersVcpu, inUse: vcpuInUse, free: vcpuFree(this.vcpuConfig(), used) },
+      vcpu: { limit: config.vcpuLimit, poolMax: config.vcpuPoolMax, reserve: config.vcpuReserve, otherSandboxes: this.othersVcpu, inUse: vcpuInUse, free: vcpuFree(this.vcpuConfig(), used) },
       spend,
       learned,
       jobs: (this.state.jobs ?? []).slice(0, 100),
@@ -564,7 +564,7 @@ export class Daemon {
       const credential = typeof json.credential === "string" ? json.credential : undefined;
       const link = url ?? (credential ? `${base}/pair#token=${credential}` : undefined);
       if (!link) throw new Error(`no pairing link from ${m.id}`);
-      links.push({ machineId: m.id, label: machineLabel(m.repo, m.id, m.size), url: link });
+      links.push({ machineId: m.id, label: machineLabel(m.repo, m.id, m.size, this.owner()), url: link });
     }
     return { links, ...(links.length ? {} : { note: "no linked machines right now" }) };
   }
@@ -584,7 +584,9 @@ export class Daemon {
         ageMinutes: minutes(now - m.createdAt),
         deadlineInMinutes: minutes(m.deadline - now),
         environmentId: m.environmentId,
-        label: machineLabel(m.repo, m.id, m.size),
+        label: machineLabel(m.repo, m.id, m.size, this.owner()),
+        startedBy: this.owner(),
+        ...(m.requestedBy ? { requestedBy: m.requestedBy } : {}),
         ...(m.antigravity ? { antigravity: true } : {}),
         ...(m.unresponsiveSince ? { notAnswering: `no answer since ${minutes(now - m.unresponsiveSince)} min ago (likely out of memory)` } : {}),
         ...(m.limitedThreads?.length ? { limitedThreads: m.limitedThreads } : {}),
@@ -719,13 +721,15 @@ export class Daemon {
     const lifetimeMs = config.lifetimeMinutes * MINUTE;
     const snap = this.state.snapshots?.[snapKey(repo, size)];
     const pendingId = `${PENDING}${randomUUID()}`;
-    this.state.machines[pendingId] = { id: pendingId, repo, size, createdAt: now, deadline: now + lifetimeMs, phase: { kind: "creating" } };
+    // The oldest waiting request of the repo is the one this machine is started for.
+    const requestedBy = this.state.tickets.find((t) => t.status === "queued" && t.repo === repo)?.holder;
+    this.state.machines[pendingId] = { id: pendingId, repo, size, createdAt: now, deadline: now + lifetimeMs, phase: { kind: "creating" }, ...(requestedBy ? { requestedBy } : {}) };
     const record: CreateRecord = { machineId: pendingId, repo, at: now, outcome: "pending" };
     (this.state.creates ??= []).push(record);
     this.createsInFlight++;
     this.launch(`create:${pendingId}`, async () => {
       try {
-        const { id, deadline } = await this.deps.provider.create(repo, size, lifetimeMs, snap?.id);
+        const { id, deadline } = await this.deps.provider.create(repo, size, lifetimeMs, snap?.id, this.labels(requestedBy ? { requestedBy } : {}));
         const pending = this.state.machines[pendingId];
         delete this.state.machines[pendingId];
         // From a snapshot the tools and the repo's setup are already on disk: bring-up finds them and skips them.
@@ -817,14 +821,14 @@ export class Daemon {
     try {
       this.t3Version ??= await this.deps.t3.version();
       const setup = this.repoSetup(repo);
-      const created = await this.deps.provider.create(repo, size, BAKE_LIFETIME_MINUTES * MINUTE);
+      const created = await this.deps.provider.create(repo, size, BAKE_LIFETIME_MINUTES * MINUTE, undefined, this.labels({ purpose: "snapshot build" }));
       id = created.id;
       this.state.machines[id] = { id, repo, size, createdAt: startedAt, deadline: created.deadline, phase: { kind: "baking" } };
       const day = utcDay(startedAt);
       this.state.usage[day] = (this.state.usage[day] ?? 0) + config.createChargeMinutes * 60 * SIZE_WEIGHT[size];
       this.deps.log(`machine ${id} (${size}) created to build the snapshot of ${repo}`);
       this.save();
-      await install(this.remote, id, this.deps.machineEnv, this.t3Version, [], { label: `${machineLabel(repo, id, size)} (snapshot build)`, size }, this.antigravityConfig(), { bake: true });
+      await install(this.remote, id, this.deps.machineEnv, this.t3Version, [], { label: `${machineLabel(repo, id, size, this.owner())} (snapshot build)`, size }, this.antigravityConfig(), { bake: true });
       const workspacePath = await cloneRepo(this.remote, id, repo);
       if (setup?.script) await runRepoSetup(this.remote, id, workspacePath, setup.script, config.setupTimeoutMinutes * MINUTE, (log) => this.logSetupOutput(id!, log));
       await scrubForSnapshot(this.remote, id);
@@ -923,7 +927,7 @@ export class Daemon {
           this.deps.machineEnv,
           this.t3Version,
           accounts,
-          { label: machineLabel(m.repo, id, m.size), size: m.size },
+          { label: machineLabel(m.repo, id, m.size, this.owner()), size: m.size },
           antigravity,
           codexAuth ? { codexAuth } : {},
         );
@@ -1453,6 +1457,17 @@ export class Daemon {
   private vcpuConfig(): Config {
     const { config } = this.deps;
     return this.othersVcpu ? { ...config, vcpuReserve: (config.vcpuReserve ?? 0) + this.othersVcpu } : config;
+  }
+
+  /** Who runs this pool: config.owner, else user@host. */
+  private owner(): string {
+    return this.deps.config.owner ?? `${userInfo().username}@${hostname()}`;
+  }
+
+  /** Lizard metadata for a new sandbox, so anyone on the account can see whose pool started it and for whom. */
+  private labels(extra: Record<string, string>): Record<string, string> {
+    const clean = (v: string) => v.replace(/[^\x20-\x7e]/g, "").trim().slice(0, 100);
+    return Object.fromEntries(Object.entries({ startedBy: this.owner(), ...extra }).map(([k, v]) => [k, clean(v)]));
   }
 
   private async countOtherSandboxes(): Promise<void> {
