@@ -45,6 +45,8 @@ const LIMIT_SCAN_EVERY_MS = MINUTE;
 /** How often a leased machine is checked for finished work (releaseIdleMinutes). */
 const WORK_CHECK_EVERY_MS = 2 * MINUTE;
 const DEFAULT_RELEASE_IDLE_MINUTES = 5;
+/** A lease on which nothing has run yet is left alone this long after its grant (or a daemon start, which forgets what ran). */
+const UNUSED_LEASE_GRACE_MS = 15 * MINUTE;
 /** Allowed difference between the machine's clock and the devbox's. */
 const CLOCK_SKEW_MS = MINUTE;
 const ANTIGRAVITY_INSTANCE = "antigravity";
@@ -128,6 +130,7 @@ export class Daemon {
   private t3Version?: string;
   private lastLimitScan = new Map<MachineId, number>();
   private lastWorkCheck = new Map<MachineId, number>();
+  private startedAt = 0;
   private lastAccountPush = new Map<MachineId, number>();
   private probing = false;
   /** The snapshot being built (`<repo>|<size>`), at most one at a time. */
@@ -153,6 +156,7 @@ export class Daemon {
     mkdirSync(this.deps.home, { recursive: true, mode: 0o700 });
     if (existsSync(this.files.state)) this.state = JSON.parse(readFileSync(this.files.state, "utf8"));
     const now = this.deps.now();
+    this.startedAt = now;
     // A create cut short by a restart may still have made a sandbox: reconcile kills it as an orphan.
     // Its record stays, settled as lost, so it still counts toward the hourly cap and the backoff.
     for (const r of this.state.creates ?? []) {
@@ -1380,8 +1384,8 @@ export class Daemon {
   }
 
   /**
-   * Releases the lease once work was seen on the machine and none has run for idleMs: the holder's
-   * threads are done, so the machine goes back to the pool instead of waiting out the lease.
+   * Releases the lease once nothing has worked on the machine for idleMs, after work was seen (the
+   * holder's threads are done) or after UNUSED_LEASE_GRACE_MS with nothing run at all (it was never used).
    */
   private async checkWork(id: MachineId, leaseId: string, idleMs: number): Promise<void> {
     const workspace = this.state.machines[id]?.workspacePath;
@@ -1399,7 +1403,8 @@ export class Daemon {
     if (busy > 0) {
       lease.workSeenAt = now;
       delete lease.idleSince;
-    } else if (lease.workSeenAt && !m.limitedThreads?.length) {
+    } else if ((lease.workSeenAt || now - Math.max(lease.grantedAt, this.startedAt) >= UNUSED_LEASE_GRACE_MS) && !m.limitedThreads?.length) {
+      // Work was seen and stopped, or nothing has run since the grace: an agent that took a machine and never used it.
       lease.idleSince ??= now;
       if (now - lease.idleSince >= idleMs) {
         this.endLease(leaseId, "finished");
