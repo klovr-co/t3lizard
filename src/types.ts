@@ -233,7 +233,8 @@ export interface Config {
   autoSuspendMinutes?: number;
   /**
    * Minutes a lease is kept once every thread and command on its machine has finished; then it is
-   * released, as if its holder had. 0 never does. Default 5. A lease on which nothing has run yet is kept.
+   * released, as if its holder had. 0 never does. Default 5. A lease on which nothing has run yet is kept
+   * for its first 15 minutes, then released the same way.
    */
   releaseIdleMinutes?: number;
   /** The size ladder, largest first. A ticket that needs a new machine gets the largest size with room. */

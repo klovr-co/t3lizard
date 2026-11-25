@@ -1026,7 +1026,7 @@ test("a lease is released a few minutes after its last thread finishes, and kept
   await h.advance(0);
   assert.equal((await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 0 })).status, "granted");
   // Nothing has run yet: the holder may still be setting up, so the lease stays.
-  await h.advance(20);
+  await h.advance(10);
   assert.equal((await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 0 })).status, "granted");
   h.provider.threads = [{ status: "running" }];
   await h.advance(4);
@@ -1049,4 +1049,17 @@ test("releaseIdleMinutes 0 keeps a finished lease until it expires", async (t) =
   h.provider.threads = [{ status: "completed" }];
   await h.advance(30);
   assert.equal((await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 0 })).status, "granted");
+});
+
+test("a lease on which nothing ever runs is released after 15 minutes plus the idle wait", async (t) => {
+  const h = await harness(t, { leaseMinutes: 90, idleCloseMinutes: 60, releaseIdleMinutes: 5 });
+  const t0 = await h.api("/acquire", { repo: REPO, ref: "main", holder: "a" });
+  await h.daemon.settled();
+  await h.advance(0);
+  await h.advance(14);
+  assert.equal((await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 0 })).status, "granted", "inside the 15-minute grace");
+  await h.advance(2);
+  assert.equal((await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 0 })).status, "granted", "idle, but not yet for 5 minutes");
+  await h.advance(6);
+  assert.equal((await h.api("/wait", { ticketId: t0.ticketId, maxSeconds: 0 })).status, "released");
 });
