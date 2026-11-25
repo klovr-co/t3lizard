@@ -140,6 +140,10 @@ export interface Lease {
   waitedMs?: number;
   /** Lease start in guard.log terms: lines before it are not this lease's kills. */
   guardLogLines?: number;
+  /** Last time a thread or a command was seen working on the machine. Unset: nothing has run yet. */
+  workSeenAt?: number;
+  /** When the machine was first seen with nothing working, after work was seen. */
+  idleSince?: number;
 }
 
 interface TicketBase {
@@ -227,6 +231,11 @@ export interface Config {
   sandboxTag?: string;
   /** InstaBox: minutes idle before a machine pauses; 0 (default) never. Pro takes 0 or 5-30; the free plan only 30. */
   autoSuspendMinutes?: number;
+  /**
+   * Minutes a lease is kept once every thread and command on its machine has finished; then it is
+   * released, as if its holder had. 0 never does. Default 5. A lease on which nothing has run yet is kept.
+   */
+  releaseIdleMinutes?: number;
   /** The size ladder, largest first. A ticket that needs a new machine gets the largest size with room. */
   sizes: SizeSlot[];
   perRepoCap: number;
@@ -283,7 +292,7 @@ export interface Config {
   accounts: AccountId[];
 }
 
-export type CloseReason = "idle" | "recycle" | "deadline" | "failed" | "orphan" | "manual" | "unresponsive";
+export type CloseReason = "idle" | "recycle" | "deadline" | "failed" | "orphan" | "manual" | "unresponsive" | "oversized";
 
 export type Action =
   | { kind: "grant"; ticketId: string; machineId: MachineId }

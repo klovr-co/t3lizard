@@ -42,6 +42,9 @@ const PROBE_AUTH_EVERY_MS = 30 * MINUTE;
 const PROBE_ERROR_EVERY_MS = 10 * MINUTE;
 /** How often a leased machine is checked for threads stopped on a usage limit. */
 const LIMIT_SCAN_EVERY_MS = MINUTE;
+/** How often a leased machine is checked for finished work (releaseIdleMinutes). */
+const WORK_CHECK_EVERY_MS = 2 * MINUTE;
+const DEFAULT_RELEASE_IDLE_MINUTES = 5;
 /** Allowed difference between the machine's clock and the devbox's. */
 const CLOCK_SKEW_MS = MINUTE;
 const ANTIGRAVITY_INSTANCE = "antigravity";
@@ -124,6 +127,7 @@ export class Daemon {
   private changes = new EventEmitter();
   private t3Version?: string;
   private lastLimitScan = new Map<MachineId, number>();
+  private lastWorkCheck = new Map<MachineId, number>();
   private lastAccountPush = new Map<MachineId, number>();
   private probing = false;
   /** The snapshot being built (`<repo>|<size>`), at most one at a time. */
@@ -189,6 +193,7 @@ export class Daemon {
       this.reopenProxies();
       this.step();
       this.scanForLimits();
+      this.releaseFinished();
       this.syncAccounts();
       this.probeAccounts();
       this.maintainSnapshots();
@@ -1357,6 +1362,54 @@ export class Daemon {
   }
 
   /** Each leased machine, at most once a minute: find threads stopped on a usage limit. */
+  /** Checks each leased machine every WORK_CHECK_EVERY_MS for work still going (releaseIdleMinutes). */
+  private releaseFinished(): void {
+    const minutes = this.deps.config.releaseIdleMinutes ?? DEFAULT_RELEASE_IDLE_MINUTES;
+    if (!minutes) return;
+    const now = this.deps.now();
+    for (const m of Object.values(this.state.machines)) {
+      if (m.phase.kind !== "leased" || !m.workspacePath) {
+        this.lastWorkCheck.delete(m.id);
+        continue;
+      }
+      if (now - (this.lastWorkCheck.get(m.id) ?? 0) < WORK_CHECK_EVERY_MS) continue;
+      this.lastWorkCheck.set(m.id, now);
+      const leaseId = m.phase.leaseId;
+      this.launch(`work:${m.id}`, () => this.checkWork(m.id, leaseId, minutes * MINUTE));
+    }
+  }
+
+  /**
+   * Releases the lease once work was seen on the machine and none has run for idleMs: the holder's
+   * threads are done, so the machine goes back to the pool instead of waiting out the lease.
+   */
+  private async checkWork(id: MachineId, leaseId: string, idleMs: number): Promise<void> {
+    const workspace = this.state.machines[id]?.workspacePath;
+    if (!workspace) return;
+    let busy: number;
+    try {
+      busy = await busyThreads(this.remote, id, workspace);
+    } catch {
+      return; // Cannot tell: keep the lease.
+    }
+    const lease = this.state.leases[leaseId];
+    const m = this.state.machines[id];
+    if (!lease || m?.phase.kind !== "leased" || m.phase.leaseId !== leaseId) return;
+    const now = this.deps.now();
+    if (busy > 0) {
+      lease.workSeenAt = now;
+      delete lease.idleSince;
+    } else if (lease.workSeenAt && !m.limitedThreads?.length) {
+      lease.idleSince ??= now;
+      if (now - lease.idleSince >= idleMs) {
+        this.endLease(leaseId, "finished");
+        this.step();
+        return;
+      }
+    }
+    this.save();
+  }
+
   private scanForLimits(): void {
     if (!this.deps.config.accounts.length) return;
     const now = this.deps.now();
@@ -1577,7 +1630,7 @@ export class Daemon {
     this.deps.log(`ticket ${id} ${status}: ${error}`);
   }
 
-  private endLease(leaseId: string, how: "released" | "expired"): void {
+  private endLease(leaseId: string, how: "released" | "expired" | "finished"): void {
     const lease = this.state.leases[leaseId];
     delete this.state.leases[leaseId];
     if (lease) {
@@ -1593,7 +1646,7 @@ export class Daemon {
       }
     }
     if (m?.phase.kind === "leased" && m.phase.leaseId === leaseId) this.setPhase(m, { kind: "idle", since: this.deps.now() });
-    this.deps.log(`lease ${leaseId} ${how}`);
+    this.deps.log(`lease ${leaseId} ${how === "finished" ? "released: its threads and commands are done" : how}`);
   }
 
   /** Marks a create as having become ready, or lost before that (which feeds the breaker). Once only. */
