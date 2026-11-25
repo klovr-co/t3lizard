@@ -25,7 +25,7 @@ export function usedSmallHours(state: State, now: number): number {
   return (state.usage[utcDay(now)] ?? 0) / 3600;
 }
 
-/** Machines per size, every phase counted: Lizard counts a sandbox until it is killed. */
+/** Machines per size, every phase counted: the provider counts a machine until it is killed. */
 export function sizesInUse(machines: Machine[]): Map<Size, number> {
   const used = new Map<Size, number>();
   for (const m of machines) used.set(m.size, (used.get(m.size) ?? 0) + 1);
@@ -164,8 +164,8 @@ export function repoCreateBlock(state: State, repo: RepoKey, now: number, config
 /** Why no machine may be created right now, or undefined when creates are allowed. */
 export function createBlock(state: State, now: number, config: Config): string | undefined {
   if (state.createsPausedUntil !== undefined && now < state.createsPausedUntil) {
-    const detail = state.lastLizardError ? `: ${state.lastLizardError.message}` : "";
-    return `Lizard creates paused until ${iso(state.createsPausedUntil)}${detail}`;
+    const detail = state.lastProviderError ? `: ${state.lastProviderError.message}` : "";
+    return `creates paused until ${iso(state.createsPausedUntil)}${detail}`;
   }
   const backoff = createBackoff(state, now);
   if (backoff) {

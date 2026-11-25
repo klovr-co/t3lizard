@@ -81,7 +81,7 @@ async function realDaemon(home: string): Promise<void> {
   // Provider tokens never go machine-wide: each lives only in its own T3 provider instance or profile.
   const machineEnv = Object.fromEntries(config.forwardEnv.flatMap((k) => (secrets[k] && !isAccountTokenKey(k) ? [[k, secrets[k]]] : [])));
   await runDaemon({
-    lizard: realLizard({ apiKey: secrets.LIZARD_API_KEY, projectId: config.project, user: config.sandboxUser, template: config.template, tag: config.sandboxTag }),
+    provider: realLizard({ apiKey: secrets.LIZARD_API_KEY, projectId: config.project, user: config.sandboxUser, template: config.template, tag: config.sandboxTag }),
     t3: realLocalT3(),
     config,
     machineEnv,

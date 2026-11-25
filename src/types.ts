@@ -156,16 +156,16 @@ export type Ticket =
   | (TicketBase & { status: "granted"; leaseId: string })
   | (TicketBase & { status: "cancelled" | "expired"; endedAt: number; error?: string });
 
-export interface LizardError {
+export interface ProviderError {
   at: number;
   message: string;
   code?: string;
   url?: string;
 }
 
-/** One machine the daemon asked Lizard for. Drives the create circuit breaker. */
+/** One machine the daemon asked the provider for. Drives the create circuit breaker. */
 export interface CreateRecord {
-  /** `pending:<uuid>` until Lizard answers, then the sandbox id. */
+  /** `pending:<uuid>` until the provider answers, then the machine id. */
   machineId: MachineId;
   repo: RepoKey;
   at: number;
@@ -193,7 +193,7 @@ export interface State {
   usage: Record<string, number>;
   usageAccruedAt?: number;
   createsPausedUntil?: number;
-  lastLizardError?: LizardError;
+  lastProviderError?: ProviderError;
   /** Creates of the last 24 hours. Optional so older state files still load. */
   creates?: CreateRecord[];
   /** Per Claude account. Optional so older state files still load. */

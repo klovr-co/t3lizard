@@ -1,5 +1,6 @@
 import { ownSandboxLister, sandboxAlive } from "../src/lizard.ts";
-import type { ExecResult, Lizard, SandboxDirectory } from "../src/lizard.ts";
+import type { SandboxDirectory } from "../src/lizard.ts";
+import type { ExecResult, MachineProvider } from "../src/provider.ts";
 import type { LocalT3 } from "../src/t3local.ts";
 import { SIZE_VCPU, type MachineId, type RepoKey, type Size } from "../src/types.ts";
 
@@ -18,13 +19,14 @@ type StepHandler = (m: FakeMachine, args: string[]) => ExecResult | undefined;
 const ok = (stdout = ""): ExecResult => ({ stdout, stderr: "", exitCode: 0 });
 
 /**
- * An in-memory Lizard. Each exec is dispatched on the `# t3lizard:<step>` line that every
+ * An in-memory provider, shaped like Lizard. Each exec is dispatched on the `# t3lizard:<step>` line that every
  * machine script starts with; `on[step]` overrides a step's default answer.
  *
  * Like the real API, `listSandboxes()` carries no metadata and `getInfo()` does. `list()` and
  * `alive()` run the production code over those two calls.
  */
-export class FakeLizard implements Lizard, SandboxDirectory {
+export class FakeProvider implements MachineProvider, SandboxDirectory {
+  readonly name = "fake";
   machines = new Map<MachineId, FakeMachine>();
   killed: MachineId[] = [];
   timeouts: [MachineId, number][] = [];
