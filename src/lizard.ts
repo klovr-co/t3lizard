@@ -70,6 +70,9 @@ export function realLizard(opts: { apiKey: string; projectId: string; user: stri
   return {
     name: "Lizard",
     portAuth: { kind: "header", name: "X-Lizard-Access-Token" },
+    home: `/home/${opts.user}`,
+    // Sandbox docs: nano $0.00405/h, mini $0.0081/h, small $0.0162/h, medium $0.0324/h, large $0.0648/h, big $0.1296/h.
+    usdPerSmallHour: 0.0162,
     accountSandboxes: () =>
       mapErrors(async () => {
         const all = (await Sandbox.list({ ...conn } as Parameters<typeof Sandbox.list>[0])) as { sandboxId?: string; id?: string; status?: string; size?: string }[];

@@ -2,8 +2,9 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
+import { INSTABOX_SIZES } from "./instabox.ts";
 import { SIZE_WEIGHT } from "./types.ts";
-import type { AccountId, Config, SizeSlot } from "./types.ts";
+import type { AccountId, Config, ProviderName, Size, SizeSlot } from "./types.ts";
 
 export function t3lizardHome(): string {
   return process.env.T3LIZARD_HOME ?? join(homedir(), ".t3lizard");
@@ -20,6 +21,7 @@ export function paths(home: string) {
 }
 
 export const DEFAULT_CONFIG: Config = {
+  provider: "lizard",
   project: "",
   template: "claude",
   // The Lizard trial runs 1 small, 2 mini and 2 nano at once. Nano (0.5 vCPU, 1 GB) is too small for builds.
@@ -52,12 +54,29 @@ export const DEFAULT_CONFIG: Config = {
   accounts: [],
 };
 
+/** The secret holding each provider's API key. */
+export const API_KEY_SECRET: Record<ProviderName, string> = { lizard: "LIZARD_API_KEY", instabox: "INSTABOX_API_KEY" };
+
+/** What differs per provider when the config file does not say. Lizard's are DEFAULT_CONFIG's. */
+const INSTABOX_DEFAULTS = {
+  // Debian 13 (glibc) with node, claude and codex.
+  template: "agent-browser",
+  sizes: [
+    { size: "medium", max: 1 },
+    { size: "small", max: 2 },
+  ] as SizeSlot[],
+};
+/** The account runs at most 32 execs at once, across every daemon on it. */
+const INSTABOX_MAX_EXECS = 32;
+
 const positive = z.number().int().positive();
 const SizeName = z.enum(["nano", "mini", "small", "medium", "large", "big"]);
 const ConfigFile = z
   .object({
+    provider: z.enum(["lizard", "instabox"]),
     project: z.string(),
     template: z.string().min(1),
+    execConcurrency: positive,
     sandboxTag: z.string().regex(/^[A-Za-z][\w-]{0,63}$/),
     /** max is optional with vcpuLimit: then the vCPU limit decides how many of each fit. */
     sizes: z.array(z.object({ size: SizeName, max: positive.optional() }).strict()).min(1),
@@ -125,13 +144,21 @@ export function parseConfig(json: unknown): Config {
   if (dailyMachineHours !== undefined && rest.dailySmallMachineHours !== undefined) {
     throw new Error('give "dailySmallMachineHours" (or its older name "dailyMachineHours"), not both');
   }
+  const instabox = rest.provider === "instabox";
   const legacy = size !== undefined || totalCap !== undefined;
-  const ladder = (sizes ?? (legacy ? [{ size: size ?? "small", max: totalCap ?? 1 }] : DEFAULT_CONFIG.sizes)).map((x) => ({ size: x.size, max: x.max ?? Number.MAX_SAFE_INTEGER }));
+  const defaults = instabox ? INSTABOX_DEFAULTS.sizes : DEFAULT_CONFIG.sizes;
+  const ladder = (sizes ?? (legacy ? [{ size: size ?? "small", max: totalCap ?? 1 }] : defaults)).map((x) => ({ size: x.size, max: x.max ?? Number.MAX_SAFE_INTEGER }));
   if (!rest.vcpuLimit && ladder.some((x) => x.max === Number.MAX_SAFE_INTEGER)) throw new Error('a size without "max" needs "vcpuLimit"');
   const dup = ladder.find((s, i) => ladder.findIndex((o) => o.size === s.size) !== i);
   if (dup) throw new Error(`size "${dup.size}" is listed twice in "sizes"`);
+  if (instabox) {
+    const missing = [...ladder.map((s) => s.size), rest.defaultSize ?? DEFAULT_CONFIG.defaultSize].find((s: Size) => !INSTABOX_SIZES[s]);
+    if (missing) throw new Error(`InstaBox has no "${missing}" size (it has ${Object.keys(INSTABOX_SIZES).join(", ")})`);
+    if ((rest.execConcurrency ?? 0) > INSTABOX_MAX_EXECS) throw new Error(`"execConcurrency" must be at most ${INSTABOX_MAX_EXECS}: the InstaBox account runs that many execs at once across every daemon on it`);
+  }
   return {
     ...DEFAULT_CONFIG,
+    ...(instabox ? { template: INSTABOX_DEFAULTS.template } : {}),
     ...rest,
     sizes: sortSizes(ladder),
     ...(dailyMachineHours !== undefined ? { dailySmallMachineHours: dailyMachineHours } : {}),

@@ -21,6 +21,10 @@ export interface MachineProvider {
   readonly name: string;
   /** How the devbox proxy sends the token from exposePort. */
   readonly portAuth: PortAuth;
+  /** The home folder of the user commands run as, on every machine (`put` paths are under it). */
+  readonly home: string;
+  /** USD per hour of a small machine (2 vCPU); other sizes cost in SIZE_WEIGHT proportion. For the dashboard's spend. */
+  readonly usdPerSmallHour: number;
   /** With snapshotId the machine starts from that saved snapshot, at the snapshot's own size (`size` is then ignored). */
   create(repo: RepoKey, size: Size, lifetimeMs: number, snapshotId?: string): Promise<{ id: MachineId; deadline: number }>;
   /** Saves the machine's files as a private snapshot and waits until it is ready. Returns its id. Storage is billed until it is deleted. */

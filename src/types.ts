@@ -9,11 +9,8 @@ export type Size = "nano" | "mini" | "small" | "medium" | "large" | "big";
  */
 export const SIZE_WEIGHT: Record<Size, number> = { nano: 0.25, mini: 0.5, small: 1, medium: 2, large: 4, big: 8 };
 
-/** vCPUs per size (Lizard): Pro plans limit the vCPUs running at once, not machines. */
+/** vCPUs per size (Lizard and InstaBox): Lizard Pro limits the vCPUs running at once, not machines. */
 export const SIZE_VCPU: Record<Size, number> = { nano: 0.5, mini: 1, small: 2, medium: 4, large: 8, big: 16 };
-
-/** Lizard's price per hour in USD (sandbox docs), for the spend shown on the dashboard. */
-export const SIZE_USD_PER_HOUR: Record<Size, number> = { nano: 0.00405, mini: 0.0081, small: 0.0162, medium: 0.0324, large: 0.0648, big: 0.1296 };
 
 /** One finished lease, kept for learning each repo's size and for the dashboard. */
 export interface JobRecord {
@@ -210,12 +207,19 @@ export interface State {
   jobs?: JobRecord[];
 }
 
+export type ProviderName = "lizard" | "instabox";
+
 export interface Config {
+  /** Where machines run. Default "lizard". */
+  provider: ProviderName;
+  /** The Lizard project id. Only Lizard needs one. */
   project: string;
-  /** Lizard template. Must be a glibc image: the T3 binary does not run on musl (Alpine). */
+  /** Machine template. Must be a glibc image: the T3 binary does not run on musl (Alpine). */
   template: string;
+  /** InstaBox only: execs in flight at once. The account allows 32 across every daemon on it. Default 24. */
+  execConcurrency?: number;
   /**
-   * Metadata key marking this daemon's sandboxes (default "t3lizard"). Two daemons on one Lizard API key must use
+   * Metadata key marking this daemon's sandboxes (default "t3lizard"). Two daemons on one provider account must use
    * different tags, or each kills the other's machines as orphans. Lizard's "Sandbox already deleted" is how it shows.
    */
   sandboxTag?: string;
@@ -242,6 +246,7 @@ export interface Config {
   createChargeMinutes: number;
   proxyPortRange: [number, number];
   forwardEnv: string[];
+  /** Lizard: the user commands run as. InstaBox runs them as its image's own user. */
   sandboxUser: string;
   tickSeconds: number;
   /** The repo setup script (~/.t3lizard/repos/<owner>/<name>/setup.sh) is stopped after this long. */

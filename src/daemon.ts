@@ -17,7 +17,7 @@ import { addStep, readHistory, readSetup, removeStep } from "./setup.ts";
 import type { RepoSetup } from "./setup.ts";
 import type { Proxy } from "./proxy.ts";
 import type { LocalT3 } from "./t3local.ts";
-import { emptyState, SIZE_USD_PER_HOUR, SIZE_VCPU, SIZE_WEIGHT } from "./types.ts";
+import { emptyState, SIZE_VCPU, SIZE_WEIGHT } from "./types.ts";
 import type { JobRecord, SnapshotRecord } from "./types.ts";
 import type { AccountId, Action, CloseReason, Config, CreateRecord, Lease, Machine, MachineId, MachinePhase, RepoKey, Size, State, Ticket } from "./types.ts";
 
@@ -261,7 +261,7 @@ export class Daemon {
    */
   async put(req: { leaseId: string; path: string; contentBase64: string; mode?: string }): Promise<{ path: string; bytes: number; mode: string }> {
     const { lease, machine } = this.leased(req.leaseId);
-    const rel = homeRelative(req.path, this.deps.config.sandboxUser);
+    const rel = homeRelative(req.path, this.deps.provider.home);
     const mode = req.mode ?? "600";
     if (!/^[A-Za-z0-9+/]*={0,2}$/.test(req.contentBase64) || req.contentBase64.length % 4 !== 0) throw new ApiError(400, "contentBase64 is not base64");
     const content = Buffer.from(req.contentBase64, "base64");
@@ -493,7 +493,7 @@ export class Daemon {
     const used = new Map<Size, number>();
     for (const m of Object.values(this.state.machines)) used.set(m.size, (used.get(m.size) ?? 0) + 1);
     const vcpuInUse = [...used].reduce((n, [size, k]) => n + SIZE_VCPU[size] * k, 0);
-    const usdPerSmallSecond = SIZE_USD_PER_HOUR.small / 3600;
+    const usdPerSmallSecond = this.deps.provider.usdPerSmallHour / 3600;
     const days = Object.entries(this.state.usage).sort(([a], [b]) => (a < b ? 1 : -1)).slice(0, 31);
     const month = new Date(now).toISOString().slice(0, 7);
     const spend = {
@@ -1667,15 +1667,15 @@ export class Daemon {
 }
 
 /**
- * A path under the sandbox user's home, as a path relative to it: "~/a/b", "/home/<user>/a/b" and
+ * A path under the machine's home folder, as a path relative to it: "~/a/b", "<home>/a/b" and
  * "a/b" all give "a/b". Anything else, or a "." or ".." part, is refused.
  */
-export function homeRelative(path: string, user: string): string {
+export function homeRelative(path: string, home: string): string {
   if (/[\0\n\r]/.test(path)) throw new ApiError(400, "the path has a control character");
   let rel = path;
   if (rel.startsWith("~/")) rel = rel.slice(2);
-  else if (rel.startsWith(`/home/${user}/`)) rel = rel.slice(`/home/${user}/`.length);
-  else if (rel.startsWith("/") || rel.startsWith("~")) throw new ApiError(400, `the path must be under the home folder (~/ or /home/${user}/)`);
+  else if (rel.startsWith(`${home}/`)) rel = rel.slice(home.length + 1);
+  else if (rel.startsWith("/") || rel.startsWith("~")) throw new ApiError(400, `the path must be under the home folder (~/ or ${home}/)`);
   const parts = rel.split("/").filter((p) => p !== "");
   if (!parts.length || parts.some((p) => p === "." || p === "..")) throw new ApiError(400, "the path must name a file under the home folder, with no . or .. parts");
   return parts.join("/");

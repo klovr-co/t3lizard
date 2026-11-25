@@ -4,10 +4,14 @@ import { parseArgs } from "node:util";
 import { call, serveApi } from "./api.ts";
 import { startDashboard } from "./dashboard.ts";
 import { probeAccount } from "./probe.ts";
-import { accountLabelsFromSecrets, accountsFromSecrets, antigravityTokenFromSecrets, isAccountTokenKey, loadConfig, loadSecrets, paths, t3lizardHome } from "./config.ts";
+import { accountLabelsFromSecrets, accountsFromSecrets, antigravityTokenFromSecrets, API_KEY_SECRET, isAccountTokenKey, loadConfig, loadSecrets, paths, t3lizardHome } from "./config.ts";
 import { Daemon } from "./daemon.ts";
 import type { DaemonDeps } from "./daemon.ts";
+import { DEFAULT_EXEC_CONCURRENCY, realInstabox } from "./instabox.ts";
 import { realLizard } from "./lizard.ts";
+import { DEFAULT_TAG } from "./provider.ts";
+import type { MachineProvider } from "./provider.ts";
+import type { Config } from "./types.ts";
 import { resolveRepo } from "./repo.ts";
 import { realLocalT3 } from "./t3local.ts";
 
@@ -70,18 +74,28 @@ function fileLogger(file: string) {
   };
 }
 
+/** The provider the config names, with its API key from the secrets. */
+function machineProvider(config: Config, secrets: Record<string, string>, home: string): MachineProvider {
+  const key = secrets[API_KEY_SECRET[config.provider]];
+  if (!key) throw new Error(`${API_KEY_SECRET[config.provider]} missing from the environment and ${paths(home).secrets}`);
+  if (config.provider === "instabox") {
+    return realInstabox({ apiKey: key, template: config.template, tag: config.sandboxTag, maxLifetimeMs: config.maxLifetimeMinutes * 60_000, execConcurrency: config.execConcurrency });
+  }
+  if (!config.project) throw new Error(`"project" (the Lizard project id) missing from ${paths(home).config}`);
+  return realLizard({ apiKey: key, projectId: config.project, user: config.sandboxUser, template: config.template, tag: config.sandboxTag });
+}
+
 async function realDaemon(home: string): Promise<void> {
   mkdirSync(home, { recursive: true, mode: 0o700 });
   const secrets = loadSecrets(home);
   const accounts = accountsFromSecrets(secrets);
   const antigravityToken = antigravityTokenFromSecrets(secrets);
   const config = { ...loadConfig(home), accounts: accounts.map((a) => a.id) };
-  if (!secrets.LIZARD_API_KEY) throw new Error(`LIZARD_API_KEY missing from the environment and ${paths(home).secrets}`);
-  if (!config.project) throw new Error(`"project" (the Lizard project id) missing from ${paths(home).config}`);
+  const provider = machineProvider(config, secrets, home);
   // Provider tokens never go machine-wide: each lives only in its own T3 provider instance or profile.
   const machineEnv = Object.fromEntries(config.forwardEnv.flatMap((k) => (secrets[k] && !isAccountTokenKey(k) ? [[k, secrets[k]]] : [])));
   await runDaemon({
-    provider: realLizard({ apiKey: secrets.LIZARD_API_KEY, projectId: config.project, user: config.sandboxUser, template: config.template, tag: config.sandboxTag }),
+    provider,
     t3: realLocalT3(),
     config,
     machineEnv,
@@ -118,14 +132,16 @@ async function doctor(home: string): Promise<string[]> {
   };
   await check("config", () => {
     const c = loadConfig(home);
-    if (!c.project) throw new Error(`set "project" in ${p.config}`);
+    if (c.provider === "lizard" && !c.project) throw new Error(`set "project" in ${p.config}`);
     const ladder = c.sizes.map((x) => `${x.size} x${x.max}`).join(", ");
-    return `project ${c.project}, template ${c.template}, sizes ${ladder}, perRepoCap ${c.perRepoCap}, budget ${c.dailySmallMachineHours} small-machine-hours a day`;
+    const where = c.provider === "lizard" ? `lizard project ${c.project}` : `instabox, ${c.execConcurrency ?? DEFAULT_EXEC_CONCURRENCY} execs at once`;
+    return `${where}, tag ${c.sandboxTag ?? DEFAULT_TAG}, template ${c.template}, sizes ${ladder}, perRepoCap ${c.perRepoCap}, budget ${c.dailySmallMachineHours} small-machine-hours a day`;
   });
   await check("secrets", () => {
     if (existsSync(p.secrets) && statSync(p.secrets).mode & 0o077) throw new Error(`${p.secrets} must be mode 600`);
     const s = loadSecrets(home);
-    const missing = ["LIZARD_API_KEY", ...loadConfig(home).forwardEnv.filter((k) => !isAccountTokenKey(k))].filter((k) => !s[k]);
+    const c = loadConfig(home);
+    const missing = [API_KEY_SECRET[c.provider], ...c.forwardEnv.filter((k) => !isAccountTokenKey(k))].filter((k) => !s[k]);
     if (missing.length) throw new Error(`missing ${missing.join(", ")}`);
   });
   await check("claude accounts", () => {

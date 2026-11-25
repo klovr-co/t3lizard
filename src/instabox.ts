@@ -11,6 +11,8 @@ export const INSTABOX_SIZES: Partial<Record<Size, { vcpus: number; memMiB: numbe
 };
 
 const MINUTE = 60_000;
+/** Execs in flight at once, below the account's 32. */
+export const DEFAULT_EXEC_CONCURRENCY = 24;
 /** Machine states that will never run a command again. */
 const GONE = new Set(["deleting", "deleted", "error"]);
 const NOT_ALIVE = new Set([...GONE, "stopped"]);
@@ -26,7 +28,7 @@ export interface InstaboxOptions {
   tag?: string;
   /** The daemon never keeps a machine longer; InstaBox deletes it 30 minutes after this as a crash backstop. */
   maxLifetimeMs: number;
-  /** Execs in flight at once, below the account's limit (32 on the plan measured). */
+  /** Execs in flight at once (default DEFAULT_EXEC_CONCURRENCY). Every daemon on the account shares its limit. */
   execConcurrency?: number;
   fetch?: typeof fetch;
   baseUrl?: string;
@@ -52,7 +54,7 @@ export function realInstabox(opts: InstaboxOptions): MachineProvider {
   const base = opts.baseUrl ?? "https://api.instabox.sh";
   const fetchFn = opts.fetch ?? fetch;
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-  const execSlot = semaphore(opts.execConcurrency ?? 24);
+  const execSlot = semaphore(opts.execConcurrency ?? DEFAULT_EXEC_CONCURRENCY);
 
   async function request(method: string, path: string, body?: unknown, extra: { headers?: Record<string, string>; timeoutMs?: number } = {}): Promise<any> {
     const headers: Record<string, string> = { "X-API-Key": opts.apiKey, accept: "application/json", ...extra.headers };
@@ -133,6 +135,10 @@ export function realInstabox(opts: InstaboxOptions): MachineProvider {
   return {
     name: "InstaBox",
     portAuth: { kind: "cookie", name: "__Host-instabox_port_auth" },
+    // Commands run as the image's user with HOME=/data/home (measured).
+    home: "/data/home",
+    // $0.004 per vCPU-hour + $0.00225 per GiB-hour: small 0.017, medium 0.034, large 0.068.
+    usdPerSmallHour: 0.017,
     async create(repo, size, lifetimeMs, snapshotId) {
       const shape = INSTABOX_SIZES[size];
       if (!shape) throw new Error(`InstaBox has no ${size} machine (sizes: ${Object.keys(INSTABOX_SIZES).join(", ")})`);

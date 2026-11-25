@@ -749,6 +749,18 @@ test("a body that is not JSON is refused without quoting it back", async (t) => 
   assert.ok(!raw.includes("c2VjcmV0"));
 });
 
+test("put takes paths under the provider's home folder, which is not always /home/<user>", async (t) => {
+  const h = await harness(t);
+  h.provider.home = "/data/home";
+  const a0 = await h.api("/acquire", { repo: REPO, ref: "main", holder: "thread-a" });
+  await h.daemon.settled();
+  const leaseId = (await h.api("/wait", { ticketId: a0.ticketId, maxSeconds: 1 })).lease.leaseId;
+  const contentBase64 = Buffer.from("X=1\n").toString("base64");
+  assert.equal((await h.api("/put", { leaseId, path: "/data/home/.env", contentBase64 })).path, "/data/home/.env");
+  assert.equal((await h.api("/put", { leaseId, path: "~/.config/x.env", contentBase64 })).path, "/data/home/.config/x.env");
+  await assert.rejects(h.api("/put", { leaseId, path: "/home/user/.env", contentBase64 }), /under the home folder \(~\/ or \/data\/home\/\)/);
+});
+
 test("files put on a machine are removed when the lease ends, and a machine that cannot remove them is never granted again", async (t) => {
   const h = await harness(t, { perRepoCap: 1, sizes: [{ size: "small", max: 1 }] });
   const grant = async (holder: string) => {
